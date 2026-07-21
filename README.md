@@ -26,7 +26,6 @@ setup-windows.bat
 
 This installs frontend dependencies, creates backend/.venv, and installs backend Python dependencies from backend/requirements.txt
 ```
-
 Then build and run:
 ```
 

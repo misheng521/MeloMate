@@ -1,0 +1,9 @@
+{
+    "mcp_servers": {
+      "local-launcher": {
+        "command": ".venv\\Scripts\\python.exe",
+        "args": ["mcp_local_launcher.py"],
+        "cwd": "."
+      }
+    }
+}

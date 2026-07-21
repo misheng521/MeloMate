@@ -1,0 +1,15 @@
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.wav binary
+*.mp3 binary
+*.wasm binary
+*.onnx binary
+*.moc3 binary
+*.cmo3 binary
+*.can3 binary

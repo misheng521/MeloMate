@@ -1,0 +1,228 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MeloMate</title>
+    <script src="./libs/live2dcubismcore.min.js"></script>
+    <script src="./libs/ort.min.js"></script>
+    <script src="./libs/vad.bundle.min.js"></script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="video-area" aria-label="视频画面">
+        <div id="videoFrame" class="video-frame">
+          <img id="videoBackground" class="video-background" alt="" aria-hidden="true" />
+          <aside id="backgroundSidebar" class="background-sidebar" aria-label="素材选择">
+            <button
+              id="backgroundSidebarToggle"
+              class="background-toggle"
+              type="button"
+              aria-label="展开素材"
+              aria-expanded="false"
+            >
+              <span aria-hidden="true">›</span>
+            </button>
+            <div class="background-panel">
+              <nav class="asset-tabs" aria-label="素材分类">
+                <button
+                  id="backgroundTab"
+                  class="asset-tab active"
+                  type="button"
+                  aria-controls="backgroundList"
+                  aria-pressed="true"
+                >
+                  背景
+                </button>
+                <button
+                  id="characterTab"
+                  class="asset-tab"
+                  type="button"
+                  aria-controls="characterList"
+                  aria-pressed="false"
+                >
+                  模型
+                </button>
+              </nav>
+              <div class="asset-options">
+                <div id="backgroundList" class="background-list" role="list"></div>
+                <div id="characterList" class="character-list" role="list" hidden></div>
+              </div>
+            </div>
+          </aside>
+          <canvas id="canvas"></canvas>
+          <button id="proactiveSpeakButton" class="proactive-speak-button" type="button" disabled>
+            让ta说句话
+          </button>
+          <button id="videoFullscreenButton" class="video-fullscreen-button" type="button" aria-label="进入全屏">
+            ⛶
+          </button>
+          <div class="subtitle" id="subtitle" aria-live="polite">点击启动后，我会开始听你说话。</div>
+        </div>
+      </section>
+
+      <aside class="text-panel" aria-label="文字面板">
+        <div class="top-actions">
+          <span id="status" class="status-dot">待启动</span>
+          <div class="top-volume" aria-label="音量">
+            <button id="volumeMuteToggle" class="volume-button" type="button" aria-label="静音" aria-pressed="false">
+              <svg class="volume-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 9v6h4l5 4V5L8 9H4Z"></path>
+                <path class="volume-wave" d="M16 8c1.3 1.1 2 2.5 2 4s-.7 2.9-2 4"></path>
+                <path class="volume-muted-mark" d="m17 9 4 4m0-4-4 4"></path>
+              </svg>
+            </button>
+            <input id="volumeRange" type="range" min="0" max="100" step="1" value="100" />
+          </div>
+          <button id="settingsButton" class="settings-button" type="button" aria-expanded="false">
+            设置
+          </button>
+        </div>
+
+        <div id="settingsPanel" class="settings-panel" hidden>
+          <label class="field">
+            <span>麦克风</span>
+            <select id="micSelect"></select>
+          </label>
+
+          <label class="field">
+            <span>扬声器</span>
+            <select id="speakerSelect"></select>
+          </label>
+
+          <label class="field">
+            <span>人设</span>
+            <select id="characterSelect"></select>
+          </label>
+
+          <div class="settings-divider" aria-hidden="true"></div>
+
+          <label class="field toggle-field collapsible-toggle" data-toggle-group="voice-chat">
+            <span class="toggle-title">
+              <span class="collapse-arrow" aria-hidden="true">›</span>
+              AI 声音进语音（需下载 Voicemeeter）
+            </span>
+            <input id="voiceChatOutputToggle" type="checkbox" />
+          </label>
+
+          <label class="field collapsible-field" data-collapse="voice-chat">
+            <span>Voicemeeter 输入通道</span>
+            <select id="voiceChatOutputSelect"></select>
+          </label>
+
+          <div class="voice-chat-actions" data-collapse="voice-chat">
+            <button id="testVoiceChatOutput" class="secondary-button" type="button">测试 Voicemeeter 输入</button>
+            <button id="showVoicemeeter" class="secondary-button" type="button">显示 Voicemeeter 窗口</button>
+          </div>
+
+          <p id="voiceChatOutputHint" class="field-hint" hidden>
+            开启后会把 AI 回复额外送进 Voicemeeter Input。语音软件的麦克风请选择 Voicemeeter Output / Out B1。
+          </p>
+
+          <div class="settings-divider" aria-hidden="true"></div>
+
+          <label class="field">
+            <span>API 地址</span>
+            <input id="endpoint" value="https://api.deepseek.com" />
+          </label>
+
+          <label class="field">
+            <span>模型</span>
+            <input id="model" value="deepseek-chat" />
+          </label>
+
+          <label class="field">
+            <span>API Key</span>
+            <div class="secret-row">
+              <input id="apiKey" type="password" autocomplete="off" />
+              <button id="toggleApiKey" class="eye-button" type="button" aria-label="显示 API Key">显示</button>
+            </div>
+          </label>
+
+          <div class="settings-divider" aria-hidden="true"></div>
+
+          <label class="field toggle-field collapsible-toggle" data-toggle-group="screen-vision">
+            <span class="toggle-title">
+              <span class="collapse-arrow" aria-hidden="true">›</span>
+              识别屏幕
+            </span>
+            <input id="screenVisionToggle" type="checkbox" />
+          </label>
+
+          <label class="field collapsible-field" data-collapse="screen-vision">
+            <span>识图 API 地址</span>
+            <input id="screenVisionEndpoint" value="https://api.moonshot.cn/v1" />
+          </label>
+
+          <label class="field collapsible-field" data-collapse="screen-vision">
+            <span>模型</span>
+            <input id="screenVisionModel" value="moonshot-v1-8k-vision-preview" />
+          </label>
+
+          <label class="field collapsible-field" data-collapse="screen-vision">
+            <span>API Key</span>
+            <div class="secret-row">
+              <input id="screenVisionApiKey" type="password" autocomplete="off" />
+              <button id="toggleScreenVisionApiKey" class="eye-button" type="button" aria-label="显示 API Key">显示</button>
+            </div>
+          </label>
+
+          <label class="field collapsible-field" data-collapse="screen-vision">
+            <span>定时截图间隔（秒）</span>
+            <input id="screenVisionInterval" type="number" min="1" max="60" step="1" value="5" />
+          </label>
+
+          <div class="settings-divider" aria-hidden="true"></div>
+
+          <label class="field toggle-field collapsible-toggle" data-toggle-group="voice-clone">
+            <span class="toggle-title">
+              <span class="collapse-arrow" aria-hidden="true">›</span>
+              使用语音克隆
+            </span>
+            <input id="voiceCloneToggle" type="checkbox" />
+          </label>
+
+          <label class="field collapsible-field" data-collapse="voice-clone">
+            <span>参考音频</span>
+            <input id="referenceAudioInput" type="file" accept="audio/*" disabled />
+          </label>
+
+          <div class="field collapsible-field" data-collapse="voice-clone">
+            <span id="referenceAudioName" hidden></span>
+            <audio id="referenceAudioPlayer" class="reference-audio disabled-audio" controls></audio>
+          </div>
+
+          <div class="settings-divider" aria-hidden="true"></div>
+
+          <label class="field toggle-field collapsible-toggle" data-toggle-group="proactive-speak">
+            <span class="toggle-title">
+              <span class="collapse-arrow" aria-hidden="true">›</span>
+              主动说话
+            </span>
+            <input id="proactiveSpeakToggle" type="checkbox" />
+          </label>
+
+          <label class="field collapsible-field" data-collapse="proactive-speak">
+            <span>空闲后触发（秒）</span>
+            <input id="proactiveIdleSeconds" type="number" min="15" max="3600" step="1" value="120" />
+          </label>
+
+        </div>
+
+        <section class="text-box transcript-box">
+          <div id="transcriptLog" class="text-content transcript-log">
+            <p class="line system-line">系统：等待启动麦克风。</p>
+          </div>
+        </section>
+
+        <div class="capture-controls">
+          <button id="startCapture" class="control-button start-button" type="button">启动</button>
+          <button id="stopCapture" class="control-button stop-button" type="button" disabled>停止</button>
+          <button id="applySettings" class="apply-button" type="button" hidden>应用配置</button>
+        </div>
+      </aside>
+    </main>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

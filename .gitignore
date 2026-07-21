@@ -1,0 +1,32 @@
+# Frontend dependencies and build output
+node_modules/
+dist/
+
+# Python virtual environments and caches
+backend/.venv/
+**/__pycache__/
+*.py[cod]
+
+# Runtime state
+backend/cache/
+backend/logs/
+backend/chat_history/
+characters/memory/**/*.bak
+reference_sounds/voice_clone_refs/
+
+# Large downloaded backend models
+models/backend/
+
+# Local tooling and editor files
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temporary files
+*.log
+*.tmp
+.tmp/

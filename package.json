@@ -1,0 +1,23 @@
+{
+  "name": "melomate",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local AI voice companion app with Live2D frontend and Python backend.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "vite --host 127.0.0.1 --port 5174",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4174",
+    "check": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "~5.5.2",
+    "vite": "^5.3.1"
+  }
+}

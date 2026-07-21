@@ -1,0 +1,97 @@
+{
+  "targets": [
+    {
+      "id": "steam",
+      "display_name": "Steam",
+      "aliases": ["steam", "\u84b8\u6c7d\u5e73\u53f0", "\u6253\u5f00steam"],
+      "uri": "steam://open/main",
+      "path_candidates": [
+        "C:\\Program Files (x86)\\Steam\\steam.exe",
+        "C:\\Program Files\\Steam\\steam.exe"
+      ],
+      "shortcut_keywords": ["Steam"]
+    },
+    {
+      "id": "overwatch",
+      "display_name": "\u5b88\u671b\u5148\u950b",
+      "aliases": ["\u5b88\u671b\u5148\u950b", "\u5b88\u671b", "overwatch", "overwatch2", "ow", "ow2"],
+      "uri_candidates": [
+        "battle.net://launch/Pro",
+        "battlenet://launch/Pro",
+        "battlenet://Pro"
+      ],
+      "path_candidates": [
+        "C:\\Program Files (x86)\\Battle.net\\Battle.net Launcher.exe",
+        "C:\\Program Files\\Battle.net\\Battle.net Launcher.exe",
+        "C:\\Program Files (x86)\\Battle.net\\Battle.net.exe",
+        "C:\\Program Files\\Battle.net\\Battle.net.exe"
+      ],
+      "shortcut_keywords": ["Overwatch", "\u5b88\u671b\u5148\u950b", "Battle.net"],
+      "launch_battlenet_first": true,
+      "post_launcher_delay_seconds": 4,
+      "battlenet_exec_args": ["--exec=launch Pro"]
+    },
+    {
+      "id": "perfect_world_arena",
+      "display_name": "\u5b8c\u7f8e\u4e16\u754c\u7ade\u6280\u5e73\u53f0",
+      "aliases": ["\u5b8c\u7f8e\u4e16\u754c\u7ade\u6280\u5e73\u53f0", "\u5b8c\u7f8e\u5e73\u53f0", "\u5b8c\u7f8e", "pw", "pvp"],
+      "path_candidates": [
+        "C:\\Program Files (x86)\\\u5b8c\u7f8e\u4e16\u754c\u7ade\u6280\u5e73\u53f0\\pvpclient.exe",
+        "C:\\Program Files\\\u5b8c\u7f8e\u4e16\u754c\u7ade\u6280\u5e73\u53f0\\pvpclient.exe",
+        "C:\\Program Files (x86)\\Perfect World Arena\\pvpclient.exe",
+        "C:\\Program Files\\Perfect World Arena\\pvpclient.exe"
+      ],
+      "shortcut_keywords": ["\u5b8c\u7f8e\u4e16\u754c\u7ade\u6280\u5e73\u53f0", "\u5b8c\u7f8e\u5e73\u53f0", "Perfect World Arena"]
+    },
+    {
+      "id": "5e",
+      "display_name": "5E \u5bf9\u6218\u5e73\u53f0",
+      "aliases": ["5e", "5E", "5e\u5e73\u53f0", "5E\u5e73\u53f0", "5e\u5bf9\u6218\u5e73\u53f0", "5E\u5bf9\u6218\u5e73\u53f0"],
+      "path_candidates": [
+        "C:\\Program Files (x86)\\5EPlay\\5EClient.exe",
+        "C:\\Program Files\\5EPlay\\5EClient.exe",
+        "C:\\Program Files (x86)\\5E\\5EClient.exe",
+        "C:\\Program Files\\5E\\5EClient.exe"
+      ],
+      "shortcut_keywords": ["5E", "5EPlay", "5E\u5bf9\u6218\u5e73\u53f0"]
+    },
+    {
+      "id": "valorant",
+      "display_name": "\u65e0\u754f\u5951\u7ea6",
+      "aliases": ["\u65e0\u754f\u5951\u7ea6", "\u74e6", "\u74e6\u7f57\u5170\u7279", "valorant", "val"],
+      "uri": "riotclient://launch-product=valorant&launch-patchline=live",
+      "path_candidates": [
+        "C:\\Riot Games\\Riot Client\\RiotClientServices.exe",
+        "C:\\Program Files\\Riot Games\\Riot Client\\RiotClientServices.exe",
+        "C:\\Program Files (x86)\\Riot Games\\Riot Client\\RiotClientServices.exe"
+      ],
+      "shortcut_keywords": ["VALORANT", "\u65e0\u754f\u5951\u7ea6", "Riot Client"]
+    }
+  ],
+  "steam_games": [
+    {
+      "id": "cs2",
+      "display_name": "Counter-Strike 2",
+      "aliases": ["cs2", "csgo", "\u53cd\u6050\u7cbe\u82f12", "\u53cd\u6050\u7cbe\u82f1"],
+      "app_id": "730"
+    },
+    {
+      "id": "dota2",
+      "display_name": "Dota 2",
+      "aliases": ["dota2", "\u5200\u58542", "dota"],
+      "app_id": "570"
+    },
+    {
+      "id": "apex",
+      "display_name": "Apex Legends",
+      "aliases": ["apex", "apex\u82f1\u96c4"],
+      "app_id": "1172470"
+    },
+    {
+      "id": "pubg",
+      "display_name": "PUBG",
+      "aliases": ["pubg", "\u7edd\u5730\u6c42\u751f", "\u5403\u9e21"],
+      "app_id": "578080"
+    }
+  ]
+}

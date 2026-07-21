@@ -24,9 +24,8 @@ For Windows users, run the setup script from the project root:
 setup-windows.bat
 ```
 
-This installs frontend dependencies, creates backend/.venv, and installs backend Python dependencies from backend/requirements.txt```
+This installs frontend dependencies, creates backend/.venv, and installs backend Python dependencies from backend/requirements.txt.
 Then build and run:
-```
 
 ```bash
 npm run build

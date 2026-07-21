@@ -18,7 +18,7 @@ if errorlevel 1 (
 )
 
 echo [1/3] Installing frontend dependencies...
-npm install
+call npm install
 if errorlevel 1 exit /b 1
 
 echo [2/3] Creating backend virtual environment...

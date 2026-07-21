@@ -18,27 +18,21 @@ Optional:
 
 ## Quick Start
 
-Install frontend dependencies:
+For Windows users, run the setup script from the project root:
 
 ```bash
+setup-windows.bat
+This installs frontend dependencies, creates backend/.venv, and installs backend Python dependencies from backend/requirements.txt.
+Then build and run:
+npm run build
+start.bat
+If you prefer to install manually, run:
 npm install
-```
-
-Create the backend environment:
-
-```bash
 cd backend
 python -m venv .venv
 .venv\Scripts\python -m pip install --upgrade pip
 .venv\Scripts\python -m pip install -r requirements.txt
 cd ..
-```
-
-Build and run:
-
-```bash
-npm run build
-start.bat
 ```
 
 The default app URL is:

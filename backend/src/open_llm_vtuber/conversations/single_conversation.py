@@ -171,7 +171,6 @@ async def process_single_conversation(
                 role="ai",
                 content=full_response,
                 name=context.character_config.character_name,
-                avatar=context.character_config.avatar,
             )
             logger.info(f"AI response: {full_response}")
 

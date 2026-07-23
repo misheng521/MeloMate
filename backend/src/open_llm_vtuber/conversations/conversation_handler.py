@@ -138,7 +138,6 @@ async def handle_individual_interrupt(
                 role="ai",
                 content=heard_response,
                 name=context.character_config.character_name,
-                avatar=context.character_config.avatar,
             )
             store_message(
                 conf_uid=context.character_config.conf_uid,
@@ -198,7 +197,6 @@ async def handle_group_interrupt(
                         role="ai",
                         content=heard_response,
                         name=context.character_config.character_name,
-                        avatar=context.character_config.avatar,
                     )
                     store_message(
                         conf_uid=member_ctx.character_config.conf_uid,

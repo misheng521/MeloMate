@@ -107,22 +107,13 @@ def init_webtool_routes(default_context_cache: ServiceContext) -> APIRouter:
             )
 
         valid_characters = []
-        supported_extensions = [".png", ".jpg", ".jpeg"]
-
         for model_file in live2d_dir.rglob("*.model3.json"):
             folder_name = model_file.relative_to(live2d_dir).parts[0]
             model_name = model_file.name.replace(".model3.json", "")
-            avatar_file = None
-            for ext in supported_extensions:
-                avatar_path = model_file.parent / f"{model_name}{ext}"
-                if avatar_path.is_file():
-                    avatar_file = str(avatar_path).replace("\\", "/")
-                    break
 
             valid_characters.append(
                 {
                     "name": folder_name,
-                    "avatar": avatar_file,
                     "model_path": str(model_file).replace("\\", "/"),
                 }
             )

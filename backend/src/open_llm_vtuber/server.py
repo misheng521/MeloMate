@@ -12,7 +12,6 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
-from starlette.responses import Response
 from starlette.staticfiles import StaticFiles as StarletteStaticFiles
 
 from .routes import init_client_ws_route, init_webtool_routes, init_proxy_route
@@ -40,19 +39,6 @@ class CORSStaticFiles(StarletteStaticFiles):
         if path.endswith(".js"):
             response.headers["Content-Type"] = "application/javascript"
 
-        return response
-
-
-class AvatarStaticFiles(CORSStaticFiles):
-    """
-    Avatar files handler with security restrictions and CORS headers
-    """
-
-    async def get_response(self, path: str, scope):
-        allowed_extensions = (".jpg", ".jpeg", ".png", ".gif", ".svg")
-        if not any(path.lower().endswith(ext) for ext in allowed_extensions):
-            return Response("Forbidden file type", status_code=403)
-        response = await super().get_response(path, scope)
         return response
 
 
@@ -131,12 +117,6 @@ class WebSocketServer:
             CORSStaticFiles(directory=str(PROJECT_ROOT / "backgrounds")),
             name="backgrounds",
         )
-        self.app.mount(
-            "/avatars",
-            AvatarStaticFiles(directory="avatars"),
-            name="avatars",
-        )
-
         if os.path.exists("web_tool"):
             self.app.mount(
                 "/web-tool",

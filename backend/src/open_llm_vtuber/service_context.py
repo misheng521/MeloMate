@@ -420,9 +420,6 @@ class ServiceContext:
 
         system_prompt = await self.construct_system_prompt(persona_prompt)
 
-        # Pass avatar to agent factory
-        avatar = self.character_config.avatar or ""  # Get avatar from config
-
         try:
             self.agent_engine = AgentFactory.create_agent(
                 conversation_agent_choice=agent_config.conversation_agent_choice,
@@ -431,7 +428,6 @@ class ServiceContext:
                 system_prompt=system_prompt,
                 live2d_model=self.live2d_model,
                 tts_preprocessor_config=self.character_config.tts_preprocessor_config,
-                character_avatar=avatar,
                 system_config=self.system_config.model_dump(),
                 tool_manager=self.tool_manager,
                 tool_executor=self.tool_executor,

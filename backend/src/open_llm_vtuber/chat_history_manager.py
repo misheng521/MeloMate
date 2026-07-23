@@ -19,7 +19,6 @@ class HistoryMessage(TypedDict):
     timestamp: str
     content: str
     name: Optional[str]
-    avatar: Optional[str]
 
 
 def _is_safe_filename(filename: str) -> bool:
@@ -242,7 +241,6 @@ def store_message(
     role: Literal["human", "ai", "system"],
     content: str,
     name: str | None = None,
-    avatar: str | None = None,
 ):
     if not conf_uid or not content:
         return
@@ -300,7 +298,6 @@ def get_history(conf_uid: str, history_uid: str = SINGLE_HISTORY_UID) -> List[Hi
                     "timestamp": timestamp,
                     "content": user_text,
                     "name": None,
-                    "avatar": None,
                 }
             )
         if bot_text:
@@ -310,7 +307,6 @@ def get_history(conf_uid: str, history_uid: str = SINGLE_HISTORY_UID) -> List[Hi
                     "timestamp": timestamp,
                     "content": bot_text,
                     "name": None,
-                    "avatar": None,
                 }
             )
     return messages

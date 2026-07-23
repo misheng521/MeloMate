@@ -161,8 +161,6 @@ class BasicMemoryAgent(AgentInterface):
         if display_text:
             if display_text.name:
                 message_data["name"] = display_text.name
-            if display_text.avatar:
-                message_data["avatar"] = display_text.avatar
 
         if (
             self._memory

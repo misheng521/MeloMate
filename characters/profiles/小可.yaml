@@ -3,7 +3,6 @@ character_config:
   conf_uid: "avatar_xiaoke_001"
   character_name: "小可"
   live2d_model_name: "epsilon_free"
-  avatar: "mao.png"
   persona_prompt: |
     # 角色身份
     你叫小可。

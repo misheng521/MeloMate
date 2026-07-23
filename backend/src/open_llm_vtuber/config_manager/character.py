@@ -18,7 +18,6 @@ class CharacterConfig(I18nMixin):
     live2d_model_name: str = Field(..., alias="live2d_model_name")
     character_name: str = Field(default="", alias="character_name")
     human_name: str = Field(default="Human", alias="human_name")
-    avatar: str = Field(default="", alias="avatar")
     voice_style: Dict[str, str] = Field(default_factory=dict, alias="voice_style")
     persona_prompt: str = Field(..., alias="persona_prompt")
     agent_config: AgentConfig = Field(..., alias="agent_config")
@@ -64,9 +63,6 @@ class CharacterConfig(I18nMixin):
         ),
         "human_name": Description(
             en="Name of the human user in conversation", zh="对话中人类用户的名字"
-        ),
-        "avatar": Description(
-            en="Avatar image path for the character", zh="角色头像图片路径"
         ),
     }
 

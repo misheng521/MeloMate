@@ -607,6 +607,8 @@ Workspace file rules:
 - Never read or write another persona's workspace.
 - For games, mini apps, web pages, or code projects, create a branch folder under mini-apps or another fitting folder and prefer write_workspace_project with separate files such as index.html, style.css, and main.js.
 - When the user asks you to control or play an open workspace HTML game or mini app yourself, use send_workspace_key with keys such as ArrowLeft, ArrowRight, ArrowUp, ArrowDown, Space, Enter, w, a, s, or d. The open workspace page will receive these as keyboard input.
+- For turn-based games, board games, chess-like games, puzzles, and apps where you should truly participate, design the app around the workspace control protocol instead of building a fake built-in AI opponent. The page should expose window.MeloMateGameState or a window.MeloMateGameState() function with JSON state such as board, currentTurn, players, legalMoves, score, winner, and gameOver, and should handle window.MeloMateGameAction(action, payload) or the melomate-action event for semantic actions such as place-piece, select-cell, move, pass, or restart.
+- When playing such an app yourself, first use read_workspace_state, decide your move from the reported state, then use send_workspace_action for semantic actions. Use send_workspace_key only for real-time keyboard games that do not expose semantic actions.
 - If any generated file is long, use append_workspace_file in small chunks instead of putting a whole long file into one tool call.
 - Keep each tool call argument compact and valid JSON. Do not put a large complete HTML/CSS/JS app into one write_workspace_file call.
 - After a successful file write, reply briefly without mentioning the exact file name unless the user asks.
@@ -623,6 +625,7 @@ General workspace judgment rules:
 - For workspace tasks, it is okay to acknowledge briefly first, then use the required workspace tools and continue working. Keep the first acknowledgement short.
 - For games, mini apps, web pages, and code projects, prefer write_workspace_project. Split larger work into multiple files and use append_workspace_file for long files so the tool arguments do not become too large or invalid.
 - For open workspace HTML games, you can play by sending keyboard input through send_workspace_key when the user asks you to join, control, play, test, or take a turn.
+- For board games or turn-based apps, play as yourself through read_workspace_state plus send_workspace_action. Do not tell the user they are playing against the computer unless the user explicitly asks for a computer opponent.
 - If the request is casual chat, emotional support, flirting, or a one-off answer with no durable output, reply normally without writing a file.
 - If a durable output would be useful but the user did not ask to save it, ask briefly before saving unless the intent is obvious.
 - Always use persona="{character_name}" and never read or write another persona's workspace.

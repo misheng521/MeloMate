@@ -225,7 +225,8 @@ audio {
 }
 
 .background-list,
-.character-list {
+.character-list,
+.workspace-list {
   display: grid;
   align-content: start;
   gap: 10px;
@@ -236,7 +237,8 @@ audio {
 }
 
 .background-list[hidden],
-.character-list[hidden] {
+.character-list[hidden],
+.workspace-list[hidden] {
   display: none !important;
 }
 
@@ -347,6 +349,88 @@ audio {
 .character-file {
   color: #7b6c73;
   font-size: 11px;
+}
+
+.workspace-header {
+  display: grid;
+  gap: 2px;
+  padding: 2px 2px 4px;
+}
+
+.workspace-title,
+.workspace-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-title {
+  color: #2f282d;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.workspace-path {
+  color: #7b6c73;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.workspace-item {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  align-items: center;
+  width: 100%;
+  min-height: 44px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 7px;
+  background: rgba(255, 255, 255, 0.72);
+  color: #2f282d;
+  cursor: pointer;
+  text-align: left;
+}
+
+.workspace-item:hover:not(:disabled) {
+  border-color: rgba(34, 32, 37, 0.22);
+  background: rgba(255, 255, 255, 0.96);
+}
+
+.workspace-item:disabled {
+  cursor: default;
+}
+
+.workspace-icon {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border-radius: 6px;
+  background: #f2f0ee;
+  color: #5b4e55;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.workspace-name {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-message {
+  margin: 0;
+  border-radius: 8px;
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.64);
+  color: #6f6268;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.45;
 }
 
 #canvas {

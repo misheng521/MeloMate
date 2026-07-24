@@ -67,6 +67,12 @@ type BackgroundOption = {
   url: string;
 };
 
+type WorkspaceEntry = {
+  name: string;
+  path: string;
+  type: "directory" | "file";
+};
+
 type CharacterConfigOption = {
   filename: string;
   name?: string;
@@ -82,7 +88,7 @@ type Live2DModelOption = {
   scale: number;
 };
 
-type AssetPanelTab = "background" | "character";
+type AssetPanelTab = "background" | "character" | "workspace";
 
 declare global {
   interface Window {
@@ -93,6 +99,7 @@ declare global {
 const settingsStorageKey = "melomate-settings";
 const backgroundManifestUrl = "/api/backgrounds";
 const live2DModelManifestUrl = "/api/live2d-models";
+const workspaceManifestUrl = "/api/workspace";
 const fallbackBackgrounds: BackgroundOption[] = [{ name: "Default", url: "/backgrounds/default.svg" }];
 const defaultCharacterConfigFile = "小可.yaml";
 const defaultCharacterOption: CharacterConfigOption = { filename: defaultCharacterConfigFile };
@@ -187,8 +194,10 @@ const backgroundSidebar = document.querySelector<HTMLElement>("#backgroundSideba
 const backgroundSidebarToggle = document.querySelector<HTMLButtonElement>("#backgroundSidebarToggle")!;
 const backgroundTab = document.querySelector<HTMLButtonElement>("#backgroundTab")!;
 const characterTab = document.querySelector<HTMLButtonElement>("#characterTab")!;
+const workspaceTab = document.querySelector<HTMLButtonElement>("#workspaceTab")!;
 const backgroundList = document.querySelector<HTMLDivElement>("#backgroundList")!;
 const characterList = document.querySelector<HTMLDivElement>("#characterList")!;
+const workspaceList = document.querySelector<HTMLDivElement>("#workspaceList")!;
 
 type SinkAudioElement = HTMLAudioElement & {
   setSinkId?: (sinkId: string) => Promise<void>;
@@ -217,6 +226,7 @@ let referenceAudioObjectUrl = "";
 let backgroundOptions: BackgroundOption[] = [];
 let characterOptions: CharacterConfigOption[] = [];
 let activeAssetPanelTab: AssetPanelTab = "background";
+let currentWorkspaceFolder = "";
 let lastAppliedCharacterConfigFile = "";
 let currentAssistantName = "小可";
 let activeLive2DModelId = "";
@@ -373,14 +383,23 @@ function setAssetPanelTab(tab: AssetPanelTab, shouldOpen = true) {
     backgroundSidebarToggle.setAttribute("aria-expanded", "true");
   }
   const isBackgroundTab = tab === "background";
+  const isCharacterTab = tab === "character";
+  const isWorkspaceTab = tab === "workspace";
 
   backgroundTab.classList.toggle("active", isBackgroundTab);
-  characterTab.classList.toggle("active", !isBackgroundTab);
+  characterTab.classList.toggle("active", isCharacterTab);
+  workspaceTab.classList.toggle("active", isWorkspaceTab);
   backgroundTab.setAttribute("aria-pressed", String(isBackgroundTab));
-  characterTab.setAttribute("aria-pressed", String(!isBackgroundTab));
+  characterTab.setAttribute("aria-pressed", String(isCharacterTab));
+  workspaceTab.setAttribute("aria-pressed", String(isWorkspaceTab));
   backgroundList.hidden = !isBackgroundTab;
-  characterList.hidden = isBackgroundTab;
+  characterList.hidden = !isCharacterTab;
+  workspaceList.hidden = !isWorkspaceTab;
   backgroundSidebarToggle.setAttribute("aria-label", backgroundSidebar.classList.contains("open") ? "收起素材" : "展开素材");
+
+  if (isWorkspaceTab) {
+    void refreshWorkspaceList();
+  }
 }
 
 async function readBackgroundOptions() {
@@ -446,6 +465,113 @@ function selectedCharacterOption() {
   return characterOptions.find((option) => option.filename === selectedFile);
 }
 
+function workspacePersonaName() {
+  const option = selectedCharacterOption();
+  return characterOptionDisplayName(option || defaultCharacterOption);
+}
+
+function workspaceFolderLabel() {
+  return currentWorkspaceFolder || "根目录";
+}
+
+async function readWorkspaceEntries(folder = currentWorkspaceFolder) {
+  const params = new URLSearchParams({
+    persona: workspacePersonaName(),
+    folder,
+  });
+  const response = await fetch(`${workspaceManifestUrl}?${params.toString()}`, { cache: "no-store" });
+  if (!response.ok) throw new Error(`工作区加载失败：${response.status}`);
+  return (await response.json()) as { entries?: WorkspaceEntry[]; folder?: string };
+}
+
+function renderWorkspaceMessage(text: string) {
+  workspaceList.textContent = "";
+  const message = document.createElement("p");
+  message.className = "workspace-message";
+  message.textContent = text;
+  workspaceList.appendChild(message);
+}
+
+function renderWorkspaceEntries(entries: WorkspaceEntry[]) {
+  workspaceList.textContent = "";
+
+  const header = document.createElement("div");
+  header.className = "workspace-header";
+
+  const title = document.createElement("span");
+  title.className = "workspace-title";
+  title.textContent = workspacePersonaName();
+
+  const path = document.createElement("span");
+  path.className = "workspace-path";
+  path.textContent = workspaceFolderLabel();
+
+  header.append(title, path);
+  workspaceList.appendChild(header);
+
+  if (currentWorkspaceFolder) {
+    const back = document.createElement("button");
+    back.className = "workspace-item";
+    back.type = "button";
+    back.setAttribute("role", "listitem");
+    back.textContent = "返回上一级";
+    back.addEventListener("click", () => {
+      const parts = currentWorkspaceFolder.split("/").filter(Boolean);
+      parts.pop();
+      currentWorkspaceFolder = parts.join("/");
+      void refreshWorkspaceList();
+    });
+    workspaceList.appendChild(back);
+  }
+
+  if (!entries.length) {
+    const empty = document.createElement("p");
+    empty.className = "workspace-message";
+    empty.textContent = "这个人设的工作区还没有文件。";
+    workspaceList.appendChild(empty);
+    return;
+  }
+
+  entries.forEach((entry) => {
+    const item = document.createElement("button");
+    item.className = "workspace-item";
+    item.type = "button";
+    item.dataset.path = entry.path;
+    item.setAttribute("role", "listitem");
+    item.disabled = entry.type !== "directory";
+
+    const icon = document.createElement("span");
+    icon.className = "workspace-icon";
+    icon.textContent = entry.type === "directory" ? "夹" : "文";
+
+    const label = document.createElement("span");
+    label.className = "workspace-name";
+    label.textContent = entry.name;
+
+    item.append(icon, label);
+    if (entry.type === "directory") {
+      item.addEventListener("click", () => {
+        currentWorkspaceFolder = entry.path;
+        void refreshWorkspaceList();
+      });
+    }
+    workspaceList.appendChild(item);
+  });
+}
+
+async function refreshWorkspaceList() {
+  renderWorkspaceMessage("正在读取工作区...");
+
+  try {
+    const data = await readWorkspaceEntries();
+    currentWorkspaceFolder = data.folder || currentWorkspaceFolder;
+    renderWorkspaceEntries(data.entries || []);
+  } catch (error) {
+    console.warn(error);
+    renderWorkspaceMessage(error instanceof Error ? error.message : "工作区加载失败。");
+  }
+}
+
 function selectedLive2DModelOption() {
   return (
     live2dModelOptions.find((option) => option.id === savedSettings?.live2dModelId) ||
@@ -496,9 +622,13 @@ function selectCharacterConfigFile(file: string) {
 
   syncAssistantNameFromSelection();
   saveSettings();
+  currentWorkspaceFolder = "";
 
   if (isWsReady && selectedCharacterConfigFile() !== lastAppliedCharacterConfigFile) {
     sendCharacterConfigSwitch();
+  }
+  if (activeAssetPanelTab === "workspace") {
+    void refreshWorkspaceList();
   }
 }
 
@@ -2133,6 +2263,7 @@ backgroundSidebarToggle.addEventListener("click", () => {
 
 backgroundTab.addEventListener("click", () => setAssetPanelTab("background"));
 characterTab.addEventListener("click", () => setAssetPanelTab("character"));
+workspaceTab.addEventListener("click", () => setAssetPanelTab("workspace"));
 
 toggleApiKey.addEventListener("click", () => syncSecretToggle(apiKeyInput, toggleApiKey));
 toggleScreenVisionApiKey.addEventListener("click", () =>

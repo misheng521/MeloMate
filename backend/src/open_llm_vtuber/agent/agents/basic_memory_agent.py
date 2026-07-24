@@ -39,6 +39,7 @@ WORKSPACE_TOOL_NAMES = {
     "read_workspace_file",
     "list_workspace",
     "schedule_reminder",
+    "send_workspace_key",
     "open_workspace_item",
 }
 
@@ -256,6 +257,8 @@ class BasicMemoryAgent(AgentInterface):
             return "好，我打开给你。"
         if "schedule_reminder" in names:
             return "好，我先记下这个提醒。"
+        if "send_workspace_key" in names:
+            return "好，轮到我来操作。"
         if names & {
             "write_workspace_file",
             "append_workspace_file",

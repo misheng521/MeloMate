@@ -124,7 +124,7 @@ class AsyncLLM(StatelessLLMInterface):
                 messages=converted_messages,
                 system=system if system else (self.system if self.system else ""),
                 model=self.model,
-                max_tokens=1024,
+                max_tokens=8192,
                 tools=tools if tools else NOT_GIVEN,
             ) as stream:
                 current_tool_call_info = None

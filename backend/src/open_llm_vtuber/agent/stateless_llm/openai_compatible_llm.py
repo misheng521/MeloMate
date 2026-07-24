@@ -107,7 +107,7 @@ class AsyncLLM(StatelessLLMInterface):
                 model=self.model,
                 stream=True,
                 temperature=self.temperature,
-                max_tokens=1024,
+                max_tokens=8192,
                 tools=available_tools,
             )
             logger.debug(

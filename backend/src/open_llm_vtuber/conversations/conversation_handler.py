@@ -212,7 +212,10 @@ def _queued_input_has_content(item: Dict[str, Any]) -> bool:
 def _looks_like_workspace_revision(item: Dict[str, Any]) -> bool:
     user_input = item.get("user_input")
     if isinstance(user_input, np.ndarray):
-        metadata = item.setdefault("metadata", {})
+        metadata = item.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            item["metadata"] = metadata
         metadata["workspace_revision_candidate"] = True
         return False
     if not isinstance(user_input, str):

@@ -35,12 +35,20 @@ def persona_root(persona: str) -> Path:
     return ensure_inside(WORKSPACE_ROOT, WORKSPACE_ROOT / safe_name(persona))
 
 
-def workspace_path(persona: str, relative_path: str = "") -> Path:
+def clean_workspace_parts(persona: str, relative_path: str = "") -> list[str]:
+    persona_name = safe_name(persona)
     clean_parts = [
         safe_name(part, "")
         for part in Path(str(relative_path or "")).parts
         if part not in {"", ".", ".."}
     ]
+    while clean_parts and clean_parts[0] == persona_name:
+        clean_parts.pop(0)
+    return clean_parts
+
+
+def workspace_path(persona: str, relative_path: str = "") -> Path:
+    clean_parts = clean_workspace_parts(persona, relative_path)
     return ensure_inside(persona_root(persona), persona_root(persona).joinpath(*clean_parts))
 
 
@@ -143,11 +151,7 @@ def write_workspace_project(persona: str, folder: str, files: list[dict[str, Any
         if len(content.encode("utf-8")) > MAX_FILE_BYTES:
             raise ValueError(f"{relative_file} is too large.")
 
-        safe_parts = [
-            safe_name(part, "")
-            for part in Path(relative_file).parts
-            if part not in {"", ".", ".."}
-        ]
+        safe_parts = clean_workspace_parts(persona, relative_file)
         if not safe_parts or "." not in safe_parts[-1]:
             raise ValueError("each project file path must include a filename with an extension.")
 

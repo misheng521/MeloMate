@@ -235,6 +235,16 @@ async def process_queued_user_inputs(
     if len(parts) == 1:
         return parts[0]
 
+    await websocket_send(
+        json.dumps(
+            {
+                "type": "user-input-merged",
+                "texts": parts,
+                "text": "\n".join(parts),
+            },
+            ensure_ascii=False,
+        )
+    )
     joined = "\n".join(f"{index + 1}. {part}" for index, part in enumerate(parts))
     return (
         "The user sent several messages before you replied. "
@@ -253,6 +263,7 @@ def is_workspace_tool_status(output_item: Dict[str, Any]) -> bool:
         "read_workspace_file",
         "list_workspace",
         "schedule_reminder",
+        "send_workspace_key",
         "open_workspace_item",
     }
 

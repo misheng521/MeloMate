@@ -97,6 +97,22 @@ class ServiceContext:
             f"  MCP Enabled: {'Yes' if self.mcp_client else 'No'}"
         )
 
+    def _enable_workspace_mcp(self, config: Config) -> None:
+        """Enable the local workspace tool for every persona without editing each YAML profile."""
+        basic_agent = (
+            config.character_config.agent_config.agent_settings.basic_memory_agent
+            if config and config.character_config and config.character_config.agent_config
+            else None
+        )
+        if not basic_agent:
+            return
+
+        basic_agent.use_mcpp = True
+        enabled_servers = list(basic_agent.mcp_enabled_servers or [])
+        if "workspace" not in enabled_servers:
+            enabled_servers.append("workspace")
+        basic_agent.mcp_enabled_servers = enabled_servers
+
     # ==== Initializers
 
     async def _init_mcp_components(self, use_mcpp, enabled_servers):
@@ -233,6 +249,7 @@ class ServiceContext:
         if not system_config:
             raise ValueError("system_config cannot be None")
 
+        self._enable_workspace_mcp(config)
         self.config = config
         self.system_config = system_config
         self.character_config = character_config
@@ -264,6 +281,8 @@ class ServiceContext:
         Parameters:
         - config (Dict): The configuration dictionary.
         """
+        self._enable_workspace_mcp(config)
+
         if not self.config:
             self.config = config
 
@@ -545,6 +564,39 @@ class ServiceContext:
                 continue
 
             persona_prompt += prompt_content
+
+        character_name = (
+            self.character_config.character_name
+            or self.character_config.conf_name
+            or "default"
+        )
+        persona_prompt += f"""
+
+Workspace file rules:
+- When the user asks you to create, save, record, write, draw, generate a file, make an SVG, keep a diary, create study notes, or build a small code project, use the workspace MCP tools instead of only replying in chat.
+- When the user asks for a reminder, such as "remind me in 10 minutes" or "提醒我十分钟后喝水", use schedule_reminder. Use delay_minutes for relative times and due_at for exact times. Reminder time is based on the user's device/local machine time.
+- Always use persona="{character_name}" when calling workspace tools.
+- Files must be created under workspace/{character_name}/. Create a fitting folder first, such as diary, drawings, study, notes, mini-apps, reminders, or a user-requested folder.
+- Never read or write another persona's workspace.
+- After a successful file write, reply briefly and mention the saved relative path.
+"""
+
+        persona_prompt += f"""
+
+General workspace judgment rules:
+- The workspace is this persona's private working area, not a fixed feature list.
+- Do not limit workspace use to diary, drawings, study notes, or mini apps. Those are examples only.
+- When the user's request can produce a reusable artifact, record, file, plan, draft, code project, list, dataset, configuration, reminder, note, creative work, or other durable output, decide whether it should be created or updated in the workspace.
+- Choose a suitable folder and file type based on the user's intent. Examples include writing, recipes, travel, fitness, music, lists, reviews, budget, data, prompts, configs, plans, logs, and user-requested folders.
+- If the user explicitly asks to save, remember in a file, create, generate, draw, write down, make a plan, build, export, or remind, use a workspace tool before replying normally.
+- For workspace tasks, call the required workspace tool before saying any conversational text. Do not start with phrases like "I will make..." or "I am going to..." before the tool call.
+- If the request is casual chat, emotional support, flirting, or a one-off answer with no durable output, reply normally without writing a file.
+- If a durable output would be useful but the user did not ask to save it, ask briefly before saving unless the intent is obvious.
+- Always use persona="{character_name}" and never read or write another persona's workspace.
+- If you complete workspace work, tell the user briefly that it is ready in the relevant workspace branch folder. Do not mention the exact file name unless the user asks.
+- After completing workspace work, ask whether the user wants to see it, open it, play it, or try it now, depending on the artifact type.
+- If the user says they want to see, open, play, or try a generated workspace item, call open_workspace_item with the relevant workspace path before replying normally.
+"""
 
         logger.debug("\n === System Prompt ===")
         logger.debug(persona_prompt)

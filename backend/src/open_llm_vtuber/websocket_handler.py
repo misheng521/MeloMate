@@ -78,6 +78,11 @@ class WebSocketHandler:
         self.client_contexts: Dict[str, ServiceContext] = {}
         self.chat_group_manager = ChatGroupManager()
         self.current_conversation_tasks: Dict[str, Optional[asyncio.Task]] = {}
+        self.pending_conversation_inputs: Dict[str, list[dict]] = {}
+        self.in_flight_conversation_inputs: Dict[str, list[dict]] = {}
+        self.reply_started_flags: Dict[str, bool] = {}
+        self.workspace_work_flags: Dict[str, bool] = {}
+        self.workspace_revision_flags: Dict[str, bool] = {}
         self.default_context_cache = default_context_cache
         self.received_data_buffers: Dict[str, np.ndarray] = {}
 
@@ -315,6 +320,11 @@ class WebSocketHandler:
         self.client_connections.pop(client_uid, None)
         self.client_contexts.pop(client_uid, None)
         self.received_data_buffers.pop(client_uid, None)
+        self.pending_conversation_inputs.pop(client_uid, None)
+        self.in_flight_conversation_inputs.pop(client_uid, None)
+        self.reply_started_flags.pop(client_uid, None)
+        self.workspace_work_flags.pop(client_uid, None)
+        self.workspace_revision_flags.pop(client_uid, None)
         if client_uid in self.current_conversation_tasks:
             task = self.current_conversation_tasks[client_uid]
             if task and not task.done():
@@ -334,6 +344,11 @@ class WebSocketHandler:
         self.client_connections.pop(client_uid, None)
         self.client_contexts.pop(client_uid, None)
         self.received_data_buffers.pop(client_uid, None)
+        self.pending_conversation_inputs.pop(client_uid, None)
+        self.in_flight_conversation_inputs.pop(client_uid, None)
+        self.reply_started_flags.pop(client_uid, None)
+        self.workspace_work_flags.pop(client_uid, None)
+        self.workspace_revision_flags.pop(client_uid, None)
         self.chat_group_manager.client_group_map.pop(client_uid, None)
 
         if client_uid in self.current_conversation_tasks:
@@ -539,6 +554,11 @@ class WebSocketHandler:
             chat_group_manager=self.chat_group_manager,
             received_data_buffers=self.received_data_buffers,
             current_conversation_tasks=self.current_conversation_tasks,
+            pending_conversation_inputs=self.pending_conversation_inputs,
+            in_flight_conversation_inputs=self.in_flight_conversation_inputs,
+            reply_started_flags=self.reply_started_flags,
+            workspace_work_flags=self.workspace_work_flags,
+            workspace_revision_flags=self.workspace_revision_flags,
             broadcast_to_group=self.broadcast_to_group,
         )
 

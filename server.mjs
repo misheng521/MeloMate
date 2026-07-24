@@ -227,6 +227,7 @@ function workspaceControlScript(persona) {
   let since = Date.now();
   const seen = new Set();
   let lastStateJson = "";
+  const actions = [];
   const codeByKey = {
     " ": "Space",
     Space: "Space",
@@ -263,17 +264,53 @@ function workspaceControlScript(persona) {
     }
   }
 
-  function runAction(command) {
+  function safeJson(value) {
+    if (value === undefined) return null;
+    try {
+      return JSON.parse(JSON.stringify(value));
+    } catch {
+      return String(value);
+    }
+  }
+
+  async function runAction(command) {
     const detail = {
       action: command.action,
       payload: command.payload || {},
       id: command.id
     };
+    let handled = false;
+    let accepted = true;
+    let result = null;
+    let error = "";
     if (typeof window.MeloMateGameAction === "function") {
-      window.MeloMateGameAction(detail.action, detail.payload, detail);
+      handled = true;
+      try {
+        result = await window.MeloMateGameAction(detail.action, detail.payload, detail);
+        if (result === false) accepted = false;
+        if (result && typeof result === "object" && result.accepted === false) accepted = false;
+      } catch (exception) {
+        accepted = false;
+        error = exception && exception.message ? exception.message : String(exception);
+      }
     }
-    window.dispatchEvent(new CustomEvent("melomate-action", { detail }));
-    document.dispatchEvent(new CustomEvent("melomate-action", { detail }));
+    const event = new CustomEvent("melomate-action", { detail, bubbles: true, cancelable: true });
+    window.dispatchEvent(event);
+    document.dispatchEvent(new CustomEvent("melomate-action", { detail, bubbles: true, cancelable: true }));
+    if (event.defaultPrevented) handled = true;
+    const actionResult = {
+      id: detail.id,
+      action: detail.action,
+      payload: detail.payload,
+      handled,
+      accepted: handled && accepted,
+      result: safeJson(result),
+      error,
+      at_ms: Date.now()
+    };
+    actions.push(actionResult);
+    while (actions.length > 20) actions.shift();
+    await publishState(currentState(), true);
   }
 
   function currentState() {
@@ -286,15 +323,26 @@ function workspaceControlScript(persona) {
     return null;
   }
 
-  async function publishState(nextState) {
-    if (nextState == null) return;
-    const stateJson = JSON.stringify(nextState);
-    if (stateJson === lastStateJson) return;
+  async function publishState(nextState, force = false) {
+    const report = {
+      protocolAvailable: nextState != null,
+      appState: nextState,
+      lastAction: actions.length ? actions[actions.length - 1] : null,
+      actions,
+      page: {
+        title: document.title,
+        path: location.pathname,
+        href: location.href
+      },
+      reported_ms: Date.now()
+    };
+    const stateJson = JSON.stringify(report);
+    if (!force && stateJson === lastStateJson) return;
     lastStateJson = stateJson;
     await fetch("/api/workspace-state", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ persona, state: nextState })
+      body: JSON.stringify({ persona, state: report })
     });
   }
 
@@ -309,7 +357,7 @@ function workspaceControlScript(persona) {
         seen.add(command.id);
         since = Math.max(since, Number(command.created_ms || since));
         if (command.type === "key") runCommand(command);
-        if (command.type === "action") runAction(command);
+        if (command.type === "action") await runAction(command);
       }
       await publishState(currentState());
     } catch {
@@ -324,6 +372,8 @@ function workspaceControlScript(persona) {
     updateState: publishState
   };
   window.setInterval(poll, 180);
+  window.setInterval(() => publishState(currentState(), true), 1000);
+  publishState(currentState(), true);
 })();
 </script>`;
 }

@@ -482,6 +482,16 @@ async function readWorkspaceEntries(folder = currentWorkspaceFolder) {
   return (await response.json()) as { entries?: WorkspaceEntry[]; folder?: string };
 }
 
+function workspaceFileUrl(path: string) {
+  const persona = encodeURIComponent(workspacePersonaName());
+  const filePath = path
+    .split("/")
+    .filter(Boolean)
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+  return `/workspace-files/${persona}/${filePath}`;
+}
+
 function clearWorkspaceCache() {
   currentWorkspaceFolder = "";
   expandedWorkspaceFolders = new Set<string>();
@@ -536,7 +546,9 @@ function renderWorkspaceEntry(entry: WorkspaceEntry, depth = 0) {
     });
   } else {
     arrow.textContent = "";
-    row.disabled = true;
+    row.addEventListener("click", () => {
+      window.open(workspaceFileUrl(entry.path), "_blank", "noopener");
+    });
   }
 
   row.append(arrow, label);

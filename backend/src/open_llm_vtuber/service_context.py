@@ -606,6 +606,7 @@ Workspace file rules:
 - Do not create a folder named "{character_name}" inside workspace/{character_name}/. The persona argument already selects that root folder.
 - Never read or write another persona's workspace.
 - For games, mini apps, web pages, or code projects, create a branch folder under mini-apps or another fitting folder and prefer write_workspace_project with separate files such as index.html, style.css, and main.js.
+- When the user asks you to control or play an open workspace HTML game or mini app yourself, use send_workspace_key with keys such as ArrowLeft, ArrowRight, ArrowUp, ArrowDown, Space, Enter, w, a, s, or d. The open workspace page will receive these as keyboard input.
 - If any generated file is long, use append_workspace_file in small chunks instead of putting a whole long file into one tool call.
 - Keep each tool call argument compact and valid JSON. Do not put a large complete HTML/CSS/JS app into one write_workspace_file call.
 - After a successful file write, reply briefly without mentioning the exact file name unless the user asks.
@@ -621,6 +622,7 @@ General workspace judgment rules:
 - If the user explicitly asks to save, remember in a file, create, generate, draw, write down, make a plan, build, export, or remind, use a workspace tool before replying normally.
 - For workspace tasks, it is okay to acknowledge briefly first, then use the required workspace tools and continue working. Keep the first acknowledgement short.
 - For games, mini apps, web pages, and code projects, prefer write_workspace_project. Split larger work into multiple files and use append_workspace_file for long files so the tool arguments do not become too large or invalid.
+- For open workspace HTML games, you can play by sending keyboard input through send_workspace_key when the user asks you to join, control, play, test, or take a turn.
 - If the request is casual chat, emotional support, flirting, or a one-off answer with no durable output, reply normally without writing a file.
 - If a durable output would be useful but the user did not ask to save it, ask briefly before saving unless the intent is obvious.
 - Always use persona="{character_name}" and never read or write another persona's workspace.

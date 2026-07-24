@@ -9,6 +9,17 @@ const contentRoots = {
   "/reference_sounds": path.resolve(__dirname, "reference_sounds"),
 };
 const workspaceRoot = path.resolve(__dirname, "workspace");
+const responseTypes: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml; charset=utf-8",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+};
 
 function isInside(basePath: string, filePath: string) {
   const child = path.relative(basePath, filePath);
@@ -86,6 +97,128 @@ function listWorkspace(persona: string, folder: string) {
   return { persona: safePersona, folder: safeFolder, entries };
 }
 
+function resolveWorkspaceFile(pathname: string) {
+  const prefix = "/workspace-files/";
+  if (!pathname.startsWith(prefix)) return null;
+
+  const parts = pathname
+    .slice(prefix.length)
+    .split("/")
+    .filter(Boolean)
+    .map((part) => decodeURIComponent(part));
+  const persona = safeName(parts.shift() || "");
+  if (!persona || !parts.length) return null;
+
+  const personaRoot = path.resolve(workspaceRoot, persona);
+  const filePath = path.resolve(personaRoot, safeWorkspaceFolder(parts.join("/")));
+  if (!isInside(personaRoot, filePath) || !fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+    return null;
+  }
+  return filePath;
+}
+
+function workspacePersonaFromFile(filePath: string) {
+  if (!isInside(workspaceRoot, filePath)) return "";
+  const relativePath = path.relative(workspaceRoot, filePath).replace(/\\/g, "/");
+  return relativePath.split("/").filter(Boolean)[0] || "";
+}
+
+function readWorkspaceCommands(persona: string, sinceMs: number) {
+  const safePersona = safeName(persona);
+  if (!safePersona) return [];
+
+  const commandFile = path.resolve(workspaceRoot, safePersona, ".control", "commands.jsonl");
+  if (!isInside(path.resolve(workspaceRoot, safePersona), commandFile) || !fs.existsSync(commandFile) || !fs.statSync(commandFile).isFile()) {
+    return [];
+  }
+
+  const minCreatedMs = Number.isFinite(sinceMs) ? sinceMs : 0;
+  return fs
+    .readFileSync(commandFile, "utf8")
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .slice(-200)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter((command) => command && Number(command.created_ms || 0) > minCreatedMs);
+}
+
+function workspaceControlScript(persona: string) {
+  return `<script>
+(() => {
+  const persona = ${JSON.stringify(persona)};
+  let since = Date.now();
+  const seen = new Set();
+  const codeByKey = {
+    " ": "Space",
+    Space: "Space",
+    Enter: "Enter",
+    ArrowLeft: "ArrowLeft",
+    ArrowRight: "ArrowRight",
+    ArrowUp: "ArrowUp",
+    ArrowDown: "ArrowDown",
+    Escape: "Escape"
+  };
+
+  function dispatchKey(type, command) {
+    const key = command.key === "Space" ? " " : command.key;
+    const code = command.code || codeByKey[command.key] || (/^[a-z]$/i.test(command.key) ? "Key" + command.key.toUpperCase() : command.key);
+    const event = new KeyboardEvent(type, {
+      key,
+      code,
+      bubbles: true,
+      cancelable: true
+    });
+    const target = document.activeElement && document.activeElement !== document.body ? document.activeElement : document;
+    target.dispatchEvent(event);
+    window.dispatchEvent(event);
+  }
+
+  function runCommand(command) {
+    const repeat = Math.max(1, Math.min(Number(command.repeat || 1), 20));
+    const duration = Math.max(20, Math.min(Number(command.duration_ms || 80), 2000));
+    for (let index = 0; index < repeat; index += 1) {
+      window.setTimeout(() => {
+        dispatchKey("keydown", command);
+        window.setTimeout(() => dispatchKey("keyup", command), duration);
+      }, index * (duration + 35));
+    }
+  }
+
+  async function poll() {
+    try {
+      const params = new URLSearchParams({ persona, since: String(since) });
+      const response = await fetch("/api/workspace-control?" + params.toString(), { cache: "no-store" });
+      if (!response.ok) return;
+      const payload = await response.json();
+      for (const command of payload.commands || []) {
+        if (!command || seen.has(command.id)) continue;
+        seen.add(command.id);
+        since = Math.max(since, Number(command.created_ms || since));
+        if (command.type === "key") runCommand(command);
+      }
+    } catch {
+      // Workspace control is optional; games still run normally without it.
+    }
+  }
+
+  window.MeloMateWorkspaceControl = { runCommand };
+  window.setInterval(poll, 180);
+})();
+</script>`;
+}
+
+function workspaceHtml(filePath: string) {
+  const html = fs.readFileSync(filePath, "utf8");
+  const script = workspaceControlScript(workspacePersonaFromFile(filePath));
+  return /<\/body\s*>/i.test(html) ? html.replace(/<\/body\s*>/i, `${script}</body>`) : `${html}\n${script}`;
+}
+
 function listBackgrounds() {
   const supported = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"]);
   return walkFiles(contentRoots["/backgrounds"])
@@ -139,6 +272,29 @@ function contentPlugin() {
           return;
         }
 
+        if (url.pathname === "/api/workspace-control") {
+          response.setHeader("Content-Type", "application/json; charset=utf-8");
+          response.end(
+            JSON.stringify({
+              ok: true,
+              commands: readWorkspaceCommands(url.searchParams.get("persona") || "", Number(url.searchParams.get("since") || 0)),
+            }),
+          );
+          return;
+        }
+
+        const workspaceFile = resolveWorkspaceFile(url.pathname);
+        if (workspaceFile) {
+          response.setHeader("Content-Type", responseTypes[path.extname(workspaceFile).toLowerCase()] || "application/octet-stream");
+          response.setHeader("Cache-Control", "no-store");
+          if (path.extname(workspaceFile).toLowerCase() === ".html") {
+            response.end(workspaceHtml(workspaceFile));
+            return;
+          }
+          fs.createReadStream(workspaceFile).pipe(response);
+          return;
+        }
+
         for (const [prefix, basePath] of Object.entries(contentRoots)) {
           if (url.pathname === prefix || url.pathname.startsWith(`${prefix}/`)) {
             const filePath = path.resolve(basePath, decodeURIComponent(url.pathname.slice(prefix.length)));
@@ -146,6 +302,7 @@ function contentPlugin() {
               next();
               return;
             }
+            response.setHeader("Content-Type", responseTypes[path.extname(filePath).toLowerCase()] || "application/octet-stream");
             response.setHeader("Cache-Control", "no-store");
             fs.createReadStream(filePath).pipe(response);
             return;

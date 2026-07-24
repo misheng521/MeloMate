@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { createReadStream, existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { basename, dirname, extname, join, normalize, relative, resolve, sep } from "node:path";
 
@@ -148,6 +148,112 @@ function resolveWorkspaceFile(pathname) {
   return filePath;
 }
 
+function workspacePersonaFromFile(filePath) {
+  if (!isInside(workspaceRoot, filePath)) return "";
+  const relativePath = relative(workspaceRoot, filePath).replace(/\\/g, "/");
+  return relativePath.split("/").filter(Boolean)[0] || "";
+}
+
+function readWorkspaceCommands(persona, sinceMs) {
+  const safePersona = safeName(persona);
+  if (!safePersona) return [];
+
+  const commandFile = safeResolve(workspaceRoot, `${safePersona}/.control/commands.jsonl`);
+  if (!commandFile || !existsSync(commandFile) || !statSync(commandFile).isFile()) return [];
+
+  const minCreatedMs = Number.isFinite(sinceMs) ? sinceMs : 0;
+  return readFileSync(commandFile, "utf8")
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .slice(-200)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter((command) => command && Number(command.created_ms || 0) > minCreatedMs);
+}
+
+function workspaceControlScript(persona) {
+  return `<script>
+(() => {
+  const persona = ${JSON.stringify(persona)};
+  let since = Date.now();
+  const seen = new Set();
+  const codeByKey = {
+    " ": "Space",
+    Space: "Space",
+    Enter: "Enter",
+    ArrowLeft: "ArrowLeft",
+    ArrowRight: "ArrowRight",
+    ArrowUp: "ArrowUp",
+    ArrowDown: "ArrowDown",
+    Escape: "Escape"
+  };
+
+  function dispatchKey(type, command) {
+    const key = command.key === "Space" ? " " : command.key;
+    const code = command.code || codeByKey[command.key] || (/^[a-z]$/i.test(command.key) ? "Key" + command.key.toUpperCase() : command.key);
+    const event = new KeyboardEvent(type, {
+      key,
+      code,
+      bubbles: true,
+      cancelable: true
+    });
+    const target = document.activeElement && document.activeElement !== document.body ? document.activeElement : document;
+    target.dispatchEvent(event);
+    window.dispatchEvent(event);
+  }
+
+  function runCommand(command) {
+    const repeat = Math.max(1, Math.min(Number(command.repeat || 1), 20));
+    const duration = Math.max(20, Math.min(Number(command.duration_ms || 80), 2000));
+    for (let index = 0; index < repeat; index += 1) {
+      window.setTimeout(() => {
+        dispatchKey("keydown", command);
+        window.setTimeout(() => dispatchKey("keyup", command), duration);
+      }, index * (duration + 35));
+    }
+  }
+
+  async function poll() {
+    try {
+      const params = new URLSearchParams({ persona, since: String(since) });
+      const response = await fetch("/api/workspace-control?" + params.toString(), { cache: "no-store" });
+      if (!response.ok) return;
+      const payload = await response.json();
+      for (const command of payload.commands || []) {
+        if (!command || seen.has(command.id)) continue;
+        seen.add(command.id);
+        since = Math.max(since, Number(command.created_ms || since));
+        if (command.type === "key") runCommand(command);
+      }
+    } catch {
+      // Workspace control is optional; games still run normally without it.
+    }
+  }
+
+  window.MeloMateWorkspaceControl = { runCommand };
+  window.setInterval(poll, 180);
+})();
+</script>`;
+}
+
+function sendWorkspaceHtml(filePath, response) {
+  const persona = workspacePersonaFromFile(filePath);
+  const html = readFileSync(filePath, "utf8");
+  const script = workspaceControlScript(persona);
+  const bodyClose = /<\/body\s*>/i;
+  const content = bodyClose.test(html) ? html.replace(bodyClose, `${script}</body>`) : `${html}\n${script}`;
+  response.writeHead(200, {
+    "Content-Type": types[".html"],
+    "Cache-Control": "no-store",
+  });
+  response.end(content);
+}
+
 function listBackgrounds() {
   const supported = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"]);
   const backgrounds = walkFiles(contentRoots["/backgrounds"])
@@ -201,6 +307,15 @@ function handleContentApiRequest(request, response) {
 
   if (pathname === "/api/workspace") {
     jsonResponse(response, 200, listWorkspace(url.searchParams.get("persona") || "", url.searchParams.get("folder") || ""));
+    return true;
+  }
+
+  if (pathname === "/api/workspace-control") {
+    const since = Number(url.searchParams.get("since") || 0);
+    jsonResponse(response, 200, {
+      ok: true,
+      commands: readWorkspaceCommands(url.searchParams.get("persona") || "", since),
+    });
     return true;
   }
 
@@ -325,6 +440,10 @@ function listen(port) {
       return;
     }
 
+    if (isInside(workspaceRoot, filePath) && extname(filePath).toLowerCase() === ".html") {
+      sendWorkspaceHtml(filePath, response);
+      return;
+    }
     response.writeHead(200, {
       "Content-Type": types[extname(filePath)] || "application/octet-stream",
       "Cache-Control": "no-store",

@@ -1,6 +1,7 @@
 from typing import Union, List, Dict, Any, Optional
 import asyncio
 import json
+from typing import Callable
 from loguru import logger
 import numpy as np
 
@@ -32,6 +33,9 @@ async def process_single_conversation(
     screen_vision: Optional[Dict[str, Any]] = None,
     session_emoji: str = np.random.choice(EMOJI_LIST),
     metadata: Optional[Dict[str, Any]] = None,
+    on_reply_started: Optional[Callable[[], None]] = None,
+    on_workspace_work_started: Optional[Callable[[], None]] = None,
+    on_workspace_work_completed: Optional[Callable[[], None]] = None,
 ) -> str:
     """Process a single-user conversation turn
 
@@ -50,19 +54,33 @@ async def process_single_conversation(
     # Create TTSTaskManager for this conversation
     tts_manager = TTSTaskManager()
     full_response = ""  # Initialize full_response here
+    reply_started = False
 
     try:
         # Send initial signals
         await send_conversation_start_signals(websocket_send)
         logger.info(f"New Conversation Chain {session_emoji} started!")
 
-        # Process user input
-        input_text = await process_user_input(
+        # Process user input. Multiple queued inputs are merged into one model turn.
+        input_text = await process_queued_user_inputs(
             user_input, context.asr_engine, websocket_send
         )
         augmented_input_text = await augment_text_with_screen_context(
             input_text, images, screen_vision
         )
+        if metadata and metadata.get("workspace_revision_candidate"):
+            metadata["workspace_revision"] = looks_like_workspace_revision_text(
+                input_text
+            )
+
+        if metadata and metadata.get("workspace_revision"):
+            augmented_input_text = (
+                "The user is giving a modification or guidance for the workspace item "
+                "you just created or are creating. Treat this as a revision request for "
+                "that workspace work, not as unrelated chat. Update the relevant workspace "
+                "artifact before replying.\n"
+                f"{augmented_input_text}"
+            )
 
         # Create batch input
         batch_input = create_batch_input(
@@ -110,6 +128,12 @@ async def process_single_conversation(
                     isinstance(output_item, dict)
                     and output_item.get("type") == "tool_call_status"
                 ):
+                    if is_workspace_tool_status(output_item):
+                        if output_item.get("status") == "running":
+                            on_workspace_work_started and on_workspace_work_started()
+                        elif output_item.get("status") in {"completed", "error"}:
+                            on_workspace_work_completed and on_workspace_work_completed()
+
                     # Handle tool status event: send WebSocket message
                     output_item["name"] = context.character_config.character_name
                     logger.debug(f"Sending tool status update: {output_item}")
@@ -117,6 +141,9 @@ async def process_single_conversation(
                     await websocket_send(json.dumps(output_item))
 
                 elif isinstance(output_item, (SentenceOutput, AudioOutput)):
+                    if not reply_started:
+                        reply_started = True
+                        on_reply_started and on_reply_started()
                     # Handle SentenceOutput or AudioOutput
                     response_part = await process_agent_output(
                         output=output_item,
@@ -187,3 +214,108 @@ async def process_single_conversation(
         raise
     finally:
         cleanup_conversation(tts_manager, session_emoji)
+
+
+async def process_queued_user_inputs(
+    user_input: Union[str, np.ndarray, List[Union[str, np.ndarray]]],
+    asr_engine,
+    websocket_send: WebSocketSend,
+) -> str:
+    if not isinstance(user_input, list):
+        return await process_user_input(user_input, asr_engine, websocket_send)
+
+    parts: List[str] = []
+    for item in user_input:
+        text = (await process_user_input(item, asr_engine, websocket_send)).strip()
+        if text:
+            parts.append(text)
+
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+
+    joined = "\n".join(f"{index + 1}. {part}" for index, part in enumerate(parts))
+    return (
+        "The user sent several messages before you replied. "
+        "Treat them as one combined request and answer the latest full intent.\n"
+        f"{joined}"
+    )
+
+
+def is_workspace_tool_status(output_item: Dict[str, Any]) -> bool:
+    tool_name = str(output_item.get("tool_name") or "")
+    return tool_name in {
+        "create_workspace_folder",
+        "write_workspace_file",
+        "read_workspace_file",
+        "list_workspace",
+        "schedule_reminder",
+        "open_workspace_item",
+    }
+
+
+def looks_like_workspace_revision_text(text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    if not normalized:
+        return False
+
+    revision_keywords = (
+        "改",
+        "修改",
+        "换成",
+        "换为",
+        "变成",
+        "做成",
+        "加",
+        "加上",
+        "增加",
+        "删",
+        "删除",
+        "去掉",
+        "不要",
+        "颜色",
+        "风格",
+        "可爱",
+        "酷",
+        "简单点",
+        "复杂点",
+        "再",
+        "也要",
+        "还要",
+        "按钮",
+        "计分",
+        "关卡",
+        "背景",
+        "音效",
+        "动画",
+        "样式",
+        "布局",
+        "字体",
+        "rewrite",
+        "revise",
+        "change",
+        "make it",
+        "add",
+        "remove",
+        "style",
+        "color",
+    )
+    ordinary_chat_keywords = (
+        "在吗",
+        "算了",
+        "等等",
+        "等一下",
+        "先别",
+        "不用了",
+        "我有点",
+        "我想你",
+        "吃饭",
+        "睡觉",
+    )
+
+    if any(keyword in normalized for keyword in revision_keywords):
+        return True
+    if any(keyword in normalized for keyword in ordinary_chat_keywords):
+        return False
+    return False

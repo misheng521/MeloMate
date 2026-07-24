@@ -2,12 +2,14 @@ import json
 import os
 import re
 from datetime import datetime
+from pathlib import Path
 from typing import Literal, List, TypedDict, Optional
 
 from loguru import logger
 
 
-CHAT_HISTORY_DIR = os.path.join("..", "characters", "memory")
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+CHAT_HISTORY_DIR = str(PROJECT_ROOT / "characters" / "memory")
 SHORT_MEMORY_FILE = "short_memory.json"
 CORE_MEMORY_FILE = "core_memory.json"
 SINGLE_HISTORY_UID = "short_memory"

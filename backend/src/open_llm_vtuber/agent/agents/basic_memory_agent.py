@@ -271,10 +271,8 @@ class BasicMemoryAgent(AgentInterface):
             return "好，我打开给你。"
         if "schedule_reminder" in names:
             return "好，我先记下这个提醒。"
-        if "send_workspace_key" in names or "send_workspace_action" in names:
-            return "好，轮到我来操作。"
-        if "read_workspace_state" in names:
-            return "好，我先看一下当前局面。"
+        if names <= SILENT_WORKSPACE_TOOL_NAMES:
+            return ""
         if names & {
             "write_workspace_file",
             "append_workspace_file",

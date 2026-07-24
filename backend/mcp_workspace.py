@@ -33,7 +33,7 @@ def append_workspace_file(persona: str, folder: str, filename: str, content: str
 
 @mcp.tool()
 def write_workspace_project(persona: str, folder: str, files: list[dict]) -> str:
-    """Write a multi-file project under workspace/{persona}/{folder}. files must be a list of objects like {"path":"index.html","content":"..."}. Prefer this for games and mini apps, split into index.html, style.css, and main.js. For games the user plays with you, do not create built-in AI/opponent logic; expose MeloMateGameState and handle MeloMateGameAction/melomate-action so you can truly play through tools."""
+    """Write a multi-file project under workspace/{persona}/{folder}. files must be a list of objects like {"path":"index.html","content":"..."}. Prefer this for games, tools, and mini apps, split into index.html, style.css, and main.js. For anything the user expects you to operate, join, play, test, or react to, expose continuous MeloMateGameState/app state and handle MeloMateGameAction/melomate-action so you can truly control it through tools instead of using built-in fake AI."""
     return safe_call(workspace_core.write_workspace_project, persona, folder, files)
 
 
@@ -62,14 +62,14 @@ def send_workspace_key(persona: str, key: str, code: str = "", duration_ms: int 
 
 
 @mcp.tool()
-def send_workspace_action(persona: str, action: str, payload: dict | None = None) -> str:
-    """Send a semantic action to an open workspace HTML app for this persona. Prefer this for board games and turn-based apps, for example action="place-piece" with payload={"row": 7, "col": 7}. This only sends the action; it does not prove the app accepted it. After calling this, call read_workspace_state before claiming you moved or naming a position."""
-    return safe_call(workspace_core.send_workspace_action, persona, action, payload)
+def send_workspace_action(persona: str, action: str, payload: dict | None = None, wait_ms: int = 900) -> str:
+    """Send a semantic action to an open workspace HTML app for this persona. Prefer this for interactive tools, board games, turn-based apps, and any app that exposes app-specific actions, for example action="place-piece" with payload={"row": 7, "col": 7} or action="choose" with payload={"id":"card-2"}. This waits briefly for the page to confirm the action and return updated state. If confirmed=false, do not claim the action happened."""
+    return safe_call(workspace_core.send_workspace_action, persona, action, payload, wait_ms)
 
 
 @mcp.tool()
 def read_workspace_state(persona: str) -> str:
-    """Read the latest state reported by an open workspace HTML app for this persona. Use this before playing a turn in board games, puzzles, or interactive apps. If available=false, you cannot see the board and must not invent moves, coordinates, score, winner, or board position."""
+    """Read the latest state reported by an open workspace HTML app for this persona. Use this before controlling, playing, testing, or reacting to interactive workspace apps. If available=false, you cannot see the app state and must not invent moves, choices, coordinates, score, winner, or current UI state."""
     return safe_call(workspace_core.read_workspace_state, persona)
 
 

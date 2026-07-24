@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -313,10 +314,71 @@ def append_workspace_command(persona: str, command: dict[str, Any]) -> None:
         file.write(json.dumps(command, ensure_ascii=False) + "\n")
 
 
+def read_workspace_state_file(persona: str) -> dict[str, Any] | None:
+    target = ensure_inside(persona_root(persona), workspace_control_dir(persona) / "state.json")
+    if not target.is_file():
+        return None
+    if target.stat().st_size > MAX_FILE_BYTES:
+        raise ValueError("workspace state is too large to read.")
+    try:
+        state = json.loads(target.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("workspace state is not valid JSON.") from exc
+    return state if isinstance(state, dict) else {"state": state}
+
+
+def state_updated_ms(state: dict[str, Any] | None) -> int | None:
+    if not state:
+        return None
+    value = state.get("updated_ms")
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
+
+
+def find_action_result(state: dict[str, Any] | None, command_id: str) -> dict[str, Any] | None:
+    if not state:
+        return None
+    payload = state.get("state")
+    candidates: list[Any] = []
+    if isinstance(payload, dict):
+        candidates.extend([payload.get("lastAction"), payload.get("last_action")])
+        actions = payload.get("actions") or payload.get("actionResults") or payload.get("action_results")
+        if isinstance(actions, list):
+            candidates.extend(actions)
+    candidates.extend([state.get("lastAction"), state.get("last_action")])
+    for item in candidates:
+        if isinstance(item, dict) and str(item.get("id") or "") == command_id:
+            return item
+    return None
+
+
+def wait_for_action_result(
+    persona: str,
+    command_id: str,
+    previous_updated_ms: int | None,
+    wait_ms: int,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    deadline = time.monotonic() + max(0, min(int(wait_ms or 0), 5000)) / 1000
+    latest_state = read_workspace_state_file(persona)
+    latest_result = find_action_result(latest_state, command_id)
+    while not latest_result and time.monotonic() < deadline:
+        updated_ms = state_updated_ms(latest_state)
+        if updated_ms is not None and previous_updated_ms is not None and updated_ms > previous_updated_ms:
+            latest_result = find_action_result(latest_state, command_id)
+            if latest_result:
+                break
+        time.sleep(0.05)
+        latest_state = read_workspace_state_file(persona)
+        latest_result = find_action_result(latest_state, command_id)
+    return latest_result, latest_state
+
+
 def send_workspace_action(
     persona: str,
     action: str,
     payload: dict[str, Any] | None = None,
+    wait_ms: int = 900,
 ) -> str:
     clean_action = str(action or "").strip()
     if not clean_action:
@@ -324,6 +386,8 @@ def send_workspace_action(
     if payload is not None and not isinstance(payload, dict):
         raise ValueError("payload must be an object.")
 
+    previous_state = read_workspace_state_file(persona)
+    previous_updated_ms = state_updated_ms(previous_state)
     now = datetime.now().astimezone()
     command = {
         "id": uuid4().hex,
@@ -334,15 +398,29 @@ def send_workspace_action(
         "created_at": now.isoformat(timespec="milliseconds"),
     }
     append_workspace_command(persona, command)
+    action_result, latest_state = wait_for_action_result(
+        persona,
+        command["id"],
+        previous_updated_ms,
+        wait_ms,
+    )
+    confirmed = bool(action_result and action_result.get("accepted") is not False)
 
     return response(
         {
             "ok": True,
             "persona": safe_name(persona),
             "sent": True,
-            "confirmed": False,
-            "message": "Action was sent to the open workspace page, but success is not confirmed. Read workspace state after this action before claiming the move happened.",
+            "confirmed": confirmed,
+            "action_result": action_result,
+            "state": latest_state,
+            "message": (
+                "Action was accepted by the open workspace page. Use the returned state/action_result for your reply."
+                if confirmed
+                else "Action was sent, but the open workspace page did not confirm it. Do not claim the move happened; read workspace state or ask the user to reopen/revise the app."
+            ),
             "command": {
+                "id": command["id"],
                 "type": command["type"],
                 "action": command["action"],
                 "payload": command["payload"],
@@ -352,8 +430,8 @@ def send_workspace_action(
 
 
 def read_workspace_state(persona: str) -> str:
-    target = ensure_inside(persona_root(persona), workspace_control_dir(persona) / "state.json")
-    if not target.is_file():
+    state = read_workspace_state_file(persona)
+    if state is None:
         return response(
             {
                 "ok": True,
@@ -363,19 +441,18 @@ def read_workspace_state(persona: str) -> str:
                 "message": "No workspace app has reported state yet. You cannot see the board or game state. Do not claim any move, coordinate, score, winner, or board position. Ask the user to open the workspace HTML through MeloMate or update the app to publish MeloMateGameState.",
             }
         )
-    if target.stat().st_size > MAX_FILE_BYTES:
-        raise ValueError("workspace state is too large to read.")
-
-    try:
-        state = json.loads(target.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError("workspace state is not valid JSON.") from exc
+    updated_ms = state_updated_ms(state)
+    age_ms = None
+    if updated_ms is not None:
+        age_ms = max(0, int(time.time() * 1000) - updated_ms)
 
     return response(
         {
             "ok": True,
             "persona": safe_name(persona),
             "available": True,
+            "fresh": age_ms is None or age_ms < 5000,
+            "age_ms": age_ms,
             "message": "Use only this reported state for game claims. If it does not include the board or last move, do not invent them.",
             "state": state,
         }

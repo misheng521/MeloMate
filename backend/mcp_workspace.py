@@ -62,6 +62,18 @@ def send_workspace_key(persona: str, key: str, code: str = "", duration_ms: int 
 
 
 @mcp.tool()
+def send_workspace_action(persona: str, action: str, payload: dict | None = None) -> str:
+    """Send a semantic action to an open workspace HTML app for this persona. Prefer this for board games and turn-based apps, for example action="place-piece" with payload={"row": 7, "col": 7}, or action="select-cell" with coordinates. The app must handle the melomate-action event or window.MeloMateGameAction."""
+    return safe_call(workspace_core.send_workspace_action, persona, action, payload)
+
+
+@mcp.tool()
+def read_workspace_state(persona: str) -> str:
+    """Read the latest state reported by an open workspace HTML app for this persona. Use this before playing a turn in board games, puzzles, or interactive apps. State is app-defined JSON such as board, turn, score, gameOver, legalMoves, or selected item."""
+    return safe_call(workspace_core.read_workspace_state, persona)
+
+
+@mcp.tool()
 def open_workspace_item(persona: str, path: str) -> str:
     """Open a file or folder from workspace/{persona} with the user's default local app. Use after the user says they want to see, open, view, play, or try a generated workspace item."""
     return safe_call(workspace_core.open_workspace_item, persona, path)

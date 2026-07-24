@@ -277,6 +277,8 @@ def is_workspace_tool_status(output_item: Dict[str, Any]) -> bool:
         "list_workspace",
         "schedule_reminder",
         "send_workspace_key",
+        "send_workspace_action",
+        "read_workspace_state",
         "open_workspace_item",
     }
 

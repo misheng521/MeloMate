@@ -48,6 +48,7 @@ type DisplayText = {
 type WsMessage = {
   type?: string;
   text?: string;
+  texts?: string[];
   message?: string;
   audio?: string | null;
   volumes?: number[];
@@ -973,6 +974,7 @@ function appendLine(role: LineRole, text: string) {
   const line = document.createElement("p");
   line.className = `line ${role}-line`;
   line.dataset.time = currentTime();
+  line.dataset.rawText = text;
   line.textContent = `${line.dataset.time} ${roleLabel(role)}：${text}`;
   transcriptLog.appendChild(line);
   transcriptLog.scrollTop = transcriptLog.scrollHeight;
@@ -985,6 +987,7 @@ function setPendingUserLine(text: string) {
     return;
   }
 
+  pendingUserLine.dataset.rawText = text;
   pendingUserLine.textContent = `${pendingUserLine.dataset.time} 用户：${text}`;
   transcriptLog.scrollTop = transcriptLog.scrollHeight;
 }
@@ -992,6 +995,7 @@ function setPendingUserLine(text: string) {
 function finalizePendingUserLine(text: string) {
   markConversationActivity();
   if (pendingUserLine) {
+    pendingUserLine.dataset.rawText = text;
     pendingUserLine.textContent = `${pendingUserLine.dataset.time} 用户：${text}`;
     pendingUserLine = null;
     transcriptLog.scrollTop = transcriptLog.scrollHeight;
@@ -999,6 +1003,37 @@ function finalizePendingUserLine(text: string) {
   }
 
   appendLine("user", text);
+}
+
+function normalizeUserDisplayText(text: string) {
+  return text.trim().replace(/\s+/g, " ");
+}
+
+function removeRecentUserLines(texts: string[]) {
+  const remaining = texts.map(normalizeUserDisplayText).filter(Boolean);
+  if (!remaining.length) return;
+
+  const lines = Array.from(transcriptLog.querySelectorAll<HTMLParagraphElement>(".user-line")).reverse();
+  for (const line of lines) {
+    const raw = normalizeUserDisplayText(line.dataset.rawText || line.textContent || "");
+    const matchIndex = remaining.findIndex((text) => raw.endsWith(text) || raw === text);
+    if (matchIndex === -1) continue;
+
+    if (line === pendingUserLine) {
+      pendingUserLine = null;
+    }
+    line.remove();
+    remaining.splice(matchIndex, 1);
+    if (!remaining.length) break;
+  }
+}
+
+function showMergedUserLine(texts: string[], fallbackText?: string) {
+  const cleanTexts = texts.map((text) => text.trim()).filter(Boolean);
+  if (!cleanTexts.length && !fallbackText?.trim()) return;
+
+  removeRecentUserLines(cleanTexts);
+  finalizePendingUserLine(cleanTexts.length ? cleanTexts.join("\n") : fallbackText!.trim());
 }
 
 function appendAssistantLine(text: string, speakerName?: string) {
@@ -1767,6 +1802,12 @@ function handleWsMessage(message: WsMessage) {
   if (message.type === "user-input-transcription" && message.text) {
     finalizePendingUserLine(message.text);
     subtitle.textContent = message.text;
+    return;
+  }
+
+  if (message.type === "user-input-merged") {
+    showMergedUserLine(message.texts || [], message.text);
+    if (message.text) subtitle.textContent = message.text;
     return;
   }
 

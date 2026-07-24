@@ -994,11 +994,17 @@ function setPendingUserLine(text: string) {
 
 function finalizePendingUserLine(text: string) {
   markConversationActivity();
+  const normalizedText = normalizeUserDisplayText(text);
   if (pendingUserLine) {
     pendingUserLine.dataset.rawText = text;
     pendingUserLine.textContent = `${pendingUserLine.dataset.time} 用户：${text}`;
     pendingUserLine = null;
     transcriptLog.scrollTop = transcriptLog.scrollHeight;
+    return;
+  }
+
+  const lastUserLine = Array.from(transcriptLog.querySelectorAll<HTMLParagraphElement>(".user-line")).pop();
+  if (lastUserLine && normalizeUserDisplayText(lastUserLine.dataset.rawText || "") === normalizedText) {
     return;
   }
 

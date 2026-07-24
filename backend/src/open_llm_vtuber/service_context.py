@@ -41,7 +41,7 @@ from .config_manager import (
     validate_config,
 )
 from .config_manager.stateless_llm import DeepseekConfig
-from .chat_history_manager import get_core_memory_prompt
+from .chat_history_manager import SINGLE_HISTORY_UID, get_core_memory_prompt
 
 
 class ServiceContext:
@@ -75,6 +75,23 @@ class ServiceContext:
         self.mcp_prompt: str = ""
 
         self.history_uid: str = ""  # Add history_uid field
+
+    def _load_short_memory_into_agent(self) -> None:
+        if not (
+            self.agent_engine
+            and self.character_config
+            and hasattr(self.agent_engine, "set_memory_from_history")
+        ):
+            return
+
+        self.history_uid = self.history_uid or SINGLE_HISTORY_UID
+        try:
+            self.agent_engine.set_memory_from_history(
+                conf_uid=self.character_config.conf_uid,
+                history_uid=self.history_uid,
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to load short memory into agent: {exc}")
 
         self.send_text: Callable = None
         self.client_uid: str = None
@@ -270,6 +287,7 @@ class ServiceContext:
             self.character_config.agent_config.agent_settings.basic_memory_agent.use_mcpp,
             self.character_config.agent_config.agent_settings.basic_memory_agent.mcp_enabled_servers,
         )
+        self._load_short_memory_into_agent()
 
         logger.debug(f"Loaded service context with cache: {character_config}")
 
@@ -332,6 +350,7 @@ class ServiceContext:
             config.character_config.agent_config,
             config.character_config.persona_prompt,
         )
+        self._load_short_memory_into_agent()
 
         self.init_translate(
             config.character_config.tts_preprocessor_config.translator_config
@@ -592,7 +611,7 @@ General workspace judgment rules:
 - When the user's request can produce a reusable artifact, record, file, plan, draft, code project, list, dataset, configuration, reminder, note, creative work, or other durable output, decide whether it should be created or updated in the workspace.
 - Choose a suitable folder and file type based on the user's intent. Examples include writing, recipes, travel, fitness, music, lists, reviews, budget, data, prompts, configs, plans, logs, and user-requested folders.
 - If the user explicitly asks to save, remember in a file, create, generate, draw, write down, make a plan, build, export, or remind, use a workspace tool before replying normally.
-- For workspace tasks, call the required workspace tool before saying any conversational text. Do not start with phrases like "I will make..." or "I am going to..." before the tool call.
+- For workspace tasks, it is okay to acknowledge briefly first, then use the required workspace tools and continue working. Keep the first acknowledgement short.
 - For games, mini apps, web pages, and code projects, prefer write_workspace_project. Split larger work into multiple files and use append_workspace_file for long files so the tool arguments do not become too large or invalid.
 - If the request is casual chat, emotional support, flirting, or a one-off answer with no durable output, reply normally without writing a file.
 - If a durable output would be useful but the user did not ask to save it, ask briefly before saving unless the intent is obvious.

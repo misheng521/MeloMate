@@ -56,6 +56,12 @@ def schedule_reminder(persona: str, message: str, delay_minutes: float = 0, due_
 
 
 @mcp.tool()
+def send_workspace_key(persona: str, key: str, code: str = "", duration_ms: int = 80, repeat: int = 1) -> str:
+    """Send keyboard input to an open workspace HTML game or mini app for this persona. Use keys such as ArrowLeft, ArrowRight, ArrowUp, ArrowDown, Space, Enter, w, a, s, or d. Use repeat for repeated taps and duration_ms for how long each key is held."""
+    return safe_call(workspace_core.send_workspace_key, persona, key, code, duration_ms, repeat)
+
+
+@mcp.tool()
 def open_workspace_item(persona: str, path: str) -> str:
     """Open a file or folder from workspace/{persona} with the user's default local app. Use after the user says they want to see, open, view, play, or try a generated workspace item."""
     return safe_call(workspace_core.open_workspace_item, persona, path)

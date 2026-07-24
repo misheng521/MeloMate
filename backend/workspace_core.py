@@ -6,6 +6,8 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
+from uuid import uuid4
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -251,17 +253,75 @@ def schedule_reminder(persona: str, message: str, delay_minutes: float = 0, due_
     )
 
 
+def send_workspace_key(
+    persona: str,
+    key: str,
+    code: str = "",
+    duration_ms: int = 80,
+    repeat: int = 1,
+) -> str:
+    clean_key = str(key or "").strip()
+    if not clean_key:
+        raise ValueError("key is required, for example ArrowLeft, ArrowRight, ArrowUp, ArrowDown, Space, Enter, w, a, s, or d.")
+
+    clean_code = str(code or "").strip()
+    safe_duration = max(20, min(int(duration_ms or 80), 2000))
+    safe_repeat = max(1, min(int(repeat or 1), 20))
+    now = datetime.now().astimezone()
+    command = {
+        "id": uuid4().hex,
+        "type": "key",
+        "key": clean_key,
+        "code": clean_code,
+        "duration_ms": safe_duration,
+        "repeat": safe_repeat,
+        "created_ms": int(now.timestamp() * 1000),
+        "created_at": now.isoformat(timespec="milliseconds"),
+    }
+
+    control_dir = ensure_inside(persona_root(persona), persona_root(persona) / ".control")
+    control_dir.mkdir(parents=True, exist_ok=True)
+    target = ensure_inside(persona_root(persona), control_dir / "commands.jsonl")
+    with target.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(command, ensure_ascii=False) + "\n")
+
+    return response(
+        {
+            "ok": True,
+            "persona": safe_name(persona),
+            "sent": True,
+            "command": {
+                "type": command["type"],
+                "key": command["key"],
+                "code": command["code"],
+                "duration_ms": command["duration_ms"],
+                "repeat": command["repeat"],
+            },
+        }
+    )
+
+
 def open_workspace_item(persona: str, path: str) -> str:
     target = workspace_path(persona, path)
     if not target.exists():
         raise FileNotFoundError("workspace item was not found.")
 
-    if sys.platform == "win32":
-        os.startfile(str(target))  # type: ignore[attr-defined]
-    elif sys.platform == "darwin":
-        subprocess.Popen(["open", str(target)])
+    opened_url = ""
+    if target.is_file() and target.suffix.lower() == ".html":
+        persona_name = safe_name(persona)
+        relative_item = target.relative_to(persona_root(persona)).as_posix()
+        base_url = os.getenv("MELOMATE_FRONTEND_URL", "http://127.0.0.1:5178").rstrip("/")
+        opened_url = f"{base_url}/workspace-files/{quote(persona_name)}/{quote(relative_item, safe='/')}"
+        open_target = opened_url
     else:
-        subprocess.Popen(["xdg-open", str(target)])
+        open_target = str(target)
+
+    if sys.platform == "win32":
+        os.startfile(open_target)  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", open_target])
+    else:
+        subprocess.Popen(["xdg-open", open_target])
 
     branch = target.parent if target.is_file() else target
     return response(
@@ -269,6 +329,7 @@ def open_workspace_item(persona: str, path: str) -> str:
             "ok": True,
             "persona": safe_name(persona),
             "opened": True,
+            "url": opened_url,
             "branch": branch.relative_to(WORKSPACE_ROOT).as_posix(),
         }
     )

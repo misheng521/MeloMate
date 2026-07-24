@@ -226,13 +226,26 @@ async def process_queued_user_inputs(
 
     parts: List[str] = []
     for item in user_input:
-        text = (await process_user_input(item, asr_engine, websocket_send)).strip()
+        text = (
+            await process_user_input(
+                item,
+                asr_engine,
+                websocket_send,
+                announce_transcription=False,
+            )
+        ).strip()
         if text:
             parts.append(text)
 
     if not parts:
         return ""
     if len(parts) == 1:
+        await websocket_send(
+            json.dumps(
+                {"type": "user-input-transcription", "text": parts[0]},
+                ensure_ascii=False,
+            )
+        )
         return parts[0]
 
     await websocket_send(

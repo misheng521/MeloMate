@@ -301,6 +301,87 @@ def send_workspace_key(
     )
 
 
+def workspace_control_dir(persona: str) -> Path:
+    target = ensure_inside(persona_root(persona), persona_root(persona) / ".control")
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def append_workspace_command(persona: str, command: dict[str, Any]) -> None:
+    target = ensure_inside(persona_root(persona), workspace_control_dir(persona) / "commands.jsonl")
+    with target.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(command, ensure_ascii=False) + "\n")
+
+
+def send_workspace_action(
+    persona: str,
+    action: str,
+    payload: dict[str, Any] | None = None,
+) -> str:
+    clean_action = str(action or "").strip()
+    if not clean_action:
+        raise ValueError("action is required, for example place-piece, select-cell, click, move, restart, or pass.")
+    if payload is not None and not isinstance(payload, dict):
+        raise ValueError("payload must be an object.")
+
+    now = datetime.now().astimezone()
+    command = {
+        "id": uuid4().hex,
+        "type": "action",
+        "action": clean_action,
+        "payload": payload or {},
+        "created_ms": int(now.timestamp() * 1000),
+        "created_at": now.isoformat(timespec="milliseconds"),
+    }
+    append_workspace_command(persona, command)
+
+    return response(
+        {
+            "ok": True,
+            "persona": safe_name(persona),
+            "sent": True,
+            "confirmed": False,
+            "message": "Action was sent to the open workspace page, but success is not confirmed. Read workspace state after this action before claiming the move happened.",
+            "command": {
+                "type": command["type"],
+                "action": command["action"],
+                "payload": command["payload"],
+            },
+        }
+    )
+
+
+def read_workspace_state(persona: str) -> str:
+    target = ensure_inside(persona_root(persona), workspace_control_dir(persona) / "state.json")
+    if not target.is_file():
+        return response(
+            {
+                "ok": True,
+                "persona": safe_name(persona),
+                "available": False,
+                "state": None,
+                "message": "No workspace app has reported state yet. You cannot see the board or game state. Do not claim any move, coordinate, score, winner, or board position. Ask the user to open the workspace HTML through MeloMate or update the app to publish MeloMateGameState.",
+            }
+        )
+    if target.stat().st_size > MAX_FILE_BYTES:
+        raise ValueError("workspace state is too large to read.")
+
+    try:
+        state = json.loads(target.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("workspace state is not valid JSON.") from exc
+
+    return response(
+        {
+            "ok": True,
+            "persona": safe_name(persona),
+            "available": True,
+            "message": "Use only this reported state for game claims. If it does not include the board or last move, do not invent them.",
+            "state": state,
+        }
+    )
+
+
 def open_workspace_item(persona: str, path: str) -> str:
     target = workspace_path(persona, path)
     if not target.exists():

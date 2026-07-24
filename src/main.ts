@@ -1282,14 +1282,24 @@ async function toggleVideoFullscreen() {
 }
 
 function sanitizeAssistantReply(text: string) {
-  const cleanText = text
+  const gameControlNarrationPatterns = [
+    /我先看(?:一下|看)?(?:当前)?(?:局面|棋盘|盘面|情况|后面|画面|状态)?(?:再说|吧)?[，,。.!！~～]*/g,
+    /让我看(?:一下|看)?(?:当前)?(?:局面|棋盘|盘面|情况|后面|画面|状态)?(?:再说|吧)?[，,。.!！~～]*/g,
+    /我看(?:一下|看)?(?:当前|现在)?(?:局面|棋盘|盘面|情况|后面|画面|状态)[，,。.!！~～]*/g,
+    /先看(?:一下|看)?(?:当前)?(?:局面|棋盘|盘面|情况|后面|画面|状态)(?:再说)?[，,。.!！~～]*/g,
+    /看(?:一下|看)?(?:当前|现在)?(?:局面|棋盘|盘面|情况|后面|画面|状态)(?:再说)?[，,。.!！~～]*/g,
+  ];
+  let cleanText = text
     .replace(/\$/g, "")
     .replace(/（[^（）]{1,40}）/g, "")
     .replace(/\([^()]{1,40}\)/g, "")
     .replace(/\[[^\[\]]{1,40}\]/g, "")
     .replace(/【[^【】]{1,40}】/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(/\s+/g, " ");
+  for (const pattern of gameControlNarrationPatterns) {
+    cleanText = cleanText.replace(pattern, "");
+  }
+  cleanText = cleanText.replace(/\s+/g, " ").replace(/^[，,。.!！~～\s]+|[，,。.!！~～\s]+$/g, "").trim();
   return cleanText;
 }
 

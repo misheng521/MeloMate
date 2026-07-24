@@ -1,15 +1,17 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { createReadStream, existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { basename, dirname, extname, join, normalize, relative, resolve, sep } from "node:path";
 
-const root = resolve("dist");
+const appRoot = dirname(fileURLToPath(import.meta.url));
+const root = resolve(appRoot, "dist");
 const contentRoots = {
-  "/backgrounds": resolve("backgrounds"),
-  "/models": resolve("models/live2d"),
-  "/reference_sounds": resolve("reference_sounds"),
+  "/backgrounds": resolve(appRoot, "backgrounds"),
+  "/models": resolve(appRoot, "models/live2d"),
+  "/reference_sounds": resolve(appRoot, "reference_sounds"),
 };
-const workspaceRoot = resolve("workspace");
+const workspaceRoot = resolve(appRoot, "workspace");
 const preferredPort = Number(process.env.PORT || 5178);
 const voicemeeterPath = "C:\\Program Files (x86)\\VB\\Voicemeeter\\voicemeeterpro.exe";
 const voicemeeterProcessName = "voicemeeterpro";

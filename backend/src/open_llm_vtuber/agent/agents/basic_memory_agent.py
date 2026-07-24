@@ -45,6 +45,12 @@ WORKSPACE_TOOL_NAMES = {
     "open_workspace_item",
 }
 
+SILENT_WORKSPACE_TOOL_NAMES = {
+    "read_workspace_state",
+    "send_workspace_action",
+    "send_workspace_key",
+}
+
 
 class BasicMemoryAgent(AgentInterface):
     """Agent with basic chat memory and tool calling support."""
@@ -251,6 +257,12 @@ class BasicMemoryAgent(AgentInterface):
     ) -> bool:
         return any(self._tool_call_name(call) in WORKSPACE_TOOL_NAMES for call in tool_calls)
 
+    def _needs_visible_workspace_ack(
+        self, tool_calls: Union[List[ToolCallObject], List[Dict[str, Any]]]
+    ) -> bool:
+        names = {self._tool_call_name(call) for call in tool_calls}
+        return bool(names & WORKSPACE_TOOL_NAMES) and not names <= SILENT_WORKSPACE_TOOL_NAMES
+
     def _workspace_ack_text(
         self, tool_calls: Union[List[ToolCallObject], List[Dict[str, Any]]]
     ) -> str:
@@ -415,6 +427,7 @@ class BasicMemoryAgent(AgentInterface):
                 if (
                     not workspace_ack_sent
                     and self._contains_workspace_tool(pending_tool_calls)
+                    and self._needs_visible_workspace_ack(pending_tool_calls)
                 ):
                     workspace_ack_sent = True
                     started_status = self._workspace_started_status(pending_tool_calls)
@@ -627,6 +640,7 @@ class BasicMemoryAgent(AgentInterface):
                 if (
                     not workspace_ack_sent
                     and self._contains_workspace_tool(pending_tool_calls)
+                    and self._needs_visible_workspace_ack(pending_tool_calls)
                 ):
                     workspace_ack_sent = True
                     started_status = self._workspace_started_status(pending_tool_calls)

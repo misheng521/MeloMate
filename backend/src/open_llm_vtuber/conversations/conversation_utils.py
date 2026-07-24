@@ -22,6 +22,23 @@ def clean_response_fragment(text: str) -> str:
     return re.sub(r"\s+", " ", text.replace("$", "")).strip()
 
 
+GAME_CONTROL_NARRATION_PATTERNS = (
+    r"我先看(?:一下|看)?(?:当前)?(?:局面|棋盘|盘面|情况|后面|画面|状态)?(?:再说|吧)?[，,。.!！~～]*",
+    r"让我看(?:一下|看)?(?:当前)?(?:局面|棋盘|盘面|情况|后面|画面|状态)?(?:再说|吧)?[，,。.!！~～]*",
+    r"我看(?:一下|看)?(?:当前|现在)?(?:局面|棋盘|盘面|情况|后面|画面|状态)[，,。.!！~～]*",
+    r"先看(?:一下|看)?(?:当前)?(?:局面|棋盘|盘面|情况|后面|画面|状态)(?:再说)?[，,。.!！~～]*",
+    r"看(?:一下|看)?(?:当前|现在)?(?:局面|棋盘|盘面|情况|后面|画面|状态)(?:再说)?[，,。.!！~～]*",
+)
+
+
+def remove_game_control_narration(text: str) -> str:
+    """Remove immersion-breaking tool-control narration from visible/TTS text."""
+    cleaned = text or ""
+    for pattern in GAME_CONTROL_NARRATION_PATTERNS:
+        cleaned = re.sub(pattern, "", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip(" ，,。.!！~～")
+
+
 def remove_stage_directions(text: str) -> str:
     """Remove parenthesized/asterisk action descriptions from visible chat text."""
     text = re.sub(r"（[^（）]*）", "", text)
@@ -290,6 +307,10 @@ async def handle_sentence_output(
         tts_text = remove_stage_directions(tts_text)
         display_text.text = clean_response_fragment(display_text.text)
         tts_text = clean_response_fragment(tts_text)
+        display_text.text = remove_game_control_narration(display_text.text)
+        tts_text = remove_game_control_narration(tts_text)
+        if not display_text.text and not tts_text:
+            continue
         if translate_engine:
             if len(re.sub(r'[\s.,!?，。！？"\'「」『』（）：；]+', "", tts_text)):
                 tts_text = translate_engine.translate(tts_text)

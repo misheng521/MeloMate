@@ -300,12 +300,12 @@ class BasicMemoryAgent(AgentInterface):
             stream = self._llm.chat_completion(messages, self._system, tools=tools)
             pending_tool_calls.clear()
             current_assistant_message_content.clear()
+            current_turn_text = ""
 
             async for event in stream:
                 if event["type"] == "text_delta":
                     text = event["text"]
                     current_turn_text += text
-                    yield text
                     if (
                         not current_assistant_message_content
                         or current_assistant_message_content[-1]["type"] != "text"
@@ -395,6 +395,7 @@ class BasicMemoryAgent(AgentInterface):
                 continue
             else:
                 if current_turn_text:
+                    yield current_turn_text
                     self._add_message(current_turn_text, "assistant")
                 return
 
@@ -454,11 +455,9 @@ class BasicMemoryAgent(AgentInterface):
                                     yield f"[Error parsing tool JSON: {e}]"
                                     goto_next_while_iteration = True
                                     break
-                        yield event
                 else:
                     if isinstance(event, str):
                         current_turn_text += event
-                        yield event
                     elif isinstance(event, list) and all(
                         isinstance(tc, ToolCallObject) for tc in event
                     ):
@@ -573,6 +572,7 @@ class BasicMemoryAgent(AgentInterface):
 
             else:
                 if current_turn_text:
+                    yield current_turn_text
                     self._add_message(current_turn_text, "assistant")
                 return
 

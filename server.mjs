@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { basename, dirname, extname, join, normalize, relative, resolve, sep } from "node:path";
 
@@ -176,12 +176,57 @@ function readWorkspaceCommands(persona, sinceMs) {
     .filter((command) => command && Number(command.created_ms || 0) > minCreatedMs);
 }
 
+function workspaceStatePath(persona) {
+  const safePersona = safeName(persona);
+  if (!safePersona) return null;
+  const personaRoot = resolve(workspaceRoot, safePersona);
+  const controlDir = safeResolve(workspaceRoot, `${safePersona}/.control`);
+  if (!controlDir || !isInside(personaRoot, controlDir)) return null;
+  mkdirSync(controlDir, { recursive: true });
+  return safeResolve(controlDir, "state.json");
+}
+
+function writeWorkspaceState(persona, state) {
+  const target = workspaceStatePath(persona);
+  if (!target) return false;
+  writeFileSync(
+    target,
+    JSON.stringify(
+      {
+        updated_ms: Date.now(),
+        state,
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+  return true;
+}
+
+function readRequestBody(request) {
+  return new Promise((resolveBody, rejectBody) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 1024 * 1024) {
+        rejectBody(new Error("Request body is too large."));
+        request.destroy();
+      }
+    });
+    request.on("end", () => resolveBody(body));
+    request.on("error", rejectBody);
+  });
+}
+
 function workspaceControlScript(persona) {
   return `<script>
 (() => {
   const persona = ${JSON.stringify(persona)};
   let since = Date.now();
   const seen = new Set();
+  let lastStateJson = "";
   const codeByKey = {
     " ": "Space",
     Space: "Space",
@@ -218,6 +263,41 @@ function workspaceControlScript(persona) {
     }
   }
 
+  function runAction(command) {
+    const detail = {
+      action: command.action,
+      payload: command.payload || {},
+      id: command.id
+    };
+    if (typeof window.MeloMateGameAction === "function") {
+      window.MeloMateGameAction(detail.action, detail.payload, detail);
+    }
+    window.dispatchEvent(new CustomEvent("melomate-action", { detail }));
+    document.dispatchEvent(new CustomEvent("melomate-action", { detail }));
+  }
+
+  function currentState() {
+    if (typeof window.MeloMateGameState === "function") {
+      return window.MeloMateGameState();
+    }
+    if (window.MeloMateGameState && typeof window.MeloMateGameState === "object") {
+      return window.MeloMateGameState;
+    }
+    return null;
+  }
+
+  async function publishState(nextState) {
+    if (nextState == null) return;
+    const stateJson = JSON.stringify(nextState);
+    if (stateJson === lastStateJson) return;
+    lastStateJson = stateJson;
+    await fetch("/api/workspace-state", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ persona, state: nextState })
+    });
+  }
+
   async function poll() {
     try {
       const params = new URLSearchParams({ persona, since: String(since) });
@@ -229,13 +309,20 @@ function workspaceControlScript(persona) {
         seen.add(command.id);
         since = Math.max(since, Number(command.created_ms || since));
         if (command.type === "key") runCommand(command);
+        if (command.type === "action") runAction(command);
       }
+      await publishState(currentState());
     } catch {
       // Workspace control is optional; games still run normally without it.
     }
   }
 
-  window.MeloMateWorkspaceControl = { runCommand };
+  window.MeloMateWorkspaceControl = {
+    runCommand,
+    runAction,
+    setState: publishState,
+    updateState: publishState
+  };
   window.setInterval(poll, 180);
 })();
 </script>`;
@@ -288,6 +375,19 @@ function listLive2DModels() {
       };
     })
     .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
+}
+
+async function handleWorkspaceStateRequest(request, response) {
+  if (request.method !== "POST" || request.url !== "/api/workspace-state") return false;
+  try {
+    const body = await readRequestBody(request);
+    const payload = JSON.parse(body || "{}");
+    const ok = writeWorkspaceState(payload.persona || "", payload.state ?? null);
+    jsonResponse(response, ok ? 200 : 400, { ok });
+  } catch (error) {
+    jsonResponse(response, 400, { ok: false, message: error instanceof Error ? error.message : "Invalid state payload." });
+  }
+  return true;
 }
 
 function handleContentApiRequest(request, response) {
@@ -428,7 +528,8 @@ function handleVoicemeeterRequest(request, response) {
 }
 
 function listen(port) {
-  const server = createServer((request, response) => {
+  const server = createServer(async (request, response) => {
+    if (await handleWorkspaceStateRequest(request, response)) return;
     if (handleContentApiRequest(request, response)) return;
     if (handleVoicemeeterRequest(request, response)) return;
 

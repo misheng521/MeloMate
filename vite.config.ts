@@ -148,12 +148,57 @@ function readWorkspaceCommands(persona: string, sinceMs: number) {
     .filter((command) => command && Number(command.created_ms || 0) > minCreatedMs);
 }
 
+function workspaceStatePath(persona: string) {
+  const safePersona = safeName(persona);
+  if (!safePersona) return null;
+  const personaRoot = path.resolve(workspaceRoot, safePersona);
+  const controlDir = path.resolve(personaRoot, ".control");
+  if (!isInside(personaRoot, controlDir)) return null;
+  fs.mkdirSync(controlDir, { recursive: true });
+  return path.resolve(controlDir, "state.json");
+}
+
+function writeWorkspaceState(persona: string, state: unknown) {
+  const target = workspaceStatePath(persona);
+  if (!target) return false;
+  fs.writeFileSync(
+    target,
+    JSON.stringify(
+      {
+        updated_ms: Date.now(),
+        state,
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+  return true;
+}
+
+function readRequestBody(request: import("http").IncomingMessage) {
+  return new Promise<string>((resolveBody, rejectBody) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 1024 * 1024) {
+        rejectBody(new Error("Request body is too large."));
+        request.destroy();
+      }
+    });
+    request.on("end", () => resolveBody(body));
+    request.on("error", rejectBody);
+  });
+}
+
 function workspaceControlScript(persona: string) {
   return `<script>
 (() => {
   const persona = ${JSON.stringify(persona)};
   let since = Date.now();
   const seen = new Set();
+  let lastStateJson = "";
   const codeByKey = {
     " ": "Space",
     Space: "Space",
@@ -190,6 +235,41 @@ function workspaceControlScript(persona: string) {
     }
   }
 
+  function runAction(command) {
+    const detail = {
+      action: command.action,
+      payload: command.payload || {},
+      id: command.id
+    };
+    if (typeof window.MeloMateGameAction === "function") {
+      window.MeloMateGameAction(detail.action, detail.payload, detail);
+    }
+    window.dispatchEvent(new CustomEvent("melomate-action", { detail }));
+    document.dispatchEvent(new CustomEvent("melomate-action", { detail }));
+  }
+
+  function currentState() {
+    if (typeof window.MeloMateGameState === "function") {
+      return window.MeloMateGameState();
+    }
+    if (window.MeloMateGameState && typeof window.MeloMateGameState === "object") {
+      return window.MeloMateGameState;
+    }
+    return null;
+  }
+
+  async function publishState(nextState) {
+    if (nextState == null) return;
+    const stateJson = JSON.stringify(nextState);
+    if (stateJson === lastStateJson) return;
+    lastStateJson = stateJson;
+    await fetch("/api/workspace-state", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ persona, state: nextState })
+    });
+  }
+
   async function poll() {
     try {
       const params = new URLSearchParams({ persona, since: String(since) });
@@ -201,13 +281,20 @@ function workspaceControlScript(persona: string) {
         seen.add(command.id);
         since = Math.max(since, Number(command.created_ms || since));
         if (command.type === "key") runCommand(command);
+        if (command.type === "action") runAction(command);
       }
+      await publishState(currentState());
     } catch {
       // Workspace control is optional; games still run normally without it.
     }
   }
 
-  window.MeloMateWorkspaceControl = { runCommand };
+  window.MeloMateWorkspaceControl = {
+    runCommand,
+    runAction,
+    setState: publishState,
+    updateState: publishState
+  };
   window.setInterval(poll, 180);
 })();
 </script>`;
@@ -251,8 +338,21 @@ function contentPlugin() {
   return {
     name: "melomate-content",
     configureServer(server) {
-      server.middlewares.use((request, response, next) => {
+      server.middlewares.use(async (request, response, next) => {
         const url = new URL(request.url || "/", "http://localhost");
+
+        if (url.pathname === "/api/workspace-state" && request.method === "POST") {
+          response.setHeader("Content-Type", "application/json; charset=utf-8");
+          try {
+            const body = await readRequestBody(request);
+            const payload = JSON.parse(body || "{}");
+            response.end(JSON.stringify({ ok: writeWorkspaceState(payload.persona || "", payload.state ?? null) }));
+          } catch (error) {
+            response.statusCode = 400;
+            response.end(JSON.stringify({ ok: false, message: error instanceof Error ? error.message : "Invalid state payload." }));
+          }
+          return;
+        }
 
         if (url.pathname === "/api/backgrounds") {
           response.setHeader("Content-Type", "application/json; charset=utf-8");

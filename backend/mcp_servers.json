@@ -4,6 +4,11 @@
         "command": ".venv\\Scripts\\python.exe",
         "args": ["mcp_local_launcher.py"],
         "cwd": "."
+      },
+      "workspace": {
+        "command": ".venv\\Scripts\\python.exe",
+        "args": ["mcp_workspace.py"],
+        "cwd": "."
       }
     }
 }

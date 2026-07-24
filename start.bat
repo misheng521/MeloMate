@@ -54,6 +54,7 @@ if errorlevel 1 (
 )
 
 echo Starting MeloMate...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=(Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 5178 -State Listen -ErrorAction SilentlyContinue).OwningProcess; if ($p) { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue }" >nul 2>nul
 start "MeloMate Backend" /min "%ROOT%backend\.venv\Scripts\python.exe" "%ROOT%backend\mini_backend.py"
 start "" /min cmd /c "timeout /t 1 /nobreak >nul & start "" http://127.0.0.1:5178/"
 node server.mjs

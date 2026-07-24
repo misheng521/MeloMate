@@ -43,7 +43,6 @@ type VadModule = {
 type DisplayText = {
   text?: string;
   name?: string;
-  avatar?: string;
 };
 
 type WsMessage = {
@@ -267,7 +266,7 @@ function normalizeStartupSettings(settings: SavedSettings | null): SavedSettings
 
   return {
     ...settings,
-    characterConfigFile: defaultCharacterConfigFile,
+    characterConfigFile: normalizeCharacterConfigFile(settings.characterConfigFile),
     voiceChatOutputEnabled: false,
     voiceCloneEnabled: false,
     screenVisionEnabled: false,
@@ -1600,6 +1599,11 @@ function handleWsMessage(message: WsMessage) {
     return;
   }
 
+  if (message.type === "interrupt-signal") {
+    stopCurrentResponsePlayback();
+    return;
+  }
+
   if (message.type === "voice-clone-config-applied") {
     return;
   }
@@ -1835,7 +1839,7 @@ async function finishBackendAudio() {
   syncProactiveSpeakButton();
 }
 
-function interruptCurrentResponse() {
+function stopCurrentResponsePlayback() {
   if (!isAssistantResponding) return;
 
   isAssistantResponding = false;
@@ -1849,12 +1853,20 @@ function interruptCurrentResponse() {
   voiceChatAudio.pause();
   voiceChatAudio.removeAttribute("src");
   voiceChatAudio.load();
+  setThinking(false);
+  syncProactiveSpeakButton();
+}
+
+function interruptCurrentResponse() {
+  if (!isAssistantResponding) return;
+
+  const interruptedText = heardAssistantText || lastAssistantText || subtitle.textContent || "";
+  stopCurrentResponsePlayback();
 
   sendWs({
     type: "interrupt-signal",
-    text: heardAssistantText || lastAssistantText || subtitle.textContent || "",
+    text: interruptedText,
   });
-  setThinking(false);
 }
 
 async function sendAudioPartition(audio: Float32Array) {
@@ -1939,11 +1951,9 @@ async function startOpenLlmVad() {
     baseAssetPath: "./libs/",
     onnxWASMBasePath: "./libs/",
     onSpeechStart: () => {
-      interruptCurrentResponse();
       setPendingUserLine("正在听...");
     },
     onSpeechRealStart: () => {
-      interruptCurrentResponse();
       setPendingUserLine("正在听...");
     },
     onSpeechEnd: (audio: Float32Array) => {

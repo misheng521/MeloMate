@@ -26,6 +26,18 @@ def write_workspace_file(persona: str, folder: str, filename: str, content: str)
 
 
 @mcp.tool()
+def append_workspace_file(persona: str, folder: str, filename: str, content: str, reset: bool = False) -> str:
+    """Append a UTF-8 text chunk to a file under workspace/{persona}/{folder}. Use reset=True for the first chunk. Prefer this for long code or long documents so tool arguments stay small and valid."""
+    return safe_call(workspace_core.append_workspace_file, persona, folder, filename, content, reset)
+
+
+@mcp.tool()
+def write_workspace_project(persona: str, folder: str, files: list[dict]) -> str:
+    """Write a multi-file project under workspace/{persona}/{folder}. files must be a list of objects like {"path":"index.html","content":"..."}. Prefer this for games and mini apps, split into index.html, style.css, and main.js."""
+    return safe_call(workspace_core.write_workspace_project, persona, folder, files)
+
+
+@mcp.tool()
 def read_workspace_file(persona: str, path: str) -> str:
     """Read a UTF-8 text file from workspace/{persona}. Never read another persona's workspace."""
     return safe_call(workspace_core.read_workspace_file, persona, path)

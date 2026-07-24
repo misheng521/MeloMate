@@ -11,6 +11,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 WORKSPACE_ROOT = ROOT / "workspace"
 MAX_FILE_BYTES = 1024 * 1024
+MAX_PROJECT_FILES = 20
 
 
 def safe_name(value: str, fallback: str = "default") -> str:
@@ -83,6 +84,85 @@ def write_workspace_file(persona: str, folder: str, filename: str, content: str)
             "ok": True,
             "persona": safe_name(persona),
             "path": target.relative_to(WORKSPACE_ROOT).as_posix(),
+        }
+    )
+
+
+def append_workspace_file(
+    persona: str,
+    folder: str,
+    filename: str,
+    content: str,
+    reset: bool = False,
+) -> str:
+    safe_filename = safe_name(filename)
+    if "." not in safe_filename:
+        raise ValueError("filename must include an extension such as .txt, .svg, .html, .css, .js, or .json.")
+
+    text = str(content or "")
+    directory = workspace_path(persona, folder)
+    directory.mkdir(parents=True, exist_ok=True)
+    target = ensure_inside(persona_root(persona), directory / safe_filename)
+
+    existing_size = 0 if reset or not target.exists() else target.stat().st_size
+    if existing_size + len(text.encode("utf-8")) > MAX_FILE_BYTES:
+        raise ValueError("file content is too large.")
+
+    mode = "w" if reset else "a"
+    with target.open(mode, encoding="utf-8") as file:
+        file.write(text)
+
+    return response(
+        {
+            "ok": True,
+            "persona": safe_name(persona),
+            "path": target.relative_to(WORKSPACE_ROOT).as_posix(),
+            "mode": "reset" if reset else "append",
+        }
+    )
+
+
+def write_workspace_project(persona: str, folder: str, files: list[dict[str, Any]]) -> str:
+    if not files:
+        raise ValueError("files is required.")
+    if len(files) > MAX_PROJECT_FILES:
+        raise ValueError(f"too many files. maximum is {MAX_PROJECT_FILES}.")
+
+    project_dir = workspace_path(persona, folder)
+    project_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+
+    for item in files:
+        if not isinstance(item, dict):
+            raise ValueError("each project file must be an object with path and content.")
+
+        relative_file = str(item.get("path") or "").strip()
+        content = str(item.get("content") or "")
+        if not relative_file:
+            raise ValueError("each project file requires path.")
+        if len(content.encode("utf-8")) > MAX_FILE_BYTES:
+            raise ValueError(f"{relative_file} is too large.")
+
+        safe_parts = [
+            safe_name(part, "")
+            for part in Path(relative_file).parts
+            if part not in {"", ".", ".."}
+        ]
+        if not safe_parts or "." not in safe_parts[-1]:
+            raise ValueError("each project file path must include a filename with an extension.")
+
+        target = ensure_inside(persona_root(persona), project_dir.joinpath(*safe_parts))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        written.append(target.relative_to(WORKSPACE_ROOT).as_posix())
+
+    return response(
+        {
+            "ok": True,
+            "persona": safe_name(persona),
+            "branch": project_dir.relative_to(WORKSPACE_ROOT).as_posix(),
+            "files_written": len(written),
+            "paths": written,
         }
     )
 

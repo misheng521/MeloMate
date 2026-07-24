@@ -517,6 +517,7 @@ class ServiceContext:
             await self.agent_engine.close()
         self.agent_engine = None
         await self.init_agent(agent_config, self.character_config.persona_prompt)
+        self._load_short_memory_into_agent()
 
     def init_translate(self, translator_config: TranslatorConfig) -> None:
         """Initialize or update the translation engine based on the configuration."""
@@ -563,6 +564,13 @@ class ServiceContext:
             core_memory_prompt = get_core_memory_prompt(self.character_config.conf_uid)
             if core_memory_prompt:
                 persona_prompt += f"\n\n{core_memory_prompt}\n"
+
+        persona_prompt += (
+            "\n\n# 记忆续接规则\n"
+            "- 每次重新进入角色时，系统会读取核心记忆和最近短期对话。\n"
+            "- 最近短期对话是上一次聊天上下文；用户继续追问、说“刚才”、"
+            "“继续”、或直接接话时，要自然接上最后一轮聊天，而不是当成全新对话。\n"
+        )
 
         for prompt_name, prompt_file in self.system_config.tool_prompts.items():
             if (

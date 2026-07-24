@@ -229,6 +229,30 @@ def get_core_memory_prompt(conf_uid: str) -> str:
     return "# 核心记忆\n" + "\n".join(lines)
 
 
+def get_core_memory_prompt(conf_uid: str) -> str:
+    core = get_core_memory(conf_uid)
+    lines = []
+
+    nickname = core.get("nickname")
+    if nickname:
+        lines.append(f"称呼用户：{nickname}")
+
+    sections = [
+        ("用户喜欢", core.get("likes")),
+        ("用户不喜欢", core.get("dislikes")),
+        ("用户希望", core.get("preferences")),
+        ("用户事实", core.get("facts")),
+    ]
+    for title, values in sections:
+        if isinstance(values, list) and values:
+            lines.append(f"{title}：" + "；".join(str(value) for value in values if value))
+
+    if not lines:
+        return ""
+
+    return "# 核心记忆\n" + "\n".join(lines)
+
+
 def create_new_history(conf_uid: str) -> str:
     if not conf_uid:
         logger.warning("No conf_uid provided")

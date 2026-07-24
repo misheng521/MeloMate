@@ -547,7 +547,7 @@ class BasicMemoryAgent(AgentInterface):
                         pending_tool_calls = event
                         assistant_message_for_api = {
                             "role": "assistant",
-                            "content": current_turn_text if current_turn_text else None,
+                            "content": current_turn_text or "",
                             "tool_calls": [
                                 {
                                     "id": tc.id,

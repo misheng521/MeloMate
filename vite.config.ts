@@ -8,6 +8,7 @@ const contentRoots = {
   "/models": path.resolve(__dirname, "models/live2d"),
   "/reference_sounds": path.resolve(__dirname, "reference_sounds"),
 };
+const workspaceRoot = path.resolve(__dirname, "workspace");
 
 function isInside(basePath: string, filePath: string) {
   const child = path.relative(basePath, filePath);
@@ -37,6 +38,52 @@ function walkFiles(basePath: string) {
 
 function assetName(filePath: string) {
   return path.basename(filePath, path.extname(filePath)).replace(/[_-]+/g, " ");
+}
+
+function safeName(value: string, fallback = "default") {
+  const cleaned = String(value || "")
+    .trim()
+    .replace(/\.(ya?ml)$/i, "")
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+    .replace(/\s+/g, "_")
+    .replace(/^[ .]+|[ .]+$/g, "");
+  return cleaned || fallback;
+}
+
+function safeWorkspaceFolder(value: string) {
+  return String(value || "")
+    .split(/[\\/]+/)
+    .filter((part) => part && part !== "." && part !== "..")
+    .map((part) => safeName(part, ""))
+    .filter(Boolean)
+    .join("/");
+}
+
+function listWorkspace(persona: string, folder: string) {
+  const safePersona = safeName(persona);
+  const safeFolder = safeWorkspaceFolder(folder);
+  const personaRoot = path.resolve(workspaceRoot, safePersona);
+  const target = path.resolve(personaRoot, safeFolder);
+
+  if (!isInside(personaRoot, target)) {
+    return { persona: safePersona, folder: "", entries: [] };
+  }
+
+  fs.mkdirSync(target, { recursive: true });
+  const entries = fs
+    .readdirSync(target, { withFileTypes: true })
+    .filter((entry) => !entry.name.startsWith("."))
+    .sort((a, b) => Number(a.isFile()) - Number(b.isFile()) || a.name.localeCompare(b.name, "zh-CN"))
+    .map((entry) => {
+      const entryPath = path.relative(personaRoot, path.join(target, entry.name)).replace(/\\/g, "/");
+      return {
+        name: entry.name,
+        path: entryPath,
+        type: entry.isDirectory() ? "directory" : "file",
+      };
+    });
+
+  return { persona: safePersona, folder: safeFolder, entries };
 }
 
 function listBackgrounds() {
@@ -83,6 +130,12 @@ function contentPlugin() {
         if (url.pathname === "/api/live2d-models") {
           response.setHeader("Content-Type", "application/json; charset=utf-8");
           response.end(JSON.stringify({ models: listLive2DModels() }));
+          return;
+        }
+
+        if (url.pathname === "/api/workspace") {
+          response.setHeader("Content-Type", "application/json; charset=utf-8");
+          response.end(JSON.stringify(listWorkspace(url.searchParams.get("persona") || "", url.searchParams.get("folder") || "")));
           return;
         }
 

@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { createReadStream, existsSync, readdirSync, statSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { basename, dirname, extname, join, normalize, relative, resolve, sep } from "node:path";
 
 const root = resolve("dist");
@@ -9,6 +9,7 @@ const contentRoots = {
   "/models": resolve("models/live2d"),
   "/reference_sounds": resolve("reference_sounds"),
 };
+const workspaceRoot = resolve("workspace");
 const preferredPort = Number(process.env.PORT || 5178);
 const voicemeeterPath = "C:\\Program Files (x86)\\VB\\Voicemeeter\\voicemeeterpro.exe";
 const voicemeeterProcessName = "voicemeeterpro";
@@ -84,6 +85,51 @@ function displayNameFromPath(filePath) {
   return basename(filePath, extname(filePath)).replace(/[_-]+/g, " ");
 }
 
+function safeName(value, fallback = "default") {
+  const cleaned = String(value || "")
+    .trim()
+    .replace(/\.(ya?ml)$/i, "")
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+    .replace(/\s+/g, "_")
+    .replace(/^[ .]+|[ .]+$/g, "");
+  return cleaned || fallback;
+}
+
+function safeWorkspaceFolder(value) {
+  return String(value || "")
+    .split(/[\\/]+/)
+    .filter((part) => part && part !== "." && part !== "..")
+    .map((part) => safeName(part, ""))
+    .filter(Boolean)
+    .join("/");
+}
+
+function listWorkspace(persona, folder) {
+  const safePersona = safeName(persona);
+  const safeFolder = safeWorkspaceFolder(folder);
+  const personaRoot = resolve(workspaceRoot, safePersona);
+  const target = resolve(personaRoot, safeFolder);
+
+  if (!isInside(personaRoot, target)) {
+    return { persona: safePersona, folder: "", entries: [] };
+  }
+
+  mkdirSync(target, { recursive: true });
+  const entries = readdirSync(target, { withFileTypes: true })
+    .filter((entry) => !entry.name.startsWith("."))
+    .sort((a, b) => Number(a.isFile()) - Number(b.isFile()) || a.name.localeCompare(b.name, "zh-CN"))
+    .map((entry) => {
+      const entryPath = relative(personaRoot, join(target, entry.name)).replace(/\\/g, "/");
+      return {
+        name: entry.name,
+        path: entryPath,
+        type: entry.isDirectory() ? "directory" : "file",
+      };
+    });
+
+  return { persona: safePersona, folder: safeFolder, entries };
+}
+
 function listBackgrounds() {
   const supported = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"]);
   const backgrounds = walkFiles(contentRoots["/backgrounds"])
@@ -122,7 +168,8 @@ function listLive2DModels() {
 
 function handleContentApiRequest(request, response) {
   if (request.method !== "GET") return false;
-  const pathname = new URL(request.url || "/", "http://localhost").pathname;
+  const url = new URL(request.url || "/", "http://localhost");
+  const pathname = url.pathname;
 
   if (pathname === "/api/backgrounds") {
     jsonResponse(response, 200, { backgrounds: listBackgrounds() });
@@ -131,6 +178,11 @@ function handleContentApiRequest(request, response) {
 
   if (pathname === "/api/live2d-models") {
     jsonResponse(response, 200, { models: listLive2DModels() });
+    return true;
+  }
+
+  if (pathname === "/api/workspace") {
+    jsonResponse(response, 200, listWorkspace(url.searchParams.get("persona") || "", url.searchParams.get("folder") || ""));
     return true;
   }
 

@@ -353,64 +353,74 @@ audio {
 
 .workspace-header {
   display: grid;
-  gap: 2px;
-  padding: 2px 2px 4px;
+  padding: 2px 2px 9px;
+  border-bottom: 1px solid rgba(36, 31, 34, 0.14);
+  text-align: center;
 }
 
-.workspace-title,
-.workspace-path {
+.workspace-title {
   min-width: 0;
   overflow: hidden;
+  color: #2f282d;
+  font-size: 13px;
+  font-weight: 900;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.workspace-title {
-  color: #2f282d;
-  font-size: 13px;
-  font-weight: 900;
-}
-
-.workspace-path {
-  color: #7b6c73;
-  font-size: 11px;
-  font-weight: 700;
-}
-
-.workspace-item {
+.workspace-entry-section {
   display: grid;
-  grid-template-columns: 30px minmax(0, 1fr);
+  gap: 0;
+  border-bottom: 1px solid rgba(36, 31, 34, 0.1);
+  padding-left: calc(var(--workspace-depth, 0) * 12px);
+}
+
+.workspace-folder-row,
+.workspace-file-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 5px;
   align-items: center;
   width: 100%;
-  min-height: 44px;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  padding: 7px;
-  background: rgba(255, 255, 255, 0.72);
+  min-height: 38px;
+  border: 0;
+  padding: 7px 4px;
+  background: transparent;
   color: #2f282d;
-  cursor: pointer;
   text-align: left;
 }
 
-.workspace-item:hover:not(:disabled) {
-  border-color: rgba(34, 32, 37, 0.22);
-  background: rgba(255, 255, 255, 0.96);
+.workspace-folder-row {
+  cursor: pointer;
 }
 
-.workspace-item:disabled {
+.workspace-folder-row:hover {
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.workspace-file-row {
   cursor: default;
 }
 
-.workspace-icon {
+.workspace-arrow {
   display: grid;
-  width: 24px;
-  height: 24px;
+  width: 18px;
+  height: 18px;
   place-items: center;
-  border-radius: 6px;
-  background: #f2f0ee;
-  color: #5b4e55;
-  font-size: 11px;
+  color: #6f6268;
+  font-size: 12px;
   font-weight: 900;
+  line-height: 1;
+  transition: transform 160ms ease;
+}
+
+.workspace-arrow.expanded {
+  transform: rotate(90deg);
+}
+
+.workspace-children {
+  display: grid;
+  gap: 0;
 }
 
 .workspace-name {
@@ -424,13 +434,18 @@ audio {
 
 .workspace-message {
   margin: 0;
-  border-radius: 8px;
-  padding: 10px;
-  background: rgba(255, 255, 255, 0.64);
+  padding: 10px 4px;
+  background: transparent;
   color: #6f6268;
   font-size: 12px;
   font-weight: 700;
   line-height: 1.45;
+  text-align: center;
+}
+
+.workspace-message.compact {
+  padding: 8px 4px 8px 23px;
+  text-align: left;
 }
 
 #canvas {

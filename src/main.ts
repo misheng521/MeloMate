@@ -227,6 +227,8 @@ let backgroundOptions: BackgroundOption[] = [];
 let characterOptions: CharacterConfigOption[] = [];
 let activeAssetPanelTab: AssetPanelTab = "background";
 let currentWorkspaceFolder = "";
+let expandedWorkspaceFolders = new Set<string>();
+let workspaceEntriesCache = new Map<string, WorkspaceEntry[]>();
 let lastAppliedCharacterConfigFile = "";
 let currentAssistantName = "小可";
 let activeLive2DModelId = "";
@@ -470,10 +472,6 @@ function workspacePersonaName() {
   return characterOptionDisplayName(option || defaultCharacterOption);
 }
 
-function workspaceFolderLabel() {
-  return currentWorkspaceFolder || "根目录";
-}
-
 async function readWorkspaceEntries(folder = currentWorkspaceFolder) {
   const params = new URLSearchParams({
     persona: workspacePersonaName(),
@@ -484,6 +482,12 @@ async function readWorkspaceEntries(folder = currentWorkspaceFolder) {
   return (await response.json()) as { entries?: WorkspaceEntry[]; folder?: string };
 }
 
+function clearWorkspaceCache() {
+  currentWorkspaceFolder = "";
+  expandedWorkspaceFolders = new Set<string>();
+  workspaceEntriesCache = new Map<string, WorkspaceEntry[]>();
+}
+
 function renderWorkspaceMessage(text: string) {
   workspaceList.textContent = "";
   const message = document.createElement("p");
@@ -492,9 +496,7 @@ function renderWorkspaceMessage(text: string) {
   workspaceList.appendChild(message);
 }
 
-function renderWorkspaceEntries(entries: WorkspaceEntry[]) {
-  workspaceList.textContent = "";
-
+function renderWorkspaceHeader() {
   const header = document.createElement("div");
   header.className = "workspace-header";
 
@@ -502,61 +504,99 @@ function renderWorkspaceEntries(entries: WorkspaceEntry[]) {
   title.className = "workspace-title";
   title.textContent = workspacePersonaName();
 
-  const path = document.createElement("span");
-  path.className = "workspace-path";
-  path.textContent = workspaceFolderLabel();
-
-  header.append(title, path);
+  header.append(title);
   workspaceList.appendChild(header);
+}
 
-  if (currentWorkspaceFolder) {
-    const back = document.createElement("button");
-    back.className = "workspace-item";
-    back.type = "button";
-    back.setAttribute("role", "listitem");
-    back.textContent = "返回上一级";
-    back.addEventListener("click", () => {
-      const parts = currentWorkspaceFolder.split("/").filter(Boolean);
-      parts.pop();
-      currentWorkspaceFolder = parts.join("/");
-      void refreshWorkspaceList();
+function renderWorkspaceEntry(entry: WorkspaceEntry, depth = 0) {
+  const section = document.createElement("div");
+  section.className = "workspace-entry-section";
+  section.style.setProperty("--workspace-depth", String(depth));
+
+  const row = document.createElement("button");
+  row.className = entry.type === "directory" ? "workspace-folder-row" : "workspace-file-row";
+  row.type = "button";
+  row.dataset.path = entry.path;
+  row.setAttribute("role", "listitem");
+
+  const arrow = document.createElement("span");
+  arrow.className = "workspace-arrow";
+
+  const label = document.createElement("span");
+  label.className = "workspace-name";
+  label.textContent = entry.name;
+
+  if (entry.type === "directory") {
+    const isExpanded = expandedWorkspaceFolders.has(entry.path);
+    arrow.textContent = ">";
+    arrow.classList.toggle("expanded", isExpanded);
+    row.setAttribute("aria-expanded", String(isExpanded));
+    row.addEventListener("click", () => {
+      void toggleWorkspaceFolder(entry.path);
     });
-    workspaceList.appendChild(back);
+  } else {
+    arrow.textContent = "";
+    row.disabled = true;
   }
+
+  row.append(arrow, label);
+  section.appendChild(row);
+
+  if (entry.type === "directory" && expandedWorkspaceFolders.has(entry.path)) {
+    const children = workspaceEntriesCache.get(entry.path);
+    const childList = document.createElement("div");
+    childList.className = "workspace-children";
+
+    if (!children) {
+      const loading = document.createElement("p");
+      loading.className = "workspace-message compact";
+      loading.textContent = "正在读取...";
+      childList.appendChild(loading);
+    } else if (!children.length) {
+      const empty = document.createElement("p");
+      empty.className = "workspace-message compact";
+      empty.textContent = "无文件";
+      childList.appendChild(empty);
+    } else {
+      children.forEach((child) => childList.appendChild(renderWorkspaceEntry(child, depth + 1)));
+    }
+
+    section.appendChild(childList);
+  }
+
+  return section;
+}
+
+function renderWorkspaceEntries(entries: WorkspaceEntry[]) {
+  workspaceList.textContent = "";
+  renderWorkspaceHeader();
 
   if (!entries.length) {
     const empty = document.createElement("p");
     empty.className = "workspace-message";
-    empty.textContent = "这个人设的工作区还没有文件。";
+    empty.textContent = "无文件";
     workspaceList.appendChild(empty);
     return;
   }
 
-  entries.forEach((entry) => {
-    const item = document.createElement("button");
-    item.className = "workspace-item";
-    item.type = "button";
-    item.dataset.path = entry.path;
-    item.setAttribute("role", "listitem");
-    item.disabled = entry.type !== "directory";
+  entries.forEach((entry) => workspaceList.appendChild(renderWorkspaceEntry(entry)));
+}
 
-    const icon = document.createElement("span");
-    icon.className = "workspace-icon";
-    icon.textContent = entry.type === "directory" ? "夹" : "文";
+async function toggleWorkspaceFolder(path: string) {
+  if (expandedWorkspaceFolders.has(path)) {
+    expandedWorkspaceFolders.delete(path);
+    renderWorkspaceEntries(workspaceEntriesCache.get("") || []);
+    return;
+  }
 
-    const label = document.createElement("span");
-    label.className = "workspace-name";
-    label.textContent = entry.name;
+  expandedWorkspaceFolders.add(path);
+  renderWorkspaceEntries(workspaceEntriesCache.get("") || []);
 
-    item.append(icon, label);
-    if (entry.type === "directory") {
-      item.addEventListener("click", () => {
-        currentWorkspaceFolder = entry.path;
-        void refreshWorkspaceList();
-      });
-    }
-    workspaceList.appendChild(item);
-  });
+  if (!workspaceEntriesCache.has(path)) {
+    const data = await readWorkspaceEntries(path);
+    workspaceEntriesCache.set(path, data.entries || []);
+  }
+  renderWorkspaceEntries(workspaceEntriesCache.get("") || []);
 }
 
 async function refreshWorkspaceList() {
@@ -564,8 +604,8 @@ async function refreshWorkspaceList() {
 
   try {
     const data = await readWorkspaceEntries();
-    currentWorkspaceFolder = data.folder || currentWorkspaceFolder;
-    renderWorkspaceEntries(data.entries || []);
+    workspaceEntriesCache.set("", data.entries || []);
+    renderWorkspaceEntries(workspaceEntriesCache.get("") || []);
   } catch (error) {
     console.warn(error);
     renderWorkspaceMessage(error instanceof Error ? error.message : "工作区加载失败。");
@@ -622,7 +662,7 @@ function selectCharacterConfigFile(file: string) {
 
   syncAssistantNameFromSelection();
   saveSettings();
-  currentWorkspaceFolder = "";
+  clearWorkspaceCache();
 
   if (isWsReady && selectedCharacterConfigFile() !== lastAppliedCharacterConfigFile) {
     sendCharacterConfigSwitch();

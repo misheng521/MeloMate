@@ -132,6 +132,22 @@ function listWorkspace(persona, folder) {
   return { persona: safePersona, folder: safeFolder, entries };
 }
 
+function resolveWorkspaceFile(pathname) {
+  const prefix = "/workspace-files/";
+  if (!pathname.startsWith(prefix)) return null;
+
+  const parts = pathname.slice(prefix.length).split("/").filter(Boolean).map(decodeURIComponent);
+  const persona = safeName(parts.shift() || "");
+  if (!persona || !parts.length) return null;
+
+  const personaRoot = resolve(workspaceRoot, persona);
+  const filePath = resolve(personaRoot, safeWorkspaceFolder(parts.join("/")));
+  if (!isInside(personaRoot, filePath) || !existsSync(filePath) || !statSync(filePath).isFile()) {
+    return null;
+  }
+  return filePath;
+}
+
 function listBackgrounds() {
   const supported = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"]);
   const backgrounds = walkFiles(contentRoots["/backgrounds"])
@@ -192,7 +208,13 @@ function handleContentApiRequest(request, response) {
 }
 
 function resolveRequest(url) {
-  const pathname = decodeURIComponent(new URL(url, "http://localhost").pathname);
+  const encodedPathname = new URL(url, "http://localhost").pathname;
+  const workspaceFile = resolveWorkspaceFile(encodedPathname);
+  if (workspaceFile) {
+    return workspaceFile;
+  }
+
+  const pathname = decodeURIComponent(encodedPathname);
   const assetPath = resolveAliasedAsset(pathname);
   if (assetPath) {
     return assetPath;

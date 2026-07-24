@@ -8,6 +8,7 @@ from typing import (
     Union,
     Optional,
 )
+import datetime
 from loguru import logger
 from .agent_interface import AgentInterface
 from ..output_types import SentenceOutput, DisplayText
@@ -28,6 +29,18 @@ from ...mcpp.tool_manager import ToolManager
 from ...mcpp.json_detector import StreamJSONDetector
 from ...mcpp.types import ToolCallObject
 from ...mcpp.tool_executor import ToolExecutor
+
+
+WORKSPACE_TOOL_NAMES = {
+    "create_workspace_folder",
+    "write_workspace_file",
+    "append_workspace_file",
+    "write_workspace_project",
+    "read_workspace_file",
+    "list_workspace",
+    "schedule_reminder",
+    "open_workspace_item",
+}
 
 
 class BasicMemoryAgent(AgentInterface):
@@ -220,6 +233,57 @@ class BasicMemoryAgent(AgentInterface):
         )
         logger.info(f"Handled interrupt with role '{interrupt_role}'.")
 
+    def _tool_call_name(self, call: Union[Dict[str, Any], ToolCallObject]) -> str:
+        if isinstance(call, ToolCallObject):
+            return call.function.name
+        return str(call.get("name") or call.get("function", {}).get("name") or "")
+
+    def _tool_call_id(self, call: Union[Dict[str, Any], ToolCallObject]) -> str:
+        if isinstance(call, ToolCallObject):
+            return str(call.id or "")
+        return str(call.get("id") or "")
+
+    def _contains_workspace_tool(
+        self, tool_calls: Union[List[ToolCallObject], List[Dict[str, Any]]]
+    ) -> bool:
+        return any(self._tool_call_name(call) in WORKSPACE_TOOL_NAMES for call in tool_calls)
+
+    def _workspace_ack_text(
+        self, tool_calls: Union[List[ToolCallObject], List[Dict[str, Any]]]
+    ) -> str:
+        names = {self._tool_call_name(call) for call in tool_calls}
+        if "open_workspace_item" in names:
+            return "好，我打开给你。"
+        if "schedule_reminder" in names:
+            return "好，我先记下这个提醒。"
+        if names & {
+            "write_workspace_file",
+            "append_workspace_file",
+            "write_workspace_project",
+            "create_workspace_folder",
+        }:
+            return "好，我开始做，做好后告诉你。"
+        return "好，我先去工作区看看。"
+
+    def _workspace_started_status(
+        self, tool_calls: Union[List[ToolCallObject], List[Dict[str, Any]]]
+    ) -> Dict[str, Any] | None:
+        for call in tool_calls:
+            tool_name = self._tool_call_name(call)
+            if tool_name in WORKSPACE_TOOL_NAMES:
+                return {
+                    "type": "tool_call_status",
+                    "tool_id": self._tool_call_id(call) or "workspace_pending",
+                    "tool_name": tool_name,
+                    "status": "running",
+                    "content": "Workspace work accepted.",
+                    "timestamp": datetime.datetime.now(
+                        datetime.timezone.utc
+                    ).isoformat()
+                    + "Z",
+                }
+        return None
+
     def _to_text_prompt(self, input_data: BatchInput) -> str:
         """Format input data to text prompt."""
         message_parts = []
@@ -295,6 +359,7 @@ class BasicMemoryAgent(AgentInterface):
         current_turn_text = ""
         pending_tool_calls = []
         current_assistant_message_content = []
+        workspace_ack_sent = False
 
         while True:
             stream = self._llm.chat_completion(messages, self._system, tools=tools)
@@ -340,6 +405,20 @@ class BasicMemoryAgent(AgentInterface):
                     return
 
             if pending_tool_calls:
+                if (
+                    not workspace_ack_sent
+                    and self._contains_workspace_tool(pending_tool_calls)
+                ):
+                    workspace_ack_sent = True
+                    started_status = self._workspace_started_status(pending_tool_calls)
+                    if started_status:
+                        yield started_status
+                    ack_text = current_turn_text.strip() or self._workspace_ack_text(
+                        pending_tool_calls
+                    )
+                    yield ack_text
+                    self._add_message(ack_text, "assistant")
+
                 filtered_assistant_content = [
                     block
                     for block in current_assistant_message_content
@@ -409,6 +488,7 @@ class BasicMemoryAgent(AgentInterface):
         current_turn_text = ""
         pending_tool_calls: Union[List[ToolCallObject], List[Dict[str, Any]]] = []
         current_system_prompt = self._system
+        workspace_ack_sent = False
 
         while True:
             if self.prompt_mode_flag:
@@ -537,6 +617,20 @@ class BasicMemoryAgent(AgentInterface):
                 continue
 
             elif pending_tool_calls and assistant_message_for_api:
+                if (
+                    not workspace_ack_sent
+                    and self._contains_workspace_tool(pending_tool_calls)
+                ):
+                    workspace_ack_sent = True
+                    started_status = self._workspace_started_status(pending_tool_calls)
+                    if started_status:
+                        yield started_status
+                    ack_text = current_turn_text.strip() or self._workspace_ack_text(
+                        pending_tool_calls
+                    )
+                    yield ack_text
+                    self._add_message(ack_text, "assistant")
+
                 messages.append(assistant_message_for_api)
                 if current_turn_text:
                     self._add_message(current_turn_text, "assistant")

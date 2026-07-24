@@ -47,7 +47,12 @@ class ToolExecutor:
                     f"Failed to decode OpenAI tool arguments for '{tool_name}'"
                 )
                 result_content = (
-                    f"Error: Invalid arguments format for tool '{tool_name}'."
+                    f"Error: Invalid arguments format for tool '{tool_name}'. "
+                    "The tool arguments were not valid JSON, often because long code "
+                    "was truncated or contained unescaped quotes. Retry with compact "
+                    "valid JSON. For games, mini apps, web pages, or long files, split "
+                    "the work into smaller files with write_workspace_project or write "
+                    "small chunks with append_workspace_file."
                 )
                 is_error = True
                 parse_error = True
@@ -204,12 +209,16 @@ class ToolExecutor:
                 continue  # Skip execution logic for this call
 
             # Yield 'running' status before execution
+            input_preview = json.dumps(tool_input, ensure_ascii=False)
+            if len(input_preview) > 1000:
+                input_preview = f"{input_preview[:1000]}... [truncated]"
+
             yield {
                 "type": "tool_call_status",
                 "tool_id": tool_id,
                 "tool_name": tool_name,
                 "status": "running",
-                "content": f"Input: {json.dumps(tool_input)}",
+                "content": f"Input: {input_preview}",
                 "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
                 + "Z",
             }

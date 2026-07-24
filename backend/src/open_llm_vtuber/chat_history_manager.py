@@ -14,6 +14,7 @@ SHORT_MEMORY_FILE = "short_memory.json"
 CORE_MEMORY_FILE = "core_memory.json"
 SINGLE_HISTORY_UID = "short_memory"
 MAX_MEMORY_ROUNDS = 20
+CORE_MEMORY_REVIEW_ROUNDS = 20
 
 
 class HistoryMessage(TypedDict):
@@ -92,6 +93,8 @@ def _ensure_memory_files(conf_uid: str) -> None:
                 "dislikes": [],
                 "preferences": [],
                 "facts": [],
+                "turns_since_core_review": 0,
+                "last_core_review_at": "",
             },
         )
 
@@ -253,6 +256,139 @@ def get_core_memory_prompt(conf_uid: str) -> str:
     return "# 核心记忆\n" + "\n".join(lines)
 
 
+def _normalize_item(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip(" ，。！？；;,.!?\n\t"))
+
+
+def _split_items(text: str) -> list[str]:
+    return [
+        item
+        for item in (_normalize_item(part) for part in re.split(r"[、，,。；;！!？?\n]+", text))
+        if item
+    ]
+
+
+def _is_stable_memory_value(value: str) -> bool:
+    value = _normalize_item(value)
+    if not value:
+        return False
+    if len(value) <= 1:
+        return False
+    unstable_markers = (
+        "吗",
+        "么",
+        "?",
+        "？",
+        "什么",
+        "为什么",
+        "怎么",
+        "能不能",
+        "可不可以",
+        "想玩",
+        "想看",
+        "看看",
+        "试试",
+        "现在",
+        "这次",
+        "刚才",
+        "这个",
+        "那个",
+        "直接把",
+    )
+    return not any(marker in value for marker in unstable_markers)
+
+
+def _extract_core_updates(message: str) -> dict:
+    text = _normalize_item(message)
+    updates = {
+        "nickname": "",
+        "likes": [],
+        "dislikes": [],
+        "preferences": [],
+        "facts": [],
+    }
+
+    if not text:
+        return updates
+
+    question_markers = ("吗", "么", "?", "？", "什么", "为什么", "怎么", "能不能", "可不可以")
+    weak_momentary_markers = ("想玩", "想看", "看看", "试试", "现在", "这次", "刚才")
+
+    nickname_patterns = [
+        r"(?:以后|之后|往后)?(?:叫我|喊我|称呼我)(?:为|叫)?[:： ]*([^，。！？；;,.!?\n]{1,20})",
+        r"(?:我的名字是|我叫)[:： ]*([^，。！？；;,.!?\n]{1,20})",
+    ]
+    for pattern in nickname_patterns:
+        match = re.search(pattern, text)
+        if match:
+            updates["nickname"] = _normalize_item(match.group(1))
+            break
+
+    for match in re.finditer(r"我(?:很|最|特别|非常)?喜欢[:： ]*([^。！？；;\n]{1,80})", text):
+        value = match.group(1)
+        if not any(marker in value for marker in question_markers):
+            updates["likes"].extend(_split_items(value))
+
+    for match in re.finditer(r"我(?:很|最|特别|非常)?(?:不喜欢|讨厌|不爱)[:： ]*([^。！？；;\n]{1,80})", text):
+        value = match.group(1)
+        if not any(marker in value for marker in question_markers):
+            updates["dislikes"].extend(_split_items(value))
+
+    preference_patterns = [
+        r"(?:以后|之后|往后)(?:不要|别|不许)[:： ]*([^。！？；;\n]{1,80})",
+        r"(?:以后|之后|往后)(?:要|希望你|你要|请你)[:： ]*([^。！？；;\n]{1,80})",
+        r"(?:请记住|记住|记得)[:： ]*([^。！？；;\n]{1,100})",
+    ]
+    for pattern in preference_patterns:
+        for match in re.finditer(pattern, text):
+            value = _normalize_item(match.group(1))
+            if value and not any(marker in value for marker in question_markers):
+                updates["preferences"].append(value)
+
+    fact_patterns = [
+        r"我的(?:生日|生辰)是[:： ]*([^。！？；;\n]{1,40})",
+        r"我住在[:： ]*([^。！？；;\n]{1,60})",
+        r"我是(?:一个|一名)?[:： ]*([^。！？；;\n]{1,60})",
+    ]
+    for pattern in fact_patterns:
+        for match in re.finditer(pattern, text):
+            value = _normalize_item(match.group(0))
+            if value and not any(marker in value for marker in question_markers + weak_momentary_markers):
+                updates["facts"].append(value)
+
+    return updates
+
+
+def get_core_memory_prompt(conf_uid: str) -> str:
+    core = get_core_memory(conf_uid)
+    lines = []
+
+    nickname = core.get("nickname")
+    if nickname:
+        lines.append(f"称呼用户：{nickname}")
+
+    sections = [
+        ("用户喜欢", core.get("likes")),
+        ("用户不喜欢", core.get("dislikes")),
+        ("用户希望", core.get("preferences")),
+        ("用户事实", core.get("facts")),
+    ]
+    for title, values in sections:
+        if isinstance(values, list) and values:
+            clean_values = [
+                _normalize_item(value)
+                for value in values
+                if _is_stable_memory_value(value)
+            ]
+            if clean_values:
+                lines.append(f"{title}：" + "；".join(clean_values))
+
+    if not lines:
+        return ""
+
+    return "# 核心记忆\n" + "\n".join(lines)
+
+
 def create_new_history(conf_uid: str) -> str:
     if not conf_uid:
         logger.warning("No conf_uid provided")
@@ -288,7 +424,7 @@ def store_message(
                 "bot": "",
             }
         )
-        _update_core_memory_from_user_message(conf_uid, content)
+        _maybe_review_core_memory(conf_uid, short_memory)
     elif role == "ai":
         if short_memory and short_memory[-1].get("user") and not short_memory[-1].get("bot"):
             short_memory[-1]["bot"] = content
@@ -389,3 +525,191 @@ def get_metadata(conf_uid: str, history_uid: str) -> dict:
 
 def update_metadate(conf_uid: str, history_uid: str, metadata: dict) -> bool:
     return True
+
+
+def _normalize_item(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip(" ，。！？；;,.!?\n\t"))
+
+
+def _split_items(text: str) -> list[str]:
+    return [
+        item
+        for item in (_normalize_item(part) for part in re.split(r"[、，,。；;！!？?\n]+", text))
+        if item
+    ]
+
+
+def _is_stable_memory_value(value: str) -> bool:
+    value = _normalize_item(value)
+    if len(value) <= 1:
+        return False
+    unstable_markers = (
+        "吗",
+        "么",
+        "?",
+        "？",
+        "什么",
+        "为什么",
+        "怎么",
+        "能不能",
+        "可不可以",
+        "想玩",
+        "想看",
+        "看看",
+        "试试",
+        "现在",
+        "这次",
+        "刚才",
+        "这个",
+        "那个",
+        "直接把",
+    )
+    return not any(marker in value for marker in unstable_markers)
+
+
+def _extract_core_updates(message: str) -> dict:
+    text = _normalize_item(message)
+    updates = {
+        "nickname": "",
+        "likes": [],
+        "dislikes": [],
+        "preferences": [],
+        "facts": [],
+    }
+    if not text:
+        return updates
+
+    question_markers = ("吗", "么", "?", "？", "什么", "为什么", "怎么", "能不能", "可不可以")
+    momentary_markers = ("想玩", "想看", "看看", "试试", "现在", "这次", "刚才", "这个", "那个")
+
+    for pattern in (
+        r"(?:以后|之后|往后)?(?:叫我|喊我|称呼我)(?:为|叫)?[:： ]*([^，。！？；;,.!?\n]{1,20})",
+        r"(?:我的名字是|我叫)[:： ]*([^，。！？；;,.!?\n]{1,20})",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            updates["nickname"] = _normalize_item(match.group(1))
+            break
+
+    for match in re.finditer(r"我(?:很|最|特别|非常)?喜欢[:： ]*([^。！？；;\n]{1,80})", text):
+        value = match.group(1)
+        if not any(marker in value for marker in question_markers + momentary_markers):
+            updates["likes"].extend(_split_items(value))
+
+    for match in re.finditer(r"我(?:很|最|特别|非常)?(?:不喜欢|讨厌|不爱)[:： ]*([^。！？；;\n]{1,80})", text):
+        value = match.group(1)
+        if not any(marker in value for marker in question_markers + momentary_markers):
+            updates["dislikes"].extend(_split_items(value))
+
+    for pattern in (
+        r"(?:以后|之后|往后)(?:不要|别|不许)[:： ]*([^。！？；;\n]{1,80})",
+        r"(?:以后|之后|往后)(?:要|希望你|你要|请你)[:： ]*([^。！？；;\n]{1,80})",
+        r"(?:请记住|记住|记得)[:： ]*([^。！？；;\n]{1,100})",
+    ):
+        for match in re.finditer(pattern, text):
+            value = _normalize_item(match.group(1))
+            if _is_stable_memory_value(value):
+                updates["preferences"].append(value)
+
+    for pattern in (
+        r"我的(?:生日|生辰)是[:： ]*([^。！？；;\n]{1,40})",
+        r"我住在[:： ]*([^。！？；;\n]{1,60})",
+        r"我是(?:一个|一名)?[:： ]*([^。！？；;\n]{1,60})",
+    ):
+        for match in re.finditer(pattern, text):
+            value = _normalize_item(match.group(0))
+            if _is_stable_memory_value(value):
+                updates["facts"].append(value)
+
+    return updates
+
+
+def _merge_core_updates(core: dict, updates: dict) -> dict:
+    core.setdefault("timestamp", _now())
+    core.setdefault("nickname", "")
+    core.setdefault("likes", [])
+    core.setdefault("dislikes", [])
+    core.setdefault("preferences", [])
+    core.setdefault("facts", [])
+    core.setdefault("turns_since_core_review", 0)
+    core.setdefault("last_core_review_at", "")
+
+    if updates.get("nickname"):
+        core["nickname"] = updates["nickname"]
+
+    for key in ("likes", "dislikes", "preferences", "facts"):
+        values = [
+            _normalize_item(value)
+            for value in updates.get(key, [])
+            if _is_stable_memory_value(value)
+        ]
+        if not isinstance(core.get(key), list):
+            core[key] = []
+        core[key] = _add_unique(core[key], values)
+
+    core["timestamp"] = _now()
+    return core
+
+
+def _maybe_review_core_memory(conf_uid: str, short_memory: list[dict]) -> None:
+    core_path = _get_core_memory_path(conf_uid)
+    core = _read_json(core_path, {})
+    if not isinstance(core, dict):
+        core = {}
+
+    turns_since_review = int(core.get("turns_since_core_review") or 0) + 1
+    if turns_since_review < CORE_MEMORY_REVIEW_ROUNDS:
+        core["turns_since_core_review"] = turns_since_review
+        core.setdefault("last_core_review_at", "")
+        core.setdefault("timestamp", _now())
+        _write_json(core_path, core)
+        return
+
+    combined_updates = {
+        "nickname": "",
+        "likes": [],
+        "dislikes": [],
+        "preferences": [],
+        "facts": [],
+    }
+    for item in short_memory[-MAX_MEMORY_ROUNDS:]:
+        updates = _extract_core_updates(str(item.get("user") or ""))
+        if updates.get("nickname"):
+            combined_updates["nickname"] = updates["nickname"]
+        for key in ("likes", "dislikes", "preferences", "facts"):
+            combined_updates[key].extend(updates.get(key, []))
+
+    core = _merge_core_updates(core, combined_updates)
+    core["turns_since_core_review"] = 0
+    core["last_core_review_at"] = _now()
+    _write_json(core_path, core)
+
+
+def get_core_memory_prompt(conf_uid: str) -> str:
+    core = get_core_memory(conf_uid)
+    lines = []
+
+    nickname = core.get("nickname")
+    if nickname:
+        lines.append(f"称呼用户：{nickname}")
+
+    sections = [
+        ("用户喜欢", core.get("likes")),
+        ("用户不喜欢", core.get("dislikes")),
+        ("用户希望", core.get("preferences")),
+        ("用户事实", core.get("facts")),
+    ]
+    for title, values in sections:
+        if isinstance(values, list):
+            clean_values = [
+                _normalize_item(value)
+                for value in values
+                if _is_stable_memory_value(value)
+            ]
+            if clean_values:
+                lines.append(f"{title}：" + "；".join(clean_values))
+
+    if not lines:
+        return ""
+
+    return "# 核心记忆\n" + "\n".join(lines)

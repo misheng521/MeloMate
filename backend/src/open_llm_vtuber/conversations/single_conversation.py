@@ -248,6 +248,8 @@ def is_workspace_tool_status(output_item: Dict[str, Any]) -> bool:
     return tool_name in {
         "create_workspace_folder",
         "write_workspace_file",
+        "append_workspace_file",
+        "write_workspace_project",
         "read_workspace_file",
         "list_workspace",
         "schedule_reminder",

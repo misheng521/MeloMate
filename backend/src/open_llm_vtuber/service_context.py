@@ -75,6 +75,8 @@ class ServiceContext:
         self.mcp_prompt: str = ""
 
         self.history_uid: str = ""  # Add history_uid field
+        self.send_text: Callable = None
+        self.client_uid: str = None
 
     def _load_short_memory_into_agent(self) -> None:
         if not (
@@ -92,9 +94,6 @@ class ServiceContext:
             )
         except Exception as exc:
             logger.warning(f"Failed to load short memory into agent: {exc}")
-
-        self.send_text: Callable = None
-        self.client_uid: str = None
 
     def __str__(self):
         return (

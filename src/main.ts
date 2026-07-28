@@ -74,6 +74,17 @@ type WorkspaceEntry = {
   type: "directory" | "file";
 };
 
+type WorkspaceEvent = {
+  id: string;
+  type: "workspace-state-changed" | "workspace-page-closed";
+  created_ms: number;
+  page?: { id?: string; title?: string; path?: string; closed?: boolean };
+  appState?: unknown;
+  lastAction?: { id?: string; action?: string; accepted?: boolean } | null;
+  actionEvent?: boolean;
+  summary?: string;
+};
+
 type WorkspaceControlStatus = {
   label: string;
   tone: "ready" | "stale" | "missing";
@@ -107,6 +118,7 @@ const backgroundManifestUrl = "/api/backgrounds";
 const live2DModelManifestUrl = "/api/live2d-models";
 const workspaceManifestUrl = "/api/workspace";
 const workspaceStateUrl = "/api/workspace-state";
+const workspaceEventsUrl = "/api/workspace-events";
 const fallbackBackgrounds: BackgroundOption[] = [{ name: "Default", url: "/backgrounds/default.svg" }];
 const defaultCharacterConfigFile = "小可.yaml";
 const defaultCharacterOption: CharacterConfigOption = { filename: defaultCharacterConfigFile };
@@ -149,6 +161,7 @@ const screenVisionJpegQuality = 0.85;
 const defaultProactiveIdleSeconds = "120";
 const proactiveSpeakCheckIntervalMs = 10_000;
 const proactiveSpeakChance = 0.35;
+const workspaceEventPollMs = 700;
 const preferredVoiceChatOutputDevicePattern = /^voicemeeter\s+input\b/i;
 const voiceChatOutputDevicePattern = /voicemeeter\s+(input|in\s*\d+|aux\s+input|vaio3\s+input)|vb-audio\s+voicemeeter\s+vaio/i;
 const voiceChatMicDevicePattern = /voicemeeter\s+out\s*b2|out\s*b2.*voicemeeter|voicemeeter.*b2/i;
@@ -237,6 +250,9 @@ let currentWorkspaceFolder = "";
 let expandedWorkspaceFolders = new Set<string>();
 let workspaceEntriesCache = new Map<string, WorkspaceEntry[]>();
 let workspaceControlStatus: WorkspaceControlStatus = { label: "未连接", tone: "missing" };
+let workspaceEventTimer = 0;
+let lastWorkspaceEventMs = Date.now();
+const handledWorkspaceEventIds = new Set<string>();
 let lastAppliedCharacterConfigFile = "";
 let currentAssistantName = "小可";
 let activeLive2DModelId = "";
@@ -1622,6 +1638,75 @@ function sendWs(message: object) {
   }
 }
 
+function workspaceEventPrompt(event: WorkspaceEvent) {
+  const pageName = event.page?.title || event.page?.path || "工作区页面";
+  if (event.type === "workspace-page-closed") {
+    return `工作区事件：用户关闭了「${pageName}」。请像同桌朋友一样自然回应，不要声称还能继续控制这个已关闭页面。`;
+  }
+
+  const stateText = JSON.stringify(event.appState ?? null);
+  return [
+    `工作区事件：「${pageName}」发生了新变化。`,
+    "你正在观察这个固定页面实例。请像现实中同桌互动一样自然回应。",
+    "如果这是游戏/棋局且轮到你，请先用 read_workspace_state 确认状态，再用 send_workspace_action 行动；没确认不要声称已行动。",
+    `最新状态：${stateText.slice(0, 1800)}`,
+  ].join("\n");
+}
+
+async function readWorkspaceEvents() {
+  const params = new URLSearchParams({
+    persona: workspacePersonaName(),
+    since: String(lastWorkspaceEventMs),
+  });
+  const response = await fetch(`${workspaceEventsUrl}?${params.toString()}`, { cache: "no-store" });
+  if (!response.ok) return [];
+  const data = (await response.json()) as { events?: WorkspaceEvent[] };
+  return data.events || [];
+}
+
+function shouldForwardWorkspaceEvent(event: WorkspaceEvent) {
+  if (!event.id || handledWorkspaceEventIds.has(event.id)) return false;
+  if (event.actionEvent && event.lastAction?.accepted !== false) return false;
+  return true;
+}
+
+async function pollWorkspaceEvents() {
+  if (!isWsReady) return;
+  try {
+    const events = await readWorkspaceEvents();
+    for (const event of events.slice(-4)) {
+      lastWorkspaceEventMs = Math.max(lastWorkspaceEventMs, Number(event.created_ms || 0));
+      if (!shouldForwardWorkspaceEvent(event)) continue;
+      handledWorkspaceEventIds.add(event.id);
+      if (handledWorkspaceEventIds.size > 200) handledWorkspaceEventIds.clear();
+      sendWs({
+        type: "text-input",
+        text: workspaceEventPrompt(event),
+        metadata: {
+          workspace_event: true,
+          skip_history: true,
+        },
+      });
+    }
+  } catch (error) {
+    console.warn("Workspace event poll failed.", error);
+  }
+}
+
+function startWorkspaceEventLoop() {
+  if (workspaceEventTimer) return;
+  void pollWorkspaceEvents();
+  workspaceEventTimer = window.setInterval(() => {
+    void pollWorkspaceEvents();
+  }, workspaceEventPollMs);
+}
+
+function stopWorkspaceEventLoop() {
+  if (!workspaceEventTimer) return;
+  window.clearInterval(workspaceEventTimer);
+  workspaceEventTimer = 0;
+}
+
 function markConversationActivity() {
   lastConversationActivityAt = Date.now();
 }
@@ -1789,6 +1874,7 @@ function connectWebSocket() {
     sendWs({ type: "create-new-history" });
     sendClientApiConfig();
     void sendClientVoiceCloneConfig();
+    startWorkspaceEventLoop();
   };
 
   ws.onmessage = (event) => {
@@ -1805,6 +1891,7 @@ function connectWebSocket() {
 
   ws.onclose = () => {
     isWsReady = false;
+    stopWorkspaceEventLoop();
     syncApplySettingsButtonState();
     syncProactiveSpeakButton();
     ws = null;

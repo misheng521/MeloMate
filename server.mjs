@@ -319,6 +319,8 @@ function workspaceControlScript(persona, pageId) {
   let since = Date.now();
   const seen = new Set();
   let lastStateJson = "";
+  let lastBroadcastActionId = "";
+  const workspaceChannel = "BroadcastChannel" in window ? new BroadcastChannel("melomate-workspace") : null;
   const actions = [];
   const codeByKey = {
     " ": "Space",
@@ -428,6 +430,24 @@ function workspaceControlScript(persona, pageId) {
     return null;
   }
 
+  function broadcastWorkspaceEvent(type, report) {
+    if (!workspaceChannel) return;
+    const actionId = report.lastAction && report.lastAction.id ? String(report.lastAction.id) : "";
+    const actionEvent = Boolean(actionId && actionId !== lastBroadcastActionId);
+    if (actionId) lastBroadcastActionId = actionId;
+    workspaceChannel.postMessage({
+      id: pageId + "-" + Date.now(),
+      type,
+      created_ms: Date.now(),
+      persona,
+      page: report.page,
+      appState: report.appState,
+      lastAction: report.lastAction || null,
+      actionEvent,
+      summary: type === "workspace-page-closed" ? "Workspace page was closed." : "Workspace page state changed."
+    });
+  }
+
   async function publishState(nextState, force = false) {
     const report = {
       protocolAvailable: nextState != null,
@@ -444,8 +464,10 @@ function workspaceControlScript(persona, pageId) {
       reported_ms: Date.now()
     };
     const stateJson = JSON.stringify(report);
-    if (!force && stateJson === lastStateJson) return;
+    const changed = stateJson !== lastStateJson;
+    if (!force && !changed) return;
     lastStateJson = stateJson;
+    if (changed) broadcastWorkspaceEvent("workspace-state-changed", report);
     await fetch("/api/workspace-state", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -470,6 +492,7 @@ function workspaceControlScript(persona, pageId) {
       closed: true,
       reported_ms: Date.now()
     };
+    broadcastWorkspaceEvent("workspace-page-closed", report);
     navigator.sendBeacon(
       "/api/workspace-state",
       new Blob([JSON.stringify({ persona, state: report })], { type: "application/json" })

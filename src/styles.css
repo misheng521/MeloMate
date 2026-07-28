@@ -353,6 +353,7 @@ audio {
 
 .workspace-header {
   display: grid;
+  gap: 5px;
   padding: 2px 2px 9px;
   border-bottom: 1px solid rgba(36, 31, 34, 0.14);
   text-align: center;
@@ -366,6 +367,31 @@ audio {
   font-weight: 900;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.workspace-control-status {
+  justify-self: center;
+  border-radius: 999px;
+  padding: 2px 8px;
+  background: rgba(36, 31, 34, 0.08);
+  color: #6f6268;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.workspace-control-status.ready {
+  background: rgba(35, 134, 84, 0.16);
+  color: #17683f;
+}
+
+.workspace-control-status.stale {
+  background: rgba(185, 124, 35, 0.16);
+  color: #79521b;
+}
+
+.workspace-control-status.missing {
+  background: rgba(174, 55, 75, 0.14);
+  color: #8d2f3f;
 }
 
 .workspace-entry-section {

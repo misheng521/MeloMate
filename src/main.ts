@@ -74,6 +74,11 @@ type WorkspaceEntry = {
   type: "directory" | "file";
 };
 
+type WorkspaceControlStatus = {
+  label: string;
+  tone: "ready" | "stale" | "missing";
+};
+
 type CharacterConfigOption = {
   filename: string;
   name?: string;
@@ -101,6 +106,7 @@ const settingsStorageKey = "melomate-settings";
 const backgroundManifestUrl = "/api/backgrounds";
 const live2DModelManifestUrl = "/api/live2d-models";
 const workspaceManifestUrl = "/api/workspace";
+const workspaceStateUrl = "/api/workspace-state";
 const fallbackBackgrounds: BackgroundOption[] = [{ name: "Default", url: "/backgrounds/default.svg" }];
 const defaultCharacterConfigFile = "小可.yaml";
 const defaultCharacterOption: CharacterConfigOption = { filename: defaultCharacterConfigFile };
@@ -230,6 +236,7 @@ let activeAssetPanelTab: AssetPanelTab = "background";
 let currentWorkspaceFolder = "";
 let expandedWorkspaceFolders = new Set<string>();
 let workspaceEntriesCache = new Map<string, WorkspaceEntry[]>();
+let workspaceControlStatus: WorkspaceControlStatus = { label: "未连接", tone: "missing" };
 let lastAppliedCharacterConfigFile = "";
 let currentAssistantName = "小可";
 let activeLive2DModelId = "";
@@ -483,6 +490,19 @@ async function readWorkspaceEntries(folder = currentWorkspaceFolder) {
   return (await response.json()) as { entries?: WorkspaceEntry[]; folder?: string };
 }
 
+async function readWorkspaceControlStatus(): Promise<WorkspaceControlStatus> {
+  const params = new URLSearchParams({ persona: workspacePersonaName() });
+  const response = await fetch(`${workspaceStateUrl}?${params.toString()}`, { cache: "no-store" });
+  if (!response.ok) return { label: "未连接", tone: "missing" };
+  const data = (await response.json()) as { state?: { updated_ms?: number; state?: { protocolAvailable?: boolean } } | null };
+  if (!data.state) return { label: "未连接", tone: "missing" };
+
+  const ageMs = Date.now() - Number(data.state.updated_ms || 0);
+  if (!Number.isFinite(ageMs) || ageMs > 5000) return { label: "状态过期", tone: "stale" };
+  if (!data.state.state?.protocolAvailable) return { label: "协议缺失", tone: "missing" };
+  return { label: "可控制", tone: "ready" };
+}
+
 function workspaceFileUrl(path: string) {
   const persona = encodeURIComponent(workspacePersonaName());
   const filePath = path
@@ -515,7 +535,11 @@ function renderWorkspaceHeader() {
   title.className = "workspace-title";
   title.textContent = workspacePersonaName();
 
-  header.append(title);
+  const control = document.createElement("span");
+  control.className = `workspace-control-status ${workspaceControlStatus.tone}`;
+  control.textContent = workspaceControlStatus.label;
+
+  header.append(title, control);
   workspaceList.appendChild(header);
 }
 
@@ -616,7 +640,11 @@ async function refreshWorkspaceList() {
   renderWorkspaceMessage("正在读取工作区...");
 
   try {
-    const data = await readWorkspaceEntries();
+    const [data, status] = await Promise.all([
+      readWorkspaceEntries(),
+      readWorkspaceControlStatus().catch(() => ({ label: "未连接", tone: "missing" }) as WorkspaceControlStatus),
+    ]);
+    workspaceControlStatus = status;
     workspaceEntriesCache.set("", data.entries || []);
     renderWorkspaceEntries(workspaceEntriesCache.get("") || []);
   } catch (error) {

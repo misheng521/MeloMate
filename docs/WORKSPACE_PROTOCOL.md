@@ -2,6 +2,8 @@
 
 Interactive workspace HTML files are controlled through a small page protocol injected by `server.mjs`.
 
+Every time an HTML file is opened through MeloMate, the server injects a unique page instance id. Workspace commands are routed to that exact page id, so two open games cannot accidentally receive each other's moves.
+
 ## Required Page API
 
 Expose fresh app state for the whole session:
@@ -35,4 +37,5 @@ window.MeloMateGameAction = (action, payload) => {
 - Return `accepted: true` only after the app actually applied the action.
 - Do not use a built-in AI opponent when the user asked to play with the character. The character must act through `read_workspace_state` and `send_workspace_action`.
 - Keyboard control can dispatch keys, but it cannot prove the app changed. Use semantic actions for turn-based tools and games.
-
+- When the page is closed, the injected script reports a close event and clears the current page state. MeloMate should treat the app as disconnected until a new HTML page reports state.
+- Runtime control files under `.control` are bounded to a short tail so command/event logs do not grow without limit.

@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKSPACE_ROOT = ROOT / "workspace"
 MAX_FILE_BYTES = 1024 * 1024
 MAX_PROJECT_FILES = 20
+FRESH_STATE_MS = 5000
 
 
 def safe_name(value: str, fallback: str = "default") -> str:
@@ -291,7 +292,10 @@ def send_workspace_key(
             "ok": True,
             "persona": safe_name(persona),
             "sent": True,
+            "confirmed": False,
+            "message": "KEY_SENT_EFFECT_NOT_CONFIRMED: Keyboard events were sent to the page, but their game/app effect is unknown. Do not claim a move, click, score, selection, or UI change unless a later read_workspace_state confirms it.",
             "command": {
+                "id": command["id"],
                 "type": command["type"],
                 "key": command["key"],
                 "code": command["code"],
@@ -336,6 +340,28 @@ def state_updated_ms(state: dict[str, Any] | None) -> int | None:
     return None
 
 
+def state_age_ms(state: dict[str, Any] | None) -> int | None:
+    updated_ms = state_updated_ms(state)
+    if updated_ms is None:
+        return None
+    return max(0, int(time.time() * 1000) - updated_ms)
+
+
+def state_payload(state: dict[str, Any] | None) -> dict[str, Any]:
+    payload = state.get("state") if state else None
+    return payload if isinstance(payload, dict) else {}
+
+
+def state_protocol_available(state: dict[str, Any] | None) -> bool:
+    payload = state_payload(state)
+    return bool(payload.get("protocolAvailable") and payload.get("appState") is not None)
+
+
+def state_is_fresh(state: dict[str, Any] | None) -> bool:
+    age_ms = state_age_ms(state)
+    return age_ms is not None and age_ms < FRESH_STATE_MS
+
+
 def find_action_result(state: dict[str, Any] | None, command_id: str) -> dict[str, Any] | None:
     if not state:
         return None
@@ -351,6 +377,26 @@ def find_action_result(state: dict[str, Any] | None, command_id: str) -> dict[st
         if isinstance(item, dict) and str(item.get("id") or "") == command_id:
             return item
     return None
+
+
+def action_result_confirmed(
+    state: dict[str, Any] | None,
+    action_result: dict[str, Any] | None,
+    command_id: str,
+) -> bool:
+    if not action_result:
+        return False
+    if str(action_result.get("id") or "") != command_id:
+        return False
+    if action_result.get("handled") is not True:
+        return False
+    if action_result.get("accepted") is not True:
+        return False
+    if not state_protocol_available(state):
+        return False
+    if not state_is_fresh(state):
+        return False
+    return True
 
 
 def wait_for_action_result(
@@ -404,7 +450,7 @@ def send_workspace_action(
         previous_updated_ms,
         wait_ms,
     )
-    confirmed = bool(action_result and action_result.get("accepted") is not False)
+    confirmed = action_result_confirmed(latest_state, action_result, command["id"])
 
     return response(
         {
@@ -412,12 +458,13 @@ def send_workspace_action(
             "persona": safe_name(persona),
             "sent": True,
             "confirmed": confirmed,
+            "control_ready": state_protocol_available(latest_state) and state_is_fresh(latest_state),
             "action_result": action_result,
             "state": latest_state,
             "message": (
                 "Action was accepted by the open workspace page. Use the returned state/action_result for your reply."
                 if confirmed
-                else "Action was sent, but the open workspace page did not confirm it. Do not claim the move happened; read workspace state or ask the user to reopen/revise the app."
+                else "CONTROL_NOT_CONFIRMED: The action was not proven to run in the open workspace page. You must not say or imply that you clicked, moved, placed, chose, changed, scored, won, or completed the action. Say briefly that the workspace did not confirm the action, then ask the user to reopen it through MeloMate or revise the app protocol."
             ),
             "command": {
                 "id": command["id"],
@@ -441,19 +488,25 @@ def read_workspace_state(persona: str) -> str:
                 "message": "No workspace app has reported state yet. You cannot see the board or game state. Do not claim any move, coordinate, score, winner, or board position. Ask the user to open the workspace HTML through MeloMate or update the app to publish MeloMateGameState.",
             }
         )
-    updated_ms = state_updated_ms(state)
-    age_ms = None
-    if updated_ms is not None:
-        age_ms = max(0, int(time.time() * 1000) - updated_ms)
+    age_ms = state_age_ms(state)
+    fresh = state_is_fresh(state)
+    protocol_available = state_protocol_available(state)
+    control_ready = protocol_available and fresh
 
     return response(
         {
             "ok": True,
             "persona": safe_name(persona),
-            "available": True,
-            "fresh": age_ms is None or age_ms < 5000,
+            "available": control_ready,
+            "fresh": fresh,
+            "protocol_available": protocol_available,
+            "control_ready": control_ready,
             "age_ms": age_ms,
-            "message": "Use only this reported state for game claims. If it does not include the board or last move, do not invent them.",
+            "message": (
+                "Workspace control is ready. Use only this reported state for game/app claims."
+                if control_ready
+                else "CONTROL_NOT_READY: The workspace page is stale or does not expose MeloMateGameState. Do not claim any move, click, choice, score, winner, or current UI state."
+            ),
             "state": state,
         }
     )

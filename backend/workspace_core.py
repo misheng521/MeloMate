@@ -16,6 +16,7 @@ WORKSPACE_ROOT = ROOT / "workspace"
 MAX_FILE_BYTES = 1024 * 1024
 MAX_PROJECT_FILES = 20
 FRESH_STATE_MS = 5000
+MAX_CONTROL_LINES = 200
 
 
 def safe_name(value: str, fallback: str = "default") -> str:
@@ -269,10 +270,13 @@ def send_workspace_key(
     clean_code = str(code or "").strip()
     safe_duration = max(20, min(int(duration_ms or 80), 2000))
     safe_repeat = max(1, min(int(repeat or 1), 20))
+    current_state = read_workspace_state_file(persona)
+    page_id = state_page_id(current_state)
     now = datetime.now().astimezone()
     command = {
         "id": uuid4().hex,
         "type": "key",
+        "page_id": page_id,
         "key": clean_key,
         "code": clean_code,
         "duration_ms": safe_duration,
@@ -281,11 +285,7 @@ def send_workspace_key(
         "created_at": now.isoformat(timespec="milliseconds"),
     }
 
-    control_dir = ensure_inside(persona_root(persona), persona_root(persona) / ".control")
-    control_dir.mkdir(parents=True, exist_ok=True)
-    target = ensure_inside(persona_root(persona), control_dir / "commands.jsonl")
-    with target.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(command, ensure_ascii=False) + "\n")
+    append_workspace_command(persona, command)
 
     return response(
         {
@@ -297,6 +297,7 @@ def send_workspace_key(
             "command": {
                 "id": command["id"],
                 "type": command["type"],
+                "page_id": command["page_id"],
                 "key": command["key"],
                 "code": command["code"],
                 "duration_ms": command["duration_ms"],
@@ -314,8 +315,9 @@ def workspace_control_dir(persona: str) -> Path:
 
 def append_workspace_command(persona: str, command: dict[str, Any]) -> None:
     target = ensure_inside(persona_root(persona), workspace_control_dir(persona) / "commands.jsonl")
-    with target.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(command, ensure_ascii=False) + "\n")
+    lines = target.read_text(encoding="utf-8").splitlines() if target.is_file() else []
+    lines = [*lines[-MAX_CONTROL_LINES + 1 :], json.dumps(command, ensure_ascii=False)]
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def read_workspace_state_file(persona: str) -> dict[str, Any] | None:
@@ -352,6 +354,11 @@ def state_payload(state: dict[str, Any] | None) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def state_page_id(state: dict[str, Any] | None) -> str:
+    page = state_payload(state).get("page")
+    return str(page.get("id") or "") if isinstance(page, dict) else ""
+
+
 def state_protocol_available(state: dict[str, Any] | None) -> bool:
     payload = state_payload(state)
     return bool(payload.get("protocolAvailable") and payload.get("appState") is not None)
@@ -383,10 +390,13 @@ def action_result_confirmed(
     state: dict[str, Any] | None,
     action_result: dict[str, Any] | None,
     command_id: str,
+    page_id: str = "",
 ) -> bool:
     if not action_result:
         return False
     if str(action_result.get("id") or "") != command_id:
+        return False
+    if page_id and state_page_id(state) != page_id:
         return False
     if action_result.get("handled") is not True:
         return False
@@ -434,10 +444,12 @@ def send_workspace_action(
 
     previous_state = read_workspace_state_file(persona)
     previous_updated_ms = state_updated_ms(previous_state)
+    page_id = state_page_id(previous_state)
     now = datetime.now().astimezone()
     command = {
         "id": uuid4().hex,
         "type": "action",
+        "page_id": page_id,
         "action": clean_action,
         "payload": payload or {},
         "created_ms": int(now.timestamp() * 1000),
@@ -450,7 +462,7 @@ def send_workspace_action(
         previous_updated_ms,
         wait_ms,
     )
-    confirmed = action_result_confirmed(latest_state, action_result, command["id"])
+    confirmed = action_result_confirmed(latest_state, action_result, command["id"], page_id)
 
     return response(
         {
@@ -469,6 +481,7 @@ def send_workspace_action(
             "command": {
                 "id": command["id"],
                 "type": command["type"],
+                "page_id": command["page_id"],
                 "action": command["action"],
                 "payload": command["payload"],
             },

@@ -280,7 +280,7 @@ class BasicMemoryAgent(AgentInterface):
             "create_workspace_folder",
         }:
             return "好，我开始做，做好后告诉你。"
-        return "好，我先去工作区看看。"
+        return "好，我去工作区看看。"
 
     def _workspace_started_status(
         self, tool_calls: Union[List[ToolCallObject], List[Dict[str, Any]]]

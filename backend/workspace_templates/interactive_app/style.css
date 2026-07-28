@@ -1,0 +1,25 @@
+body {
+  margin: 0;
+  font-family: "Microsoft YaHei", system-ui, sans-serif;
+  background: #f7f4ef;
+  color: #272225;
+}
+
+main {
+  display: grid;
+  min-height: 100vh;
+  align-content: center;
+  justify-items: center;
+  gap: 14px;
+}
+
+button {
+  min-width: 120px;
+  border: 1px solid #c9bfc4;
+  border-radius: 8px;
+  padding: 10px 14px;
+  background: white;
+  color: #272225;
+  font-weight: 700;
+}
+

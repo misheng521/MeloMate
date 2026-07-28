@@ -15,6 +15,9 @@ from .mcp_client import MCPClient
 from .tool_manager import ToolManager
 
 
+CONTROL_TOOL_NAMES = {"send_workspace_action", "send_workspace_key"}
+
+
 class ToolExecutor:
     def __init__(
         self,
@@ -125,6 +128,29 @@ class ToolExecutor:
                 "is_error": is_error,
             }
         return None
+
+    def harden_workspace_control_result(
+        self, tool_name: str, is_error: bool, text_content: str
+    ) -> tuple[bool, str]:
+        if tool_name not in CONTROL_TOOL_NAMES or not text_content:
+            return is_error, text_content
+        try:
+            payload = json.loads(text_content)
+        except json.JSONDecodeError:
+            return True, (
+                f"CONTROL_RESULT_INVALID: {tool_name} did not return valid JSON. "
+                "Do not claim any workspace action happened."
+            )
+        if payload.get("confirmed") is True:
+            return is_error, text_content
+        payload["ok"] = False
+        payload["confirmed"] = False
+        payload["assistant_response_contract"] = (
+            "The workspace action is not confirmed. The next spoken reply must not "
+            "claim the character clicked, moved, placed, chose, changed, scored, "
+            "won, or completed the action. Say the workspace did not confirm it."
+        )
+        return True, json.dumps(payload, ensure_ascii=False)
 
     def process_tool_from_prompt_json(
         self, data: List[Dict[str, Any]]
@@ -272,6 +298,13 @@ class ToolExecutor:
                         )  # Use blocks or empty string
                     elif caller_mode in ["OpenAI", "Prompt"]:
                         llm_formatted_content = status_content
+
+            is_error, llm_formatted_content = self.harden_workspace_control_result(
+                tool_name, is_error, str(llm_formatted_content)
+            )
+            if llm_formatted_content != text_content:
+                text_content = str(llm_formatted_content)
+                status_content = text_content
 
             # Prepare and yield tool call status update
             status_update = {

@@ -78,6 +78,7 @@ type WorkspaceEvent = {
   id: string;
   type: "workspace-state-changed" | "workspace-page-closed";
   created_ms: number;
+  persona?: string;
   page?: { id?: string; title?: string; path?: string; closed?: boolean };
   appState?: unknown;
   lastAction?: { id?: string; action?: string; accepted?: boolean } | null;
@@ -252,6 +253,7 @@ let workspaceEntriesCache = new Map<string, WorkspaceEntry[]>();
 let workspaceControlStatus: WorkspaceControlStatus = { label: "未连接", tone: "missing" };
 let workspaceEventTimer = 0;
 let lastWorkspaceEventMs = Date.now();
+let workspaceBroadcastChannel: BroadcastChannel | null = null;
 const handledWorkspaceEventIds = new Set<string>();
 let lastAppliedCharacterConfigFile = "";
 let currentAssistantName = "小可";
@@ -1648,7 +1650,8 @@ function workspaceEventPrompt(event: WorkspaceEvent) {
   return [
     `工作区事件：「${pageName}」发生了新变化。`,
     "你正在观察这个固定页面实例。请像现实中同桌互动一样自然回应。",
-    "如果这是游戏/棋局且轮到你，请先用 read_workspace_state 确认状态，再用 send_workspace_action 行动；没确认不要声称已行动。",
+    "如果这是游戏/棋局，且状态显示轮到你、currentTurn 是你、或 availableActions 非空，不要等待用户提问：立刻先用 read_workspace_state 确认状态，再用 send_workspace_action 下下一步，确认成功后再说话。",
+    "如果还没轮到你，只简短回应你看到了变化。没确认行动成功时不要声称已行动。",
     `最新状态：${stateText.slice(0, 1800)}`,
   ].join("\n");
 }
@@ -1670,23 +1673,30 @@ function shouldForwardWorkspaceEvent(event: WorkspaceEvent) {
   return true;
 }
 
+function forwardWorkspaceEvent(event: WorkspaceEvent) {
+  if (!isWsReady || !shouldForwardWorkspaceEvent(event)) return;
+  handledWorkspaceEventIds.add(event.id);
+  if (handledWorkspaceEventIds.size > 200) handledWorkspaceEventIds.clear();
+  markConversationActivity();
+  setThinking(true);
+  sendWs({
+    type: "text-input",
+    text: workspaceEventPrompt(event),
+    metadata: {
+      workspace_event: true,
+      skip_memory: true,
+      skip_history: true,
+    },
+  });
+}
+
 async function pollWorkspaceEvents() {
   if (!isWsReady) return;
   try {
     const events = await readWorkspaceEvents();
     for (const event of events.slice(-4)) {
       lastWorkspaceEventMs = Math.max(lastWorkspaceEventMs, Number(event.created_ms || 0));
-      if (!shouldForwardWorkspaceEvent(event)) continue;
-      handledWorkspaceEventIds.add(event.id);
-      if (handledWorkspaceEventIds.size > 200) handledWorkspaceEventIds.clear();
-      sendWs({
-        type: "text-input",
-        text: workspaceEventPrompt(event),
-        metadata: {
-          workspace_event: true,
-          skip_history: true,
-        },
-      });
+      forwardWorkspaceEvent(event);
     }
   } catch (error) {
     console.warn("Workspace event poll failed.", error);
@@ -1695,6 +1705,17 @@ async function pollWorkspaceEvents() {
 
 function startWorkspaceEventLoop() {
   if (workspaceEventTimer) return;
+  if (!workspaceBroadcastChannel && "BroadcastChannel" in window) {
+    workspaceBroadcastChannel = new BroadcastChannel("melomate-workspace");
+    workspaceBroadcastChannel.onmessage = (event) => {
+      const workspaceEvent = event.data as WorkspaceEvent;
+      if (workspaceEvent?.persona && workspaceEvent.persona !== workspacePersonaName()) return;
+      if (workspaceEvent?.created_ms) {
+        lastWorkspaceEventMs = Math.max(lastWorkspaceEventMs, Number(workspaceEvent.created_ms || 0));
+      }
+      forwardWorkspaceEvent(workspaceEvent);
+    };
+  }
   void pollWorkspaceEvents();
   workspaceEventTimer = window.setInterval(() => {
     void pollWorkspaceEvents();
@@ -1705,6 +1726,8 @@ function stopWorkspaceEventLoop() {
   if (!workspaceEventTimer) return;
   window.clearInterval(workspaceEventTimer);
   workspaceEventTimer = 0;
+  workspaceBroadcastChannel?.close();
+  workspaceBroadcastChannel = null;
 }
 
 function markConversationActivity() {

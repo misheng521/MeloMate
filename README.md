@@ -98,6 +98,7 @@ npm run check
 - `WebSDK` - Live2D Cubism Web SDK integration used by the frontend.
 - `public` - Browser-side runtime libraries and WASM files.
 - `backend/src/open_llm_vtuber` - Python backend modules for WebSocket, conversation, ASR, TTS, memory, tools, and configuration.
+- `docs/WORKSPACE_PROTOCOL.md` - Protocol for interactive workspace apps that both the user and MeloMate can control.
 - `backend/prompts` - Prompt fragments used by the backend.
 - `backend/conf.yaml` - Main backend configuration.
 - `characters/profiles` - Character YAML profiles.

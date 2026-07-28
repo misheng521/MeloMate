@@ -204,6 +204,16 @@ function writeWorkspaceState(persona, state) {
   return true;
 }
 
+function readWorkspaceState(persona) {
+  const target = workspaceStatePath(persona);
+  if (!target || !existsSync(target) || !statSync(target).isFile()) return null;
+  try {
+    return JSON.parse(readFileSync(target, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
 function readRequestBody(request) {
   return new Promise((resolveBody, rejectBody) => {
     let body = "";
@@ -273,39 +283,51 @@ function workspaceControlScript(persona) {
     }
   }
 
+  function applyActionResult(detail, nextResult) {
+    if (nextResult === undefined) return;
+    detail.result = nextResult;
+    if (nextResult === false) detail.accepted = false;
+    if (nextResult && typeof nextResult === "object") {
+      if (nextResult.accepted === false) detail.accepted = false;
+      if (nextResult.handled === true) detail.handled = true;
+      if (Object.prototype.hasOwnProperty.call(nextResult, "result")) detail.result = nextResult.result;
+      if (nextResult.error) detail.error = String(nextResult.error);
+    }
+  }
+
   async function runAction(command) {
     const detail = {
       action: command.action,
       payload: command.payload || {},
-      id: command.id
+      id: command.id,
+      handled: false,
+      accepted: true,
+      result: null,
+      error: ""
     };
-    let handled = false;
-    let accepted = true;
-    let result = null;
-    let error = "";
     if (typeof window.MeloMateGameAction === "function") {
-      handled = true;
+      detail.handled = true;
       try {
-        result = await window.MeloMateGameAction(detail.action, detail.payload, detail);
-        if (result === false) accepted = false;
-        if (result && typeof result === "object" && result.accepted === false) accepted = false;
+        applyActionResult(detail, await window.MeloMateGameAction(detail.action, detail.payload, detail));
       } catch (exception) {
-        accepted = false;
-        error = exception && exception.message ? exception.message : String(exception);
+        detail.accepted = false;
+        detail.error = exception && exception.message ? exception.message : String(exception);
       }
     }
-    const event = new CustomEvent("melomate-action", { detail, bubbles: true, cancelable: true });
-    window.dispatchEvent(event);
-    document.dispatchEvent(new CustomEvent("melomate-action", { detail, bubbles: true, cancelable: true }));
-    if (event.defaultPrevented) handled = true;
+    const windowEvent = new CustomEvent("melomate-action", { detail, bubbles: true, cancelable: true });
+    window.dispatchEvent(windowEvent);
+    if (windowEvent.defaultPrevented) detail.handled = true;
+    const documentEvent = new CustomEvent("melomate-action", { detail, bubbles: true, cancelable: true });
+    document.dispatchEvent(documentEvent);
+    if (documentEvent.defaultPrevented) detail.handled = true;
     const actionResult = {
       id: detail.id,
       action: detail.action,
       payload: detail.payload,
-      handled,
-      accepted: handled && accepted,
-      result: safeJson(result),
-      error,
+      handled: detail.handled === true,
+      accepted: detail.handled === true && detail.accepted !== false,
+      result: safeJson(detail.result),
+      error: detail.error,
       at_ms: Date.now()
     };
     actions.push(actionResult);
@@ -466,6 +488,12 @@ function handleContentApiRequest(request, response) {
       ok: true,
       commands: readWorkspaceCommands(url.searchParams.get("persona") || "", since),
     });
+    return true;
+  }
+
+  if (pathname === "/api/workspace-state") {
+    const state = readWorkspaceState(url.searchParams.get("persona") || "");
+    jsonResponse(response, 200, { ok: true, state });
     return true;
   }
 

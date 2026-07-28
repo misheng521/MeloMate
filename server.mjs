@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { basename, dirname, extname, join, normalize, relative, resolve, sep } from "node:path";
 
@@ -15,6 +16,11 @@ const workspaceRoot = resolve(appRoot, "workspace");
 const preferredPort = Number(process.env.PORT || 5178);
 const voicemeeterPath = "C:\\Program Files (x86)\\VB\\Voicemeeter\\voicemeeterpro.exe";
 const voicemeeterProcessName = "voicemeeterpro";
+const workspaceEventLimit = 200;
+
+function newWorkspacePageId() {
+  return `${Date.now()}${String(Math.floor(Math.random() * 1_000_000)).padStart(6, "0")}`;
+}
 
 if (!existsSync(join(root, "index.html"))) {
   console.error("[ERROR] dist/index.html was not found.");
@@ -186,9 +192,65 @@ function workspaceStatePath(persona) {
   return safeResolve(controlDir, "state.json");
 }
 
+function workspaceEventsPath(persona) {
+  const safePersona = safeName(persona);
+  if (!safePersona) return null;
+  const personaRoot = resolve(workspaceRoot, safePersona);
+  const controlDir = safeResolve(workspaceRoot, `${safePersona}/.control`);
+  if (!controlDir || !isInside(personaRoot, controlDir)) return null;
+  mkdirSync(controlDir, { recursive: true });
+  return safeResolve(controlDir, "events.jsonl");
+}
+
+function stableEventState(state) {
+  if (state?.closed) return JSON.stringify({ pageId: state.page?.id || "", closed: true });
+  if (!state?.protocolAvailable) return "";
+  return JSON.stringify({
+    pageId: state.page?.id || "",
+    path: state.page?.path || "",
+    appState: state.appState,
+    lastAction: state.lastAction || null,
+  });
+}
+
+function appendWorkspaceEvent(persona, previous, nextState) {
+  const nextEventState = stableEventState(nextState);
+  if (!nextEventState || stableEventState(previous?.state) === nextEventState) return;
+
+  const target = workspaceEventsPath(persona);
+  if (!target) return;
+  const lines = existsSync(target) ? readFileSync(target, "utf8").split(/\r?\n/).filter(Boolean) : [];
+  const previousActionId = previous?.state?.lastAction?.id || "";
+  const nextActionId = nextState.lastAction?.id || "";
+  const event = {
+    id: randomUUID(),
+    type: nextState.closed ? "workspace-page-closed" : "workspace-state-changed",
+    created_ms: Date.now(),
+    persona: safeName(persona),
+    page: nextState.page,
+    appState: nextState.appState,
+    lastAction: nextState.lastAction || null,
+    actionEvent: Boolean(nextActionId && nextActionId !== previousActionId),
+    summary: nextState.closed
+      ? "Workspace page was closed."
+      : previous
+        ? "Workspace page state changed."
+        : "Workspace page was opened.",
+  };
+  writeFileSync(target, [...lines.slice(-workspaceEventLimit + 1), JSON.stringify(event)].join("\n") + "\n", "utf8");
+}
+
 function writeWorkspaceState(persona, state) {
   const target = workspaceStatePath(persona);
   if (!target) return false;
+  const previous = readWorkspaceState(persona);
+  appendWorkspaceEvent(persona, previous, state);
+  if (state?.closed) {
+    if (existsSync(target) && previous?.state?.page?.id === state.page?.id) {
+      unlinkSync(target);
+    }
+    return true;
+  }
   writeFileSync(
     target,
     JSON.stringify(
@@ -214,6 +276,24 @@ function readWorkspaceState(persona) {
   }
 }
 
+function readWorkspaceEvents(persona, sinceMs) {
+  const target = workspaceEventsPath(persona);
+  if (!target || !existsSync(target) || !statSync(target).isFile()) return [];
+  const minCreatedMs = Number.isFinite(sinceMs) ? sinceMs : 0;
+  return readFileSync(target, "utf8")
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .slice(-workspaceEventLimit)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter((event) => event && Number(event.created_ms || 0) > minCreatedMs);
+}
+
 function readRequestBody(request) {
   return new Promise((resolveBody, rejectBody) => {
     let body = "";
@@ -230,10 +310,12 @@ function readRequestBody(request) {
   });
 }
 
-function workspaceControlScript(persona) {
+function workspaceControlScript(persona, pageId) {
   return `<script>
 (() => {
   const persona = ${JSON.stringify(persona)};
+  const pageId = ${JSON.stringify(pageId)};
+  const openedAtMs = Date.now();
   let since = Date.now();
   const seen = new Set();
   let lastStateJson = "";
@@ -300,6 +382,7 @@ function workspaceControlScript(persona) {
       action: command.action,
       payload: command.payload || {},
       id: command.id,
+      pageId,
       handled: false,
       accepted: true,
       result: null,
@@ -352,9 +435,11 @@ function workspaceControlScript(persona) {
       lastAction: actions.length ? actions[actions.length - 1] : null,
       actions,
       page: {
+        id: pageId,
         title: document.title,
         path: location.pathname,
-        href: location.href
+        href: location.href,
+        opened_at_ms: openedAtMs
       },
       reported_ms: Date.now()
     };
@@ -368,6 +453,29 @@ function workspaceControlScript(persona) {
     });
   }
 
+  function publishClosed() {
+    const report = {
+      protocolAvailable: false,
+      appState: null,
+      lastAction: actions.length ? actions[actions.length - 1] : null,
+      actions,
+      page: {
+        id: pageId,
+        title: document.title,
+        path: location.pathname,
+        href: location.href,
+        opened_at_ms: openedAtMs,
+        closed: true
+      },
+      closed: true,
+      reported_ms: Date.now()
+    };
+    navigator.sendBeacon(
+      "/api/workspace-state",
+      new Blob([JSON.stringify({ persona, state: report })], { type: "application/json" })
+    );
+  }
+
   async function poll() {
     try {
       const params = new URLSearchParams({ persona, since: String(since) });
@@ -376,6 +484,7 @@ function workspaceControlScript(persona) {
       const payload = await response.json();
       for (const command of payload.commands || []) {
         if (!command || seen.has(command.id)) continue;
+        if (command.page_id && command.page_id !== pageId) continue;
         seen.add(command.id);
         since = Math.max(since, Number(command.created_ms || since));
         if (command.type === "key") runCommand(command);
@@ -388,6 +497,7 @@ function workspaceControlScript(persona) {
   }
 
   window.MeloMateWorkspaceControl = {
+    pageId,
     runCommand,
     runAction,
     setState: publishState,
@@ -395,6 +505,8 @@ function workspaceControlScript(persona) {
   };
   window.setInterval(poll, 180);
   window.setInterval(() => publishState(currentState(), true), 1000);
+  window.addEventListener("pagehide", publishClosed);
+  window.addEventListener("beforeunload", publishClosed);
   publishState(currentState(), true);
 })();
 </script>`;
@@ -403,7 +515,7 @@ function workspaceControlScript(persona) {
 function sendWorkspaceHtml(filePath, response) {
   const persona = workspacePersonaFromFile(filePath);
   const html = readFileSync(filePath, "utf8");
-  const script = workspaceControlScript(persona);
+  const script = workspaceControlScript(persona, newWorkspacePageId());
   const bodyClose = /<\/body\s*>/i;
   const content = bodyClose.test(html) ? html.replace(bodyClose, `${script}</body>`) : `${html}\n${script}`;
   response.writeHead(200, {
@@ -494,6 +606,15 @@ function handleContentApiRequest(request, response) {
   if (pathname === "/api/workspace-state") {
     const state = readWorkspaceState(url.searchParams.get("persona") || "");
     jsonResponse(response, 200, { ok: true, state });
+    return true;
+  }
+
+  if (pathname === "/api/workspace-events") {
+    const since = Number(url.searchParams.get("since") || 0);
+    jsonResponse(response, 200, {
+      ok: true,
+      events: readWorkspaceEvents(url.searchParams.get("persona") || "", since),
+    });
     return true;
   }
 

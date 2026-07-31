@@ -50,6 +50,7 @@ type WsMessage = {
   text?: string;
   texts?: string[];
   input_id?: string;
+  turn_id?: string;
   message?: string;
   audio?: string | null;
   volumes?: number[];
@@ -250,6 +251,8 @@ let isUserSpeaking = false;
 let isUserInputPriorityActive = false;
 let isUserVoiceTurnSubmitted = false;
 let hasSentInterruptForCurrentUserInput = false;
+let pendingUserTurnId = "";
+let activeAssistantTurnId = "";
 let referenceAudioBlob: Blob | null = null;
 let referenceAudioStoredName = "";
 let referenceAudioObjectUrl = "";
@@ -2060,23 +2063,49 @@ function connectWebSocket() {
   };
 }
 
-function handleControlMessage(text: string) {
+function handleControlMessage(text: string, turnId?: string) {
   if (text === "conversation-chain-start") {
+    if (!acceptAssistantTurn(turnId)) return;
     lastAssistantText = "";
     heardAssistantText = "";
     isAssistantResponding = true;
+    isUserInputPriorityActive = false;
+    isUserVoiceTurnSubmitted = false;
     setThinking(true);
     return;
   }
 
   if (text === "conversation-chain-end") {
-    if (shouldSuppressAssistantOutput()) return;
+    if (!shouldAcceptAssistantOutput({ turn_id: turnId })) return;
     void finishBackendAudio();
+    if (turnId && turnId === pendingUserTurnId) {
+      pendingUserTurnId = "";
+    }
   }
 }
 
-function shouldSuppressAssistantOutput() {
-  return isUserInputPriorityActive;
+function acceptAssistantTurn(turnId?: string) {
+  if (pendingUserTurnId) {
+    if (!turnId || turnId !== pendingUserTurnId) return false;
+    activeAssistantTurnId = turnId;
+    return true;
+  }
+
+  if (turnId) {
+    activeAssistantTurnId = turnId;
+    return true;
+  }
+  return !activeAssistantTurnId;
+}
+
+function shouldAcceptAssistantOutput(message: Pick<WsMessage, "turn_id">) {
+  if (pendingUserTurnId) {
+    return Boolean(message.turn_id && message.turn_id === pendingUserTurnId);
+  }
+  if (activeAssistantTurnId) {
+    return message.turn_id === activeAssistantTurnId;
+  }
+  return !isUserInputPriorityActive;
 }
 
 function releaseUserInputPriorityAfterUserTextDisplayed() {
@@ -2091,16 +2120,17 @@ function cancelUserInputPriority() {
   isUserInputPriorityActive = false;
   isUserVoiceTurnSubmitted = false;
   hasSentInterruptForCurrentUserInput = false;
+  pendingUserTurnId = "";
 }
 
 function handleWsMessage(message: WsMessage) {
   if (message.type === "control" && message.text) {
-    handleControlMessage(message.text);
+    handleControlMessage(message.text, message.turn_id);
     return;
   }
 
   if (message.type === "full-text") {
-    if (shouldSuppressAssistantOutput()) return;
+    if (!shouldAcceptAssistantOutput(message)) return;
     if (message.text && !["Connection established", "Thinking...", "AI wants to speak something..."].includes(message.text)) {
       subtitle.textContent = sanitizeAssistantReply(message.text) || message.text;
     }
@@ -2128,13 +2158,13 @@ function handleWsMessage(message: WsMessage) {
   }
 
   if (message.type === "audio") {
-    if (shouldSuppressAssistantOutput()) return;
+    if (!shouldAcceptAssistantOutput(message)) return;
     queueAudioMessage(message);
     return;
   }
 
   if (message.type === "backend-synth-complete") {
-    if (shouldSuppressAssistantOutput()) return;
+    if (!shouldAcceptAssistantOutput(message)) return;
     backendSynthComplete = true;
     void finishBackendAudio();
     return;
@@ -2179,12 +2209,13 @@ function handleWsMessage(message: WsMessage) {
 }
 
 function queueAudioMessage(message: WsMessage) {
-  if (shouldSuppressAssistantOutput()) return;
+  if (!shouldAcceptAssistantOutput(message)) return;
 
   const text = message.display_text?.text || "";
   const queueVersion = audioQueueVersion;
+  const turnId = message.turn_id;
   audioQueue = audioQueue.then(async () => {
-    if (queueVersion !== audioQueueVersion || shouldSuppressAssistantOutput()) return;
+    if (queueVersion !== audioQueueVersion || !shouldAcceptAssistantOutput({ turn_id: turnId })) return;
 
     if (text) {
       appendAssistantLine(text, message.display_text?.name);
@@ -2198,13 +2229,13 @@ function queueAudioMessage(message: WsMessage) {
     }
 
     if (message.audio) {
-      await playBackendAudio(message.audio, queueVersion);
+      await playBackendAudio(message.audio, queueVersion, turnId);
     }
   });
 }
 
-async function playBackendAudio(audioBase64: string, queueVersion: number) {
-  if (queueVersion !== audioQueueVersion || shouldSuppressAssistantOutput()) return;
+async function playBackendAudio(audioBase64: string, queueVersion: number, turnId?: string) {
+  if (queueVersion !== audioQueueVersion || !shouldAcceptAssistantOutput({ turn_id: turnId })) return;
 
   responseAudio.pause();
   voiceChatAudio.pause();
@@ -2213,11 +2244,11 @@ async function playBackendAudio(audioBase64: string, queueVersion: number) {
   const audioSource = `data:audio/wav;base64,${audioBase64}`;
   responseAudio.src = audioSource;
   await applyAudioOutput();
-  if (queueVersion !== audioQueueVersion || shouldSuppressAssistantOutput()) return;
+  if (queueVersion !== audioQueueVersion || !shouldAcceptAssistantOutput({ turn_id: turnId })) return;
 
   const playbackTasks = [playAudioElement(responseAudio)];
   const canUseVoiceChatOutput = await applyVoiceChatAudioOutput();
-  if (queueVersion !== audioQueueVersion || shouldSuppressAssistantOutput()) return;
+  if (queueVersion !== audioQueueVersion || !shouldAcceptAssistantOutput({ turn_id: turnId })) return;
 
   if (canUseVoiceChatOutput) {
     voiceChatAudio.src = audioSource;
@@ -2439,6 +2470,8 @@ function beginUserVoiceInput() {
   isUserInputPriorityActive = true;
   isUserVoiceTurnSubmitted = false;
   hasSentInterruptForCurrentUserInput = false;
+  pendingUserTurnId = nextUserVoiceInputId();
+  activeAssistantTurnId = "";
   stopAssistantReplyForUserInput(true);
   setPendingUserLine(listeningDisplayText);
   ensurePendingUserInputId();
@@ -2497,11 +2530,13 @@ async function sendAudioPartition(audio: Float32Array) {
   }
 
   const inputId = markUserVoiceAwaitingTranscription();
+  const turnId = pendingUserTurnId;
   endUserVoiceInput();
   isUserVoiceTurnSubmitted = true;
   sendWs({
     type: "mic-audio-end",
     input_id: inputId,
+    turn_id: turnId,
     images: await screenImagesForNextTurn(),
     screen_vision: screenVisionConfigPayload(),
   });

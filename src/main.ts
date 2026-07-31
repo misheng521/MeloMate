@@ -236,6 +236,7 @@ let pendingUserLine: HTMLParagraphElement | null = null;
 let pendingUserTranscriptionLines: HTMLParagraphElement[] = [];
 let userVoiceInputSequence = 0;
 const displayedUserInputIds = new Set<string>();
+const recentDisplayedUserTranscriptions = new Map<string, number>();
 let lastAssistantLine: HTMLParagraphElement | null = null;
 let outputVolume = 1;
 let savedSettings: SavedSettings | null = null;
@@ -283,6 +284,7 @@ const responseAudio = new Audio() as SinkAudioElement;
 const voiceChatAudio = new Audio() as SinkAudioElement;
 const listeningDisplayText = "正在听";
 const recognizingDisplayText = "正在识别...";
+const duplicateUserTranscriptionWindowMs = 8000;
 
 function roleLabel(role: LineRole) {
   if (role === "user") return "用户";
@@ -1104,6 +1106,15 @@ function takePendingUserLine(inputId?: string) {
   return pendingUserTranscriptionLines.shift() || pendingUserLine;
 }
 
+function discardPendingUserLine(inputId?: string) {
+  const line = takePendingUserLine(inputId);
+  if (!line) return;
+  line.remove();
+  if (line === pendingUserLine) {
+    pendingUserLine = null;
+  }
+}
+
 function rememberDisplayedUserInput(inputId?: string) {
   if (!inputId) return;
   displayedUserInputIds.add(inputId);
@@ -1113,11 +1124,48 @@ function rememberDisplayedUserInput(inputId?: string) {
   }
 }
 
+function pruneRecentDisplayedUserTranscriptions(now = Date.now()) {
+  recentDisplayedUserTranscriptions.forEach((displayedAt, text) => {
+    if (now - displayedAt > duplicateUserTranscriptionWindowMs) {
+      recentDisplayedUserTranscriptions.delete(text);
+    }
+  });
+}
+
+function wasUserTranscriptionRecentlyDisplayed(normalizedText: string) {
+  if (!normalizedText) return false;
+  const now = Date.now();
+  pruneRecentDisplayedUserTranscriptions(now);
+  const displayedAt = recentDisplayedUserTranscriptions.get(normalizedText);
+  return Boolean(displayedAt && now - displayedAt <= duplicateUserTranscriptionWindowMs);
+}
+
+function rememberDisplayedUserTranscription(normalizedText: string) {
+  if (!normalizedText) return;
+  pruneRecentDisplayedUserTranscriptions();
+  recentDisplayedUserTranscriptions.set(normalizedText, Date.now());
+  if (recentDisplayedUserTranscriptions.size > 200) {
+    const oldestText = recentDisplayedUserTranscriptions.keys().next().value as string | undefined;
+    if (oldestText) recentDisplayedUserTranscriptions.delete(oldestText);
+  }
+}
+
 function finalizePendingUserLine(text: string, inputId?: string) {
   markConversationActivity();
-  if (inputId && displayedUserInputIds.has(inputId)) return false;
+  if (inputId && displayedUserInputIds.has(inputId)) {
+    discardPendingUserLine(inputId);
+    return false;
+  }
 
   const normalizedText = normalizeUserDisplayText(text);
+  if (wasUserTranscriptionRecentlyDisplayed(normalizedText)) {
+    if (inputId) {
+      discardPendingUserLine(inputId);
+    }
+    rememberDisplayedUserInput(inputId);
+    return false;
+  }
+
   const line = takePendingUserLine(inputId);
   if (line) {
     line.dataset.rawText = text;
@@ -1127,6 +1175,7 @@ function finalizePendingUserLine(text: string, inputId?: string) {
       pendingUserLine = null;
     }
     rememberDisplayedUserInput(inputId || line.dataset.inputId);
+    rememberDisplayedUserTranscription(normalizedText);
     keepActiveUserInputLinesAtBottom();
     transcriptLog.scrollTop = transcriptLog.scrollHeight;
     return true;
@@ -1142,6 +1191,7 @@ function finalizePendingUserLine(text: string, inputId?: string) {
     appendedLine.dataset.inputId = inputId;
   }
   rememberDisplayedUserInput(inputId);
+  rememberDisplayedUserTranscription(normalizedText);
   return true;
 }
 

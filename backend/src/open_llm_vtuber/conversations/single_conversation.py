@@ -231,7 +231,7 @@ async def process_queued_user_inputs(
                 item,
                 asr_engine,
                 websocket_send,
-                announce_transcription=False,
+                announce_transcription=True,
             )
         ).strip()
         if text:
@@ -240,24 +240,8 @@ async def process_queued_user_inputs(
     if not parts:
         return ""
     if len(parts) == 1:
-        await websocket_send(
-            json.dumps(
-                {"type": "user-input-transcription", "text": parts[0]},
-                ensure_ascii=False,
-            )
-        )
         return parts[0]
 
-    await websocket_send(
-        json.dumps(
-            {
-                "type": "user-input-merged",
-                "texts": parts,
-                "text": "\n".join(parts),
-            },
-            ensure_ascii=False,
-        )
-    )
     joined = "\n".join(f"{index + 1}. {part}" for index, part in enumerate(parts))
     return (
         "The user sent several messages before you replied. "

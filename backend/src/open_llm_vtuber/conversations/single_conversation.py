@@ -31,6 +31,8 @@ async def process_single_conversation(
     user_input: Union[str, np.ndarray, List[Union[str, np.ndarray]]],
     input_ids: Optional[List[Optional[str]]] = None,
     queued_items: Optional[List[Dict[str, Any]]] = None,
+    transcription_cache: Optional[Dict[str, str]] = None,
+    announced_transcription_ids: Optional[set[str]] = None,
     images: Optional[List[Dict[str, Any]]] = None,
     screen_vision: Optional[Dict[str, Any]] = None,
     session_emoji: str = np.random.choice(EMOJI_LIST),
@@ -70,6 +72,8 @@ async def process_single_conversation(
             websocket_send,
             input_ids=input_ids,
             queued_items=queued_items,
+            transcription_cache=transcription_cache,
+            announced_transcription_ids=announced_transcription_ids,
         )
         augmented_input_text = await augment_text_with_screen_context(
             input_text, images, screen_vision
@@ -228,6 +232,8 @@ async def process_queued_user_inputs(
     websocket_send: WebSocketSend,
     input_ids: Optional[List[Optional[str]]] = None,
     queued_items: Optional[List[Dict[str, Any]]] = None,
+    transcription_cache: Optional[Dict[str, str]] = None,
+    announced_transcription_ids: Optional[set[str]] = None,
 ) -> str:
     if not isinstance(user_input, list):
         return await process_queued_user_input_item(
@@ -236,6 +242,8 @@ async def process_queued_user_inputs(
             websocket_send=websocket_send,
             input_id=input_ids[0] if input_ids else None,
             queued_item=queued_items[0] if queued_items else None,
+            transcription_cache=transcription_cache,
+            announced_transcription_ids=announced_transcription_ids,
         )
 
     parts: List[str] = []
@@ -247,6 +255,8 @@ async def process_queued_user_inputs(
                 websocket_send=websocket_send,
                 input_id=input_ids[index] if input_ids and index < len(input_ids) else None,
                 queued_item=queued_items[index] if queued_items and index < len(queued_items) else None,
+                transcription_cache=transcription_cache,
+                announced_transcription_ids=announced_transcription_ids,
             )
         ).strip()
         if text:
@@ -271,13 +281,26 @@ async def process_queued_user_input_item(
     websocket_send: WebSocketSend,
     input_id: Optional[str] = None,
     queued_item: Optional[Dict[str, Any]] = None,
+    transcription_cache: Optional[Dict[str, str]] = None,
+    announced_transcription_ids: Optional[set[str]] = None,
 ) -> str:
     if queued_item and not input_id:
         input_id = queued_item.get("input_id")
+    if not input_id:
+        input_id = audio_input_fingerprint(item)
+        if queued_item is not None:
+            queued_item["input_id"] = input_id
 
     cached_text = queued_item.get("transcription_text") if queued_item else None
-    if isinstance(cached_text, str):
+    if input_id and transcription_cache and input_id in transcription_cache:
+        input_text = transcription_cache[input_id]
+        if queued_item is not None:
+            queued_item["transcription_text"] = input_text
+    elif isinstance(cached_text, str):
         input_text = cached_text
+        if input_id and transcription_cache is not None:
+            transcription_cache[input_id] = input_text
+            trim_transcription_cache(transcription_cache)
     else:
         input_text = await process_user_input(
             item,
@@ -287,10 +310,20 @@ async def process_queued_user_input_item(
         )
         if queued_item is not None:
             queued_item["transcription_text"] = input_text
+        if input_id and transcription_cache is not None:
+            transcription_cache[input_id] = input_text
+            trim_transcription_cache(transcription_cache)
 
-    if isinstance(item, np.ndarray) and not (queued_item or {}).get("transcription_announced"):
+    already_announced = bool(
+        (input_id and announced_transcription_ids and input_id in announced_transcription_ids)
+        or (queued_item or {}).get("transcription_announced")
+    )
+    if isinstance(item, np.ndarray) and not already_announced:
         if queued_item is not None:
             queued_item["transcription_announced"] = True
+        if input_id and announced_transcription_ids is not None:
+            announced_transcription_ids.add(input_id)
+            trim_announced_transcription_ids(announced_transcription_ids)
         await websocket_send(
             json.dumps(
                 {
@@ -303,6 +336,39 @@ async def process_queued_user_input_item(
         )
 
     return input_text
+
+
+def audio_input_fingerprint(item: Union[str, np.ndarray]) -> Optional[str]:
+    if isinstance(item, str):
+        normalized = " ".join(item.strip().split())
+        return f"text:{normalized}" if normalized else None
+    if not isinstance(item, np.ndarray) or item.size == 0:
+        return None
+
+    samples = item.astype(np.float32, copy=False)
+    peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+    duration = int(samples.size)
+    head = samples[: min(128, samples.size)]
+    tail = samples[max(0, samples.size - 128) :]
+    checksum = int((float(np.sum(head)) * 1_000_000) + (float(np.sum(tail)) * 1_000_000))
+    energy = int(float(np.sum(samples * samples)) * 1000)
+    return f"audio:{duration}:{round(peak, 5)}:{energy}:{checksum}"
+
+
+def trim_transcription_cache(transcription_cache: Dict[str, str], limit: int = 200) -> None:
+    while len(transcription_cache) > limit:
+        oldest_key = next(iter(transcription_cache), None)
+        if oldest_key is None:
+            return
+        transcription_cache.pop(oldest_key, None)
+
+
+def trim_announced_transcription_ids(announced_ids: set[str], limit: int = 200) -> None:
+    while len(announced_ids) > limit:
+        oldest_key = next(iter(announced_ids), None)
+        if oldest_key is None:
+            return
+        announced_ids.discard(oldest_key)
 
 
 def is_workspace_tool_status(output_item: Dict[str, Any]) -> bool:

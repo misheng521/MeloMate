@@ -29,6 +29,8 @@ async def handle_conversation_trigger(
     current_conversation_tasks: Dict[str, Optional[asyncio.Task]],
     pending_conversation_inputs: Dict[str, List[Dict[str, Any]]],
     in_flight_conversation_inputs: Dict[str, List[Dict[str, Any]]],
+    transcription_cache: Dict[str, Dict[str, str]],
+    announced_transcription_ids: Dict[str, set[str]],
     reply_started_flags: Dict[str, bool],
     workspace_work_flags: Dict[str, bool],
     workspace_revision_flags: Dict[str, bool],
@@ -195,6 +197,8 @@ async def handle_conversation_trigger(
                 current_conversation_tasks=current_conversation_tasks,
                 pending_conversation_inputs=pending_conversation_inputs,
                 in_flight_conversation_inputs=in_flight_conversation_inputs,
+                transcription_cache=transcription_cache,
+                announced_transcription_ids=announced_transcription_ids,
                 reply_started_flags=reply_started_flags,
                 workspace_work_flags=workspace_work_flags,
                 workspace_revision_flags=workspace_revision_flags,
@@ -296,6 +300,8 @@ async def _drain_single_conversation_queue(
     current_conversation_tasks: Dict[str, Optional[asyncio.Task]],
     pending_conversation_inputs: Dict[str, List[Dict[str, Any]]],
     in_flight_conversation_inputs: Dict[str, List[Dict[str, Any]]],
+    transcription_cache: Dict[str, Dict[str, str]],
+    announced_transcription_ids: Dict[str, set[str]],
     reply_started_flags: Dict[str, bool],
     workspace_work_flags: Dict[str, bool],
     workspace_revision_flags: Dict[str, bool],
@@ -315,16 +321,9 @@ async def _drain_single_conversation_queue(
             if any((item.get("metadata") or {}).get("workspace_revision") for item in batch):
                 workspace_revision_flags[client_uid] = True
 
-            user_inputs = [
-                item["user_input"]
-                for item in batch
-                if _queued_input_has_content(item)
-            ]
-            input_ids = [
-                item.get("input_id")
-                for item in batch
-                if _queued_input_has_content(item)
-            ]
+            content_items = [item for item in batch if _queued_input_has_content(item)]
+            user_inputs = [item["user_input"] for item in content_items]
+            input_ids = [item.get("input_id") for item in content_items]
             if not user_inputs:
                 continue
 
@@ -341,7 +340,9 @@ async def _drain_single_conversation_queue(
                 client_uid=client_uid,
                 user_input=user_inputs if len(user_inputs) > 1 else user_inputs[0],
                 input_ids=input_ids if len(user_inputs) > 1 else input_ids[:1],
-                queued_items=batch,
+                queued_items=content_items,
+                transcription_cache=transcription_cache.setdefault(client_uid, {}),
+                announced_transcription_ids=announced_transcription_ids.setdefault(client_uid, set()),
                 images=latest.get("images"),
                 screen_vision=latest.get("screen_vision"),
                 session_emoji=session_emoji,
@@ -376,6 +377,8 @@ async def _drain_single_conversation_queue(
                     current_conversation_tasks=current_conversation_tasks,
                     pending_conversation_inputs=pending_conversation_inputs,
                     in_flight_conversation_inputs=in_flight_conversation_inputs,
+                    transcription_cache=transcription_cache,
+                    announced_transcription_ids=announced_transcription_ids,
                     reply_started_flags=reply_started_flags,
                     workspace_work_flags=workspace_work_flags,
                     workspace_revision_flags=workspace_revision_flags,

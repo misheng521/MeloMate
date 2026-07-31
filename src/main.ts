@@ -249,6 +249,7 @@ let isAssistantResponding = false;
 let isUserSpeaking = false;
 let isUserInputPriorityActive = false;
 let isUserVoiceTurnSubmitted = false;
+let hasSentInterruptForCurrentUserInput = false;
 let referenceAudioBlob: Blob | null = null;
 let referenceAudioStoredName = "";
 let referenceAudioObjectUrl = "";
@@ -2086,6 +2087,7 @@ function releaseUserInputPriorityAfterUserTextDisplayed() {
 function cancelUserInputPriority() {
   isUserInputPriorityActive = false;
   isUserVoiceTurnSubmitted = false;
+  hasSentInterruptForCurrentUserInput = false;
 }
 
 function handleWsMessage(message: WsMessage) {
@@ -2106,6 +2108,7 @@ function handleWsMessage(message: WsMessage) {
     const displayed = finalizePendingUserLine(message.text, message.input_id);
     if (displayed) {
       subtitle.textContent = message.text;
+      stopAssistantReplyForUserInput();
     }
     releaseUserInputPriorityAfterUserTextDisplayed();
     return;
@@ -2113,7 +2116,10 @@ function handleWsMessage(message: WsMessage) {
 
   if (message.type === "user-input-merged") {
     const displayed = showMergedUserLine(message.texts || [], message.text);
-    if (displayed && message.text) subtitle.textContent = message.text;
+    if (displayed && message.text) {
+      subtitle.textContent = message.text;
+      stopAssistantReplyForUserInput();
+    }
     releaseUserInputPriorityAfterUserTextDisplayed();
     return;
   }
@@ -2204,9 +2210,13 @@ async function playBackendAudio(audioBase64: string, queueVersion: number) {
   const audioSource = `data:audio/wav;base64,${audioBase64}`;
   responseAudio.src = audioSource;
   await applyAudioOutput();
+  if (queueVersion !== audioQueueVersion || shouldSuppressAssistantOutput()) return;
 
   const playbackTasks = [playAudioElement(responseAudio)];
-  if (await applyVoiceChatAudioOutput()) {
+  const canUseVoiceChatOutput = await applyVoiceChatAudioOutput();
+  if (queueVersion !== audioQueueVersion || shouldSuppressAssistantOutput()) return;
+
+  if (canUseVoiceChatOutput) {
     voiceChatAudio.src = audioSource;
     playbackTasks.push(playAudioElement(voiceChatAudio));
   }
@@ -2405,14 +2415,31 @@ function interruptCurrentResponse() {
   });
 }
 
+function stopAssistantReplyForUserInput(notifyBackend = false) {
+  const shouldNotifyBackend =
+    notifyBackend && !hasSentInterruptForCurrentUserInput && (isAssistantResponding || heardAssistantText || lastAssistantText);
+  const interruptedText = heardAssistantText || lastAssistantText || subtitle.textContent || "";
+
+  stopCurrentResponsePlayback(true);
+
+  if (shouldNotifyBackend) {
+    hasSentInterruptForCurrentUserInput = true;
+    sendWs({
+      type: "interrupt-signal",
+      text: interruptedText,
+    });
+  }
+}
+
 function beginUserVoiceInput() {
   isUserSpeaking = true;
   isUserInputPriorityActive = true;
   isUserVoiceTurnSubmitted = false;
+  hasSentInterruptForCurrentUserInput = false;
   setPendingUserLine(listeningDisplayText);
   ensurePendingUserInputId();
   subtitle.textContent = listeningDisplayText;
-  interruptCurrentResponse();
+  stopAssistantReplyForUserInput(true);
   setAssistantStatus("listening");
   markConversationActivity();
   syncProactiveSpeakButton();
@@ -2434,6 +2461,7 @@ function markUserVoiceAwaitingTranscription() {
   pendingUserTranscriptionLines.push(pendingUserLine);
   pendingUserLine = null;
   subtitle.textContent = recognizingDisplayText;
+  stopAssistantReplyForUserInput();
   keepActiveUserInputLinesAtBottom();
   transcriptLog.scrollTop = transcriptLog.scrollHeight;
   return inputId;

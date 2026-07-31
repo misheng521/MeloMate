@@ -1165,10 +1165,7 @@ function finalizePendingUserLine(text: string, inputId?: string) {
   }
 
   const normalizedText = normalizeUserDisplayText(text);
-  if (wasUserTranscriptionRecentlyDisplayed(normalizedText)) {
-    if (inputId) {
-      discardPendingUserLine(inputId);
-    }
+  if (!inputId && wasUserTranscriptionRecentlyDisplayed(normalizedText)) {
     rememberDisplayedUserInput(inputId);
     return false;
   }

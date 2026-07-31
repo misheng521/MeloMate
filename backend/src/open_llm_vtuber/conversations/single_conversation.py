@@ -29,6 +29,7 @@ async def process_single_conversation(
     websocket_send: WebSocketSend,
     client_uid: str,
     user_input: Union[str, np.ndarray],
+    input_ids: Optional[List[Optional[str]]] = None,
     images: Optional[List[Dict[str, Any]]] = None,
     screen_vision: Optional[Dict[str, Any]] = None,
     session_emoji: str = np.random.choice(EMOJI_LIST),
@@ -63,7 +64,7 @@ async def process_single_conversation(
 
         # Process user input. Multiple queued inputs are merged into one model turn.
         input_text = await process_queued_user_inputs(
-            user_input, context.asr_engine, websocket_send
+            user_input, context.asr_engine, websocket_send, input_ids=input_ids
         )
         augmented_input_text = await augment_text_with_screen_context(
             input_text, images, screen_vision
@@ -220,21 +221,52 @@ async def process_queued_user_inputs(
     user_input: Union[str, np.ndarray, List[Union[str, np.ndarray]]],
     asr_engine,
     websocket_send: WebSocketSend,
+    input_ids: Optional[List[Optional[str]]] = None,
 ) -> str:
     if not isinstance(user_input, list):
-        return await process_user_input(user_input, asr_engine, websocket_send)
+        input_text = await process_user_input(
+            user_input,
+            asr_engine,
+            websocket_send,
+            announce_transcription=False,
+        )
+        input_id = input_ids[0] if input_ids else None
+        if isinstance(user_input, np.ndarray):
+            await websocket_send(
+                json.dumps(
+                    {
+                        "type": "user-input-transcription",
+                        "text": input_text,
+                        "input_id": input_id,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        return input_text
 
     parts: List[str] = []
-    for item in user_input:
+    for index, item in enumerate(user_input):
         text = (
             await process_user_input(
                 item,
                 asr_engine,
                 websocket_send,
-                announce_transcription=True,
+                announce_transcription=False,
             )
         ).strip()
         if text:
+            input_id = input_ids[index] if input_ids and index < len(input_ids) else None
+            if isinstance(item, np.ndarray):
+                await websocket_send(
+                    json.dumps(
+                        {
+                            "type": "user-input-transcription",
+                            "text": text,
+                            "input_id": input_id,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
             parts.append(text)
 
     if not parts:

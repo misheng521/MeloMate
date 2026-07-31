@@ -81,6 +81,7 @@ async def handle_conversation_trigger(
     session_emoji = np.random.choice(EMOJI_LIST)
     queued_input = {
         "user_input": user_input,
+        "input_id": data.get("input_id"),
         "images": images,
         "screen_vision": screen_vision,
         "metadata": metadata,
@@ -319,6 +320,11 @@ async def _drain_single_conversation_queue(
                 for item in batch
                 if _queued_input_has_content(item)
             ]
+            input_ids = [
+                item.get("input_id")
+                for item in batch
+                if _queued_input_has_content(item)
+            ]
             if not user_inputs:
                 continue
 
@@ -334,6 +340,7 @@ async def _drain_single_conversation_queue(
                 websocket_send=websocket_send,
                 client_uid=client_uid,
                 user_input=user_inputs if len(user_inputs) > 1 else user_inputs[0],
+                input_ids=input_ids if len(user_inputs) > 1 else input_ids[:1],
                 images=latest.get("images"),
                 screen_vision=latest.get("screen_vision"),
                 session_emoji=session_emoji,

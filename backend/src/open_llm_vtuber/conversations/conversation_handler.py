@@ -1,5 +1,6 @@
 import asyncio
 import json
+import uuid
 from typing import Dict, Optional, Callable, Any, List
 
 import numpy as np
@@ -81,9 +82,11 @@ async def handle_conversation_trigger(
     images = data.get("images")
     screen_vision = data.get("screen_vision")
     session_emoji = np.random.choice(EMOJI_LIST)
+    turn_id = data.get("turn_id") or f"server-{uuid.uuid4().hex}"
     queued_input = {
         "user_input": user_input,
         "input_id": data.get("input_id"),
+        "turn_id": turn_id,
         "images": images,
         "screen_vision": screen_vision,
         "metadata": metadata,
@@ -329,6 +332,7 @@ async def _drain_single_conversation_queue(
 
             latest = batch[-1]
             session_emoji = latest.get("session_emoji") or np.random.choice(EMOJI_LIST)
+            turn_id = latest.get("turn_id")
             metadata = _merge_metadata([item.get("metadata") for item in batch])
 
             logger.info(
@@ -341,6 +345,7 @@ async def _drain_single_conversation_queue(
                 user_input=user_inputs if len(user_inputs) > 1 else user_inputs[0],
                 input_ids=input_ids if len(user_inputs) > 1 else input_ids[:1],
                 queued_items=content_items,
+                turn_id=turn_id,
                 transcription_cache=transcription_cache.setdefault(client_uid, {}),
                 announced_transcription_ids=announced_transcription_ids.setdefault(client_uid, set()),
                 images=latest.get("images"),

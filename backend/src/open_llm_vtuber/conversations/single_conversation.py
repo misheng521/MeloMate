@@ -24,6 +24,27 @@ from ..service_context import ServiceContext
 from ..agent.output_types import SentenceOutput, AudioOutput
 
 
+def with_turn_id(websocket_send: WebSocketSend, turn_id: Optional[str]) -> WebSocketSend:
+    if not turn_id:
+        return websocket_send
+
+    async def send(message: str) -> None:
+        try:
+            payload = json.loads(message)
+        except Exception:
+            await websocket_send(message)
+            return
+
+        if isinstance(payload, dict):
+            payload.setdefault("turn_id", turn_id)
+            await websocket_send(json.dumps(payload, ensure_ascii=False))
+            return
+
+        await websocket_send(message)
+
+    return send
+
+
 async def process_single_conversation(
     context: ServiceContext,
     websocket_send: WebSocketSend,
@@ -31,6 +52,7 @@ async def process_single_conversation(
     user_input: Union[str, np.ndarray, List[Union[str, np.ndarray]]],
     input_ids: Optional[List[Optional[str]]] = None,
     queued_items: Optional[List[Dict[str, Any]]] = None,
+    turn_id: Optional[str] = None,
     transcription_cache: Optional[Dict[str, str]] = None,
     announced_transcription_ids: Optional[set[str]] = None,
     images: Optional[List[Dict[str, Any]]] = None,
@@ -59,17 +81,18 @@ async def process_single_conversation(
     tts_manager = TTSTaskManager()
     full_response = ""  # Initialize full_response here
     reply_started = False
+    websocket_send_with_turn = with_turn_id(websocket_send, turn_id)
 
     try:
         # Send initial signals
-        await send_conversation_start_signals(websocket_send)
+        await send_conversation_start_signals(websocket_send_with_turn)
         logger.info(f"New Conversation Chain {session_emoji} started!")
 
         # Process user input. Multiple queued inputs are merged into one model turn.
         input_text = await process_queued_user_inputs(
             user_input,
             context.asr_engine,
-            websocket_send,
+            websocket_send_with_turn,
             input_ids=input_ids,
             queued_items=queued_items,
             transcription_cache=transcription_cache,
@@ -148,7 +171,7 @@ async def process_single_conversation(
                     output_item["name"] = context.character_config.character_name
                     logger.debug(f"Sending tool status update: {output_item}")
 
-                    await websocket_send(json.dumps(output_item))
+                    await websocket_send_with_turn(json.dumps(output_item))
 
                 elif isinstance(output_item, (SentenceOutput, AudioOutput)):
                     if not reply_started:
@@ -160,7 +183,7 @@ async def process_single_conversation(
                         character_config=context.character_config,
                         live2d_model=context.live2d_model,
                         tts_engine=context.get_current_tts_engine(),
-                        websocket_send=websocket_send,  # Pass websocket_send for audio/tts messages
+                        websocket_send=websocket_send_with_turn,  # Pass websocket_send for audio/tts messages
                         tts_manager=tts_manager,
                         translate_engine=context.translate_engine,
                     )
@@ -179,7 +202,7 @@ async def process_single_conversation(
             logger.exception(
                 f"Error processing agent response stream: {e}"
             )  # Log with stack trace
-            await websocket_send(
+            await websocket_send_with_turn(
                 json.dumps(
                     {
                         "type": "error",
@@ -193,11 +216,11 @@ async def process_single_conversation(
         # Wait for any pending TTS tasks
         if tts_manager.task_list:
             await asyncio.gather(*tts_manager.task_list)
-            await websocket_send(json.dumps({"type": "backend-synth-complete"}))
+            await websocket_send_with_turn(json.dumps({"type": "backend-synth-complete"}))
 
         await finalize_conversation_turn(
             tts_manager=tts_manager,
-            websocket_send=websocket_send,
+            websocket_send=websocket_send_with_turn,
             client_uid=client_uid,
         )
 
@@ -218,7 +241,7 @@ async def process_single_conversation(
         raise
     except Exception as e:
         logger.error(f"Error in conversation chain: {e}")
-        await websocket_send(
+        await websocket_send_with_turn(
             json.dumps({"type": "error", "message": f"Conversation error: {str(e)}"})
         )
         raise

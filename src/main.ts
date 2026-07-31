@@ -1048,6 +1048,10 @@ function appendLine(role: LineRole, text: string) {
     return null;
   }
 
+  if (role === "user") {
+    stopAssistantReplyForUserInput();
+  }
+
   clearInitialLine();
   const line = document.createElement("p");
   line.className = `line ${role}-line`;
@@ -1063,6 +1067,8 @@ function appendLine(role: LineRole, text: string) {
 }
 
 function setPendingUserLine(text: string) {
+  stopAssistantReplyForUserInput(true);
+
   if (!pendingUserLine) {
     pendingUserLine = appendLine("user", text);
     keepActiveUserInputLinesAtBottom();
@@ -2436,10 +2442,10 @@ function beginUserVoiceInput() {
   isUserInputPriorityActive = true;
   isUserVoiceTurnSubmitted = false;
   hasSentInterruptForCurrentUserInput = false;
+  stopAssistantReplyForUserInput(true);
   setPendingUserLine(listeningDisplayText);
   ensurePendingUserInputId();
   subtitle.textContent = listeningDisplayText;
-  stopAssistantReplyForUserInput(true);
   setAssistantStatus("listening");
   markConversationActivity();
   syncProactiveSpeakButton();

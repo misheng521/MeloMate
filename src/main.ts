@@ -232,6 +232,7 @@ let isWsReady = false;
 let websocketReconnectTimer = 0;
 let websocketReconnectAttempt = 0;
 let pendingUserLine: HTMLParagraphElement | null = null;
+let pendingUserTranscriptionLines: HTMLParagraphElement[] = [];
 let lastAssistantLine: HTMLParagraphElement | null = null;
 let outputVolume = 1;
 let savedSettings: SavedSettings | null = null;
@@ -241,6 +242,9 @@ let lastAssistantText = "";
 let heardAssistantText = "";
 let audioQueueVersion = 0;
 let isAssistantResponding = false;
+let isUserSpeaking = false;
+let isUserInputPriorityActive = false;
+let isUserVoiceTurnSubmitted = false;
 let referenceAudioBlob: Blob | null = null;
 let referenceAudioStoredName = "";
 let referenceAudioObjectUrl = "";
@@ -274,6 +278,8 @@ let isVideoFullscreen = false;
 let isFallbackVideoFullscreen = false;
 const responseAudio = new Audio() as SinkAudioElement;
 const voiceChatAudio = new Audio() as SinkAudioElement;
+const listeningDisplayText = "正在听";
+const recognizingDisplayText = "正在识别...";
 
 function roleLabel(role: LineRole) {
   if (role === "user") return "用户";
@@ -1010,6 +1016,26 @@ function clearHiddenSystemErrors() {
   });
 }
 
+function activeUserInputLines() {
+  const seen = new Set<HTMLParagraphElement>();
+  return [...pendingUserTranscriptionLines, pendingUserLine]
+    .filter((line): line is HTMLParagraphElement => Boolean(line))
+    .filter((line) => {
+      if (seen.has(line)) return false;
+      seen.add(line);
+      return true;
+    });
+}
+
+function keepActiveUserInputLinesAtBottom() {
+  const lines = activeUserInputLines();
+  if (!lines.length) return;
+
+  lines.forEach((line) => {
+    transcriptLog.appendChild(line);
+  });
+}
+
 function appendLine(role: LineRole, text: string) {
   if (role === "system" && isHiddenSystemError(text)) {
     console.warn(text);
@@ -1023,6 +1049,9 @@ function appendLine(role: LineRole, text: string) {
   line.dataset.rawText = text;
   line.textContent = `${line.dataset.time} ${roleLabel(role)}：${text}`;
   transcriptLog.appendChild(line);
+  if (!activeUserInputLines().includes(line)) {
+    keepActiveUserInputLinesAtBottom();
+  }
   transcriptLog.scrollTop = transcriptLog.scrollHeight;
   return line;
 }
@@ -1030,21 +1059,28 @@ function appendLine(role: LineRole, text: string) {
 function setPendingUserLine(text: string) {
   if (!pendingUserLine) {
     pendingUserLine = appendLine("user", text);
+    keepActiveUserInputLinesAtBottom();
+    transcriptLog.scrollTop = transcriptLog.scrollHeight;
     return;
   }
 
   pendingUserLine.dataset.rawText = text;
   pendingUserLine.textContent = `${pendingUserLine.dataset.time} 用户：${text}`;
+  keepActiveUserInputLinesAtBottom();
   transcriptLog.scrollTop = transcriptLog.scrollHeight;
 }
 
 function finalizePendingUserLine(text: string) {
   markConversationActivity();
   const normalizedText = normalizeUserDisplayText(text);
-  if (pendingUserLine) {
-    pendingUserLine.dataset.rawText = text;
-    pendingUserLine.textContent = `${pendingUserLine.dataset.time} 用户：${text}`;
-    pendingUserLine = null;
+  const line = pendingUserTranscriptionLines.shift() || pendingUserLine;
+  if (line) {
+    line.dataset.rawText = text;
+    line.textContent = `${line.dataset.time} 用户：${text}`;
+    if (line === pendingUserLine) {
+      pendingUserLine = null;
+    }
+    keepActiveUserInputLinesAtBottom();
     transcriptLog.scrollTop = transcriptLog.scrollHeight;
     return;
   }
@@ -1061,31 +1097,16 @@ function normalizeUserDisplayText(text: string) {
   return text.trim().replace(/\s+/g, " ");
 }
 
-function removeRecentUserLines(texts: string[]) {
-  const remaining = texts.map(normalizeUserDisplayText).filter(Boolean);
-  if (!remaining.length) return;
-
-  const lines = Array.from(transcriptLog.querySelectorAll<HTMLParagraphElement>(".user-line")).reverse();
-  for (const line of lines) {
-    const raw = normalizeUserDisplayText(line.dataset.rawText || line.textContent || "");
-    const matchIndex = remaining.findIndex((text) => raw.endsWith(text) || raw === text);
-    if (matchIndex === -1) continue;
-
-    if (line === pendingUserLine) {
-      pendingUserLine = null;
-    }
-    line.remove();
-    remaining.splice(matchIndex, 1);
-    if (!remaining.length) break;
-  }
-}
-
 function showMergedUserLine(texts: string[], fallbackText?: string) {
   const cleanTexts = texts.map((text) => text.trim()).filter(Boolean);
   if (!cleanTexts.length && !fallbackText?.trim()) return;
 
-  removeRecentUserLines(cleanTexts);
-  finalizePendingUserLine(cleanTexts.length ? cleanTexts.join("\n") : fallbackText!.trim());
+  if (cleanTexts.length) {
+    cleanTexts.forEach((text) => finalizePendingUserLine(text));
+    return;
+  }
+
+  finalizePendingUserLine(fallbackText!.trim());
 }
 
 function appendAssistantLine(text: string, speakerName?: string) {
@@ -1118,11 +1139,14 @@ function setCaptureUi(active: boolean) {
   syncProactiveSpeakButton();
 }
 
-function setAssistantStatus(state: "idle" | "thinking" | "answering") {
-  const isThinking = state === "thinking";
-  const isAnswering = state === "answering";
+function setAssistantStatus(state: "idle" | "thinking" | "answering" | "listening") {
+  const isListening = isUserSpeaking || state === "listening";
+  const isThinking = !isListening && state === "thinking";
+  const isAnswering = !isListening && state === "answering";
 
-  if (isThinking) {
+  if (isListening) {
+    status.textContent = listeningDisplayText;
+  } else if (isThinking) {
     status.textContent = "思考中";
   } else if (isAnswering) {
     status.textContent = "回答中";
@@ -1131,6 +1155,7 @@ function setAssistantStatus(state: "idle" | "thinking" | "answering") {
   } else {
     status.textContent = "已停止";
   }
+  status.classList.toggle("listening", isListening);
   status.classList.toggle("thinking", isThinking);
   status.classList.toggle("answering", isAnswering);
 }
@@ -1936,8 +1961,26 @@ function handleControlMessage(text: string) {
   }
 
   if (text === "conversation-chain-end") {
+    if (shouldSuppressAssistantOutput()) return;
     void finishBackendAudio();
   }
+}
+
+function shouldSuppressAssistantOutput() {
+  return isUserInputPriorityActive;
+}
+
+function releaseUserInputPriorityAfterUserTextDisplayed() {
+  if (!isUserInputPriorityActive || !isUserVoiceTurnSubmitted || isUserSpeaking || pendingUserTranscriptionLines.length) {
+    return;
+  }
+  isUserInputPriorityActive = false;
+  isUserVoiceTurnSubmitted = false;
+}
+
+function cancelUserInputPriority() {
+  isUserInputPriorityActive = false;
+  isUserVoiceTurnSubmitted = false;
 }
 
 function handleWsMessage(message: WsMessage) {
@@ -1947,6 +1990,7 @@ function handleWsMessage(message: WsMessage) {
   }
 
   if (message.type === "full-text") {
+    if (shouldSuppressAssistantOutput()) return;
     if (message.text && !["Connection established", "Thinking...", "AI wants to speak something..."].includes(message.text)) {
       subtitle.textContent = sanitizeAssistantReply(message.text) || message.text;
     }
@@ -1956,21 +2000,25 @@ function handleWsMessage(message: WsMessage) {
   if (message.type === "user-input-transcription" && message.text) {
     finalizePendingUserLine(message.text);
     subtitle.textContent = message.text;
+    releaseUserInputPriorityAfterUserTextDisplayed();
     return;
   }
 
   if (message.type === "user-input-merged") {
     showMergedUserLine(message.texts || [], message.text);
     if (message.text) subtitle.textContent = message.text;
+    releaseUserInputPriorityAfterUserTextDisplayed();
     return;
   }
 
   if (message.type === "audio") {
+    if (shouldSuppressAssistantOutput()) return;
     queueAudioMessage(message);
     return;
   }
 
   if (message.type === "backend-synth-complete") {
+    if (shouldSuppressAssistantOutput()) return;
     backendSynthComplete = true;
     void finishBackendAudio();
     return;
@@ -2015,10 +2063,12 @@ function handleWsMessage(message: WsMessage) {
 }
 
 function queueAudioMessage(message: WsMessage) {
+  if (shouldSuppressAssistantOutput()) return;
+
   const text = message.display_text?.text || "";
   const queueVersion = audioQueueVersion;
   audioQueue = audioQueue.then(async () => {
-    if (queueVersion !== audioQueueVersion) return;
+    if (queueVersion !== audioQueueVersion || shouldSuppressAssistantOutput()) return;
 
     if (text) {
       appendAssistantLine(text, message.display_text?.name);
@@ -2038,7 +2088,7 @@ function queueAudioMessage(message: WsMessage) {
 }
 
 async function playBackendAudio(audioBase64: string, queueVersion: number) {
-  if (queueVersion !== audioQueueVersion) return;
+  if (queueVersion !== audioQueueVersion || shouldSuppressAssistantOutput()) return;
 
   responseAudio.pause();
   voiceChatAudio.pause();
@@ -2216,8 +2266,9 @@ async function finishBackendAudio() {
   syncProactiveSpeakButton();
 }
 
-function stopCurrentResponsePlayback() {
-  if (!isAssistantResponding) return;
+function stopCurrentResponsePlayback(force = false) {
+  const hasActivePlayback = !responseAudio.paused || !voiceChatAudio.paused;
+  if (!force && !isAssistantResponding && !hasActivePlayback) return;
 
   isAssistantResponding = false;
   backendSynthComplete = false;
@@ -2235,10 +2286,11 @@ function stopCurrentResponsePlayback() {
 }
 
 function interruptCurrentResponse() {
-  if (!isAssistantResponding) return;
+  const hasActivePlayback = !responseAudio.paused || !voiceChatAudio.paused;
+  if (!isAssistantResponding && !hasActivePlayback) return;
 
   const interruptedText = heardAssistantText || lastAssistantText || subtitle.textContent || "";
-  stopCurrentResponsePlayback();
+  stopCurrentResponsePlayback(true);
 
   sendWs({
     type: "interrupt-signal",
@@ -2246,14 +2298,49 @@ function interruptCurrentResponse() {
   });
 }
 
+function beginUserVoiceInput() {
+  isUserSpeaking = true;
+  isUserInputPriorityActive = true;
+  isUserVoiceTurnSubmitted = false;
+  setPendingUserLine(listeningDisplayText);
+  subtitle.textContent = listeningDisplayText;
+  interruptCurrentResponse();
+  setAssistantStatus("listening");
+  markConversationActivity();
+  syncProactiveSpeakButton();
+}
+
+function endUserVoiceInput() {
+  if (!isUserSpeaking) return;
+  isUserSpeaking = false;
+  setAssistantStatus("idle");
+  syncProactiveSpeakButton();
+}
+
+function markUserVoiceAwaitingTranscription() {
+  if (!pendingUserLine) return;
+
+  pendingUserLine.dataset.rawText = recognizingDisplayText;
+  pendingUserLine.textContent = `${pendingUserLine.dataset.time} 用户：${recognizingDisplayText}`;
+  pendingUserTranscriptionLines.push(pendingUserLine);
+  pendingUserLine = null;
+  subtitle.textContent = recognizingDisplayText;
+  keepActiveUserInputLinesAtBottom();
+  transcriptLog.scrollTop = transcriptLog.scrollHeight;
+}
+
 async function sendAudioPartition(audio: Float32Array) {
   if (!isWsReady) {
+    endUserVoiceInput();
+    cancelUserInputPriority();
     appendLine("system", "MeloMate 后端还没有连接成功。");
     return;
   }
 
   const speechAudio = prepareSpeechAudio(audio);
   if (!speechAudio.length) {
+    endUserVoiceInput();
+    cancelUserInputPriority();
     pendingUserLine?.remove();
     pendingUserLine = null;
     subtitle.textContent = isCapturing ? "麦克风已启动。" : "麦克风已停止。";
@@ -2268,6 +2355,9 @@ async function sendAudioPartition(audio: Float32Array) {
     });
   }
 
+  markUserVoiceAwaitingTranscription();
+  endUserVoiceInput();
+  isUserVoiceTurnSubmitted = true;
   sendWs({
     type: "mic-audio-end",
     images: await screenImagesForNextTurn(),
@@ -2328,15 +2418,17 @@ async function startOpenLlmVad() {
     baseAssetPath: "./libs/",
     onnxWASMBasePath: "./libs/",
     onSpeechStart: () => {
-      setPendingUserLine("正在听...");
+      beginUserVoiceInput();
     },
     onSpeechRealStart: () => {
-      setPendingUserLine("正在听...");
+      beginUserVoiceInput();
     },
     onSpeechEnd: (audio: Float32Array) => {
       void sendAudioPartition(audio);
     },
     onVADMisfire: () => {
+      endUserVoiceInput();
+      cancelUserInputPriority();
       pendingUserLine?.remove();
       pendingUserLine = null;
       subtitle.textContent = isCapturing ? "麦克风已启动。" : "麦克风已停止。";
@@ -2396,6 +2488,8 @@ function stopCaptureInternal(announce: boolean) {
   setCaptureUi(false);
   subtitle.textContent = "麦克风已停止。";
   pendingUserLine = null;
+  isUserSpeaking = false;
+  cancelUserInputPriority();
   if (announce) {
     appendLine("system", "麦克风已停止。");
   }

@@ -676,6 +676,11 @@ audio {
   color: #704f16;
 }
 
+.status-dot.listening {
+  background: #e5f8ff;
+  color: #12556a;
+}
+
 .status-dot.answering {
   background: #eef1ff;
   color: #38437b;

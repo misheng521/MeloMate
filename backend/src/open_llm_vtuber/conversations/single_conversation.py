@@ -28,8 +28,9 @@ async def process_single_conversation(
     context: ServiceContext,
     websocket_send: WebSocketSend,
     client_uid: str,
-    user_input: Union[str, np.ndarray],
+    user_input: Union[str, np.ndarray, List[Union[str, np.ndarray]]],
     input_ids: Optional[List[Optional[str]]] = None,
+    queued_items: Optional[List[Dict[str, Any]]] = None,
     images: Optional[List[Dict[str, Any]]] = None,
     screen_vision: Optional[Dict[str, Any]] = None,
     session_emoji: str = np.random.choice(EMOJI_LIST),
@@ -64,7 +65,11 @@ async def process_single_conversation(
 
         # Process user input. Multiple queued inputs are merged into one model turn.
         input_text = await process_queued_user_inputs(
-            user_input, context.asr_engine, websocket_send, input_ids=input_ids
+            user_input,
+            context.asr_engine,
+            websocket_send,
+            input_ids=input_ids,
+            queued_items=queued_items,
         )
         augmented_input_text = await augment_text_with_screen_context(
             input_text, images, screen_vision
@@ -222,51 +227,29 @@ async def process_queued_user_inputs(
     asr_engine,
     websocket_send: WebSocketSend,
     input_ids: Optional[List[Optional[str]]] = None,
+    queued_items: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     if not isinstance(user_input, list):
-        input_text = await process_user_input(
-            user_input,
-            asr_engine,
-            websocket_send,
-            announce_transcription=False,
+        return await process_queued_user_input_item(
+            item=user_input,
+            asr_engine=asr_engine,
+            websocket_send=websocket_send,
+            input_id=input_ids[0] if input_ids else None,
+            queued_item=queued_items[0] if queued_items else None,
         )
-        input_id = input_ids[0] if input_ids else None
-        if isinstance(user_input, np.ndarray):
-            await websocket_send(
-                json.dumps(
-                    {
-                        "type": "user-input-transcription",
-                        "text": input_text,
-                        "input_id": input_id,
-                    },
-                    ensure_ascii=False,
-                )
-            )
-        return input_text
 
     parts: List[str] = []
     for index, item in enumerate(user_input):
         text = (
-            await process_user_input(
-                item,
-                asr_engine,
-                websocket_send,
-                announce_transcription=False,
+            await process_queued_user_input_item(
+                item=item,
+                asr_engine=asr_engine,
+                websocket_send=websocket_send,
+                input_id=input_ids[index] if input_ids and index < len(input_ids) else None,
+                queued_item=queued_items[index] if queued_items and index < len(queued_items) else None,
             )
         ).strip()
         if text:
-            input_id = input_ids[index] if input_ids and index < len(input_ids) else None
-            if isinstance(item, np.ndarray):
-                await websocket_send(
-                    json.dumps(
-                        {
-                            "type": "user-input-transcription",
-                            "text": text,
-                            "input_id": input_id,
-                        },
-                        ensure_ascii=False,
-                    )
-                )
             parts.append(text)
 
     if not parts:
@@ -280,6 +263,46 @@ async def process_queued_user_inputs(
         "Treat them as one combined request and answer the latest full intent.\n"
         f"{joined}"
     )
+
+
+async def process_queued_user_input_item(
+    item: Union[str, np.ndarray],
+    asr_engine,
+    websocket_send: WebSocketSend,
+    input_id: Optional[str] = None,
+    queued_item: Optional[Dict[str, Any]] = None,
+) -> str:
+    if queued_item and not input_id:
+        input_id = queued_item.get("input_id")
+
+    cached_text = queued_item.get("transcription_text") if queued_item else None
+    if isinstance(cached_text, str):
+        input_text = cached_text
+    else:
+        input_text = await process_user_input(
+            item,
+            asr_engine,
+            websocket_send,
+            announce_transcription=False,
+        )
+        if queued_item is not None:
+            queued_item["transcription_text"] = input_text
+
+    if isinstance(item, np.ndarray) and not (queued_item or {}).get("transcription_announced"):
+        if queued_item is not None:
+            queued_item["transcription_announced"] = True
+        await websocket_send(
+            json.dumps(
+                {
+                    "type": "user-input-transcription",
+                    "text": input_text,
+                    "input_id": input_id,
+                },
+                ensure_ascii=False,
+            )
+        )
+
+    return input_text
 
 
 def is_workspace_tool_status(output_item: Dict[str, Any]) -> bool:

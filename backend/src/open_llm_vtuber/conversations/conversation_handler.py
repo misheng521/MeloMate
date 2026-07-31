@@ -341,6 +341,7 @@ async def _drain_single_conversation_queue(
                 client_uid=client_uid,
                 user_input=user_inputs if len(user_inputs) > 1 else user_inputs[0],
                 input_ids=input_ids if len(user_inputs) > 1 else input_ids[:1],
+                queued_items=batch,
                 images=latest.get("images"),
                 screen_vision=latest.get("screen_vision"),
                 session_emoji=session_emoji,

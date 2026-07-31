@@ -49,6 +49,7 @@ type WsMessage = {
   type?: string;
   text?: string;
   texts?: string[];
+  input_id?: string;
   message?: string;
   audio?: string | null;
   volumes?: number[];
@@ -233,6 +234,8 @@ let websocketReconnectTimer = 0;
 let websocketReconnectAttempt = 0;
 let pendingUserLine: HTMLParagraphElement | null = null;
 let pendingUserTranscriptionLines: HTMLParagraphElement[] = [];
+let userVoiceInputSequence = 0;
+const displayedUserInputIds = new Set<string>();
 let lastAssistantLine: HTMLParagraphElement | null = null;
 let outputVolume = 1;
 let savedSettings: SavedSettings | null = null;
@@ -1070,27 +1073,76 @@ function setPendingUserLine(text: string) {
   transcriptLog.scrollTop = transcriptLog.scrollHeight;
 }
 
-function finalizePendingUserLine(text: string) {
+function nextUserVoiceInputId() {
+  userVoiceInputSequence += 1;
+  return `voice-${Date.now()}-${userVoiceInputSequence}`;
+}
+
+function ensurePendingUserInputId() {
+  if (!pendingUserLine) return "";
+  if (!pendingUserLine.dataset.inputId) {
+    pendingUserLine.dataset.inputId = nextUserVoiceInputId();
+  }
+  return pendingUserLine.dataset.inputId;
+}
+
+function takePendingUserLine(inputId?: string) {
+  if (inputId) {
+    const matchIndex = pendingUserTranscriptionLines.findIndex((line) => line.dataset.inputId === inputId);
+    if (matchIndex !== -1) {
+      const [line] = pendingUserTranscriptionLines.splice(matchIndex, 1);
+      return line;
+    }
+    if (pendingUserLine?.dataset.inputId === inputId) {
+      const line = pendingUserLine;
+      pendingUserLine = null;
+      return line;
+    }
+    return null;
+  }
+
+  return pendingUserTranscriptionLines.shift() || pendingUserLine;
+}
+
+function rememberDisplayedUserInput(inputId?: string) {
+  if (!inputId) return;
+  displayedUserInputIds.add(inputId);
+  if (displayedUserInputIds.size > 200) {
+    const oldestInputId = displayedUserInputIds.values().next().value as string | undefined;
+    if (oldestInputId) displayedUserInputIds.delete(oldestInputId);
+  }
+}
+
+function finalizePendingUserLine(text: string, inputId?: string) {
   markConversationActivity();
+  if (inputId && displayedUserInputIds.has(inputId)) return false;
+
   const normalizedText = normalizeUserDisplayText(text);
-  const line = pendingUserTranscriptionLines.shift() || pendingUserLine;
+  const line = takePendingUserLine(inputId);
   if (line) {
     line.dataset.rawText = text;
+    if (inputId) line.dataset.inputId = inputId;
     line.textContent = `${line.dataset.time} 用户：${text}`;
     if (line === pendingUserLine) {
       pendingUserLine = null;
     }
+    rememberDisplayedUserInput(inputId || line.dataset.inputId);
     keepActiveUserInputLinesAtBottom();
     transcriptLog.scrollTop = transcriptLog.scrollHeight;
-    return;
+    return true;
   }
 
   const lastUserLine = Array.from(transcriptLog.querySelectorAll<HTMLParagraphElement>(".user-line")).pop();
   if (lastUserLine && normalizeUserDisplayText(lastUserLine.dataset.rawText || "") === normalizedText) {
-    return;
+    return false;
   }
 
-  appendLine("user", text);
+  const appendedLine = appendLine("user", text);
+  if (appendedLine && inputId) {
+    appendedLine.dataset.inputId = inputId;
+  }
+  rememberDisplayedUserInput(inputId);
+  return true;
 }
 
 function normalizeUserDisplayText(text: string) {
@@ -1099,14 +1151,17 @@ function normalizeUserDisplayText(text: string) {
 
 function showMergedUserLine(texts: string[], fallbackText?: string) {
   const cleanTexts = texts.map((text) => text.trim()).filter(Boolean);
-  if (!cleanTexts.length && !fallbackText?.trim()) return;
+  if (!cleanTexts.length && !fallbackText?.trim()) return false;
 
   if (cleanTexts.length) {
-    cleanTexts.forEach((text) => finalizePendingUserLine(text));
-    return;
+    let displayedAny = false;
+    cleanTexts.forEach((text) => {
+      displayedAny = finalizePendingUserLine(text) || displayedAny;
+    });
+    return displayedAny;
   }
 
-  finalizePendingUserLine(fallbackText!.trim());
+  return finalizePendingUserLine(fallbackText!.trim());
 }
 
 function appendAssistantLine(text: string, speakerName?: string) {
@@ -1998,15 +2053,17 @@ function handleWsMessage(message: WsMessage) {
   }
 
   if (message.type === "user-input-transcription" && message.text) {
-    finalizePendingUserLine(message.text);
-    subtitle.textContent = message.text;
+    const displayed = finalizePendingUserLine(message.text, message.input_id);
+    if (displayed) {
+      subtitle.textContent = message.text;
+    }
     releaseUserInputPriorityAfterUserTextDisplayed();
     return;
   }
 
   if (message.type === "user-input-merged") {
-    showMergedUserLine(message.texts || [], message.text);
-    if (message.text) subtitle.textContent = message.text;
+    const displayed = showMergedUserLine(message.texts || [], message.text);
+    if (displayed && message.text) subtitle.textContent = message.text;
     releaseUserInputPriorityAfterUserTextDisplayed();
     return;
   }
@@ -2303,6 +2360,7 @@ function beginUserVoiceInput() {
   isUserInputPriorityActive = true;
   isUserVoiceTurnSubmitted = false;
   setPendingUserLine(listeningDisplayText);
+  ensurePendingUserInputId();
   subtitle.textContent = listeningDisplayText;
   interruptCurrentResponse();
   setAssistantStatus("listening");
@@ -2318,8 +2376,9 @@ function endUserVoiceInput() {
 }
 
 function markUserVoiceAwaitingTranscription() {
-  if (!pendingUserLine) return;
+  if (!pendingUserLine) return "";
 
+  const inputId = ensurePendingUserInputId();
   pendingUserLine.dataset.rawText = recognizingDisplayText;
   pendingUserLine.textContent = `${pendingUserLine.dataset.time} 用户：${recognizingDisplayText}`;
   pendingUserTranscriptionLines.push(pendingUserLine);
@@ -2327,6 +2386,7 @@ function markUserVoiceAwaitingTranscription() {
   subtitle.textContent = recognizingDisplayText;
   keepActiveUserInputLinesAtBottom();
   transcriptLog.scrollTop = transcriptLog.scrollHeight;
+  return inputId;
 }
 
 async function sendAudioPartition(audio: Float32Array) {
@@ -2355,11 +2415,12 @@ async function sendAudioPartition(audio: Float32Array) {
     });
   }
 
-  markUserVoiceAwaitingTranscription();
+  const inputId = markUserVoiceAwaitingTranscription();
   endUserVoiceInput();
   isUserVoiceTurnSubmitted = true;
   sendWs({
     type: "mic-audio-end",
+    input_id: inputId,
     images: await screenImagesForNextTurn(),
     screen_vision: screenVisionConfigPayload(),
   });
@@ -2488,6 +2549,7 @@ function stopCaptureInternal(announce: boolean) {
   setCaptureUi(false);
   subtitle.textContent = "麦克风已停止。";
   pendingUserLine = null;
+  pendingUserTranscriptionLines = [];
   isUserSpeaking = false;
   cancelUserInputPriority();
   if (announce) {

@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { basename, dirname, extname, join, normalize, relative, resolve, sep } from "node:path";
 
@@ -474,25 +474,32 @@ function writeWorkspaceState(persona, state) {
   const target = workspaceStatePath(persona);
   if (!target) return false;
   const previous = readWorkspaceState(persona);
-  appendWorkspaceEvent(persona, previous, state);
   if (state?.closed) {
     if (existsSync(target) && previous?.state?.page?.id === state.page?.id) {
       unlinkSync(target);
     }
+    appendWorkspaceEvent(persona, previous, state);
     return true;
   }
-  writeFileSync(
-    target,
-    JSON.stringify(
-      {
-        updated_ms: Date.now(),
-        state,
-      },
-      null,
-      2,
-    ),
-    "utf8",
-  );
+  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(
+      temporary,
+      JSON.stringify(
+        {
+          updated_ms: Date.now(),
+          state,
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    renameSync(temporary, target);
+  } finally {
+    if (existsSync(temporary)) unlinkSync(temporary);
+  }
+  appendWorkspaceEvent(persona, previous, state);
   return true;
 }
 
@@ -577,7 +584,6 @@ function workspaceControlScript(persona, pageId, accessToken, logicalPath) {
     });
     const target = document.activeElement && document.activeElement !== document.body ? document.activeElement : document;
     target.dispatchEvent(event);
-    window.dispatchEvent(event);
   }
 
   function runCommand(command) {
@@ -605,7 +611,7 @@ function workspaceControlScript(persona, pageId, accessToken, logicalPath) {
     detail.result = nextResult;
     if (nextResult === false) detail.accepted = false;
     if (nextResult && typeof nextResult === "object") {
-      if (nextResult.accepted === false) detail.accepted = false;
+      if (nextResult.accepted === false || nextResult.confirmed === false || nextResult.ok === false) detail.accepted = false;
       if (nextResult.handled === true) detail.handled = true;
       if (Object.prototype.hasOwnProperty.call(nextResult, "result")) detail.result = nextResult.result;
       if (nextResult.error) detail.error = String(nextResult.error);
@@ -631,13 +637,11 @@ function workspaceControlScript(persona, pageId, accessToken, logicalPath) {
         detail.accepted = false;
         detail.error = exception && exception.message ? exception.message : String(exception);
       }
+    } else {
+      const actionEvent = new CustomEvent("melomate-action", { detail, bubbles: true, cancelable: true });
+      document.dispatchEvent(actionEvent);
+      if (actionEvent.defaultPrevented) detail.handled = true;
     }
-    const windowEvent = new CustomEvent("melomate-action", { detail, bubbles: true, cancelable: true });
-    window.dispatchEvent(windowEvent);
-    if (windowEvent.defaultPrevented) detail.handled = true;
-    const documentEvent = new CustomEvent("melomate-action", { detail, bubbles: true, cancelable: true });
-    document.dispatchEvent(documentEvent);
-    if (documentEvent.defaultPrevented) detail.handled = true;
     const actionResult = {
       id: detail.id,
       action: detail.action,

@@ -200,7 +200,29 @@ class ToolExecutor:
                 tool_name, tool_policy, consume
             )
         if tool_name == "send_workspace_action":
-            action = str(tool_input.get("action") or "").strip()
+            grants = tool_policy.get("workspace_action_grants")
+            action_id = str(tool_input.get("action_id") or "").strip()[:128]
+            selected_grant = None
+            if action_id and isinstance(grants, list):
+                selected_grant = next(
+                    (
+                        grant
+                        for grant in grants
+                        if isinstance(grant, dict)
+                        and str(grant.get("id") or "") == action_id
+                    ),
+                    None,
+                )
+                if selected_grant is None:
+                    return tool_input, (
+                        "TOOL_POLICY_DENIED: action_id must exactly match a "
+                        "page-advertised availableAction id."
+                    )
+            action = str(
+                (selected_grant or {}).get("action")
+                or tool_input.get("action")
+                or ""
+            ).strip()
             if not action or len(action) > 120:
                 return tool_input, (
                     "TOOL_POLICY_DENIED: workspace action must be 1-120 characters."
@@ -209,7 +231,11 @@ class ToolExecutor:
                 wait_ms = max(100, min(int(tool_input.get("wait_ms") or 900), 1500))
             except (TypeError, ValueError):
                 wait_ms = 900
-            raw_payload = tool_input.get("payload")
+            raw_payload = (
+                selected_grant.get("payload")
+                if selected_grant is not None
+                else tool_input.get("payload")
+            )
             safe_payload = (
                 sanitize_untrusted_value(raw_payload)
                 if isinstance(raw_payload, dict)
@@ -221,7 +247,8 @@ class ToolExecutor:
                 "payload": safe_payload,
                 "wait_ms": wait_ms,
             }
-            grants = tool_policy.get("workspace_action_grants")
+            if selected_grant is not None:
+                normalized_input["action_id"] = action_id
             if isinstance(grants, list) and not any(
                 grant.get("action") == normalized_input["action"]
                 and grant.get("payload") == normalized_input["payload"]

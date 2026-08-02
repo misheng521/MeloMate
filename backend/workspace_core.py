@@ -344,6 +344,21 @@ def state_is_fresh(state: dict[str, Any] | None) -> bool:
     return age_ms is not None and age_ms < FRESH_STATE_MS
 
 
+def advertised_workspace_actions(
+    state: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Return exact semantic actions advertised by the current page state."""
+    app_state = state_payload(state).get("appState")
+    if not isinstance(app_state, dict):
+        return []
+    advertised = app_state.get("availableActions")
+    if not isinstance(advertised, list):
+        advertised = app_state.get("available_actions")
+    if not isinstance(advertised, list):
+        return []
+    return [item for item in advertised[:256] if isinstance(item, dict)]
+
+
 def find_action_result(state: dict[str, Any] | None, command_id: str) -> dict[str, Any] | None:
     if not state:
         return None
@@ -407,19 +422,40 @@ def wait_for_action_result(
 
 def send_workspace_action(
     persona: str,
-    action: str,
+    action: str = "",
     payload: dict[str, Any] | None = None,
     wait_ms: int = 900,
     expected_page_id: str = "",
     expected_state_version: int | None = None,
+    action_id: str = "",
 ) -> str:
+    previous_state = read_workspace_state_file(persona)
+    selected_action_id = str(action_id or "").strip()[:128]
+    if selected_action_id:
+        selected = next(
+            (
+                item
+                for item in advertised_workspace_actions(previous_state)
+                if str(item.get("id") or "") == selected_action_id
+            ),
+            None,
+        )
+        if selected is None:
+            raise ValueError(
+                "action_id is not advertised by the current workspace page state."
+            )
+        action = str(selected.get("action") or "")
+        selected_payload = selected.get("payload")
+        payload = selected_payload if isinstance(selected_payload, dict) else {}
+
     clean_action = str(action or "").strip()
     if not clean_action:
-        raise ValueError("action is required, for example place-piece, select-cell, click, move, restart, or pass.")
+        raise ValueError(
+            "action or a current page-advertised action_id is required."
+        )
     if payload is not None and not isinstance(payload, dict):
         raise ValueError("payload must be an object.")
 
-    previous_state = read_workspace_state_file(persona)
     current_page_id = state_page_id(previous_state)
     current_version = state_version(previous_state)
     if expected_page_id and current_page_id != str(expected_page_id):
@@ -485,6 +521,7 @@ def send_workspace_action(
                 "page_id": command["page_id"],
                 "action": command["action"],
                 "payload": command["payload"],
+                "action_id": selected_action_id,
             },
         }
     )

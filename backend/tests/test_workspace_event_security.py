@@ -8,6 +8,8 @@ from unittest.mock import patch
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_ROOT))
 
+import workspace_core  # noqa: E402
+
 from src.open_llm_vtuber.conversations.conversation_handler import (  # noqa: E402
     _pop_compatible_input_batch,
     _queue_input_by_priority,
@@ -20,7 +22,13 @@ from src.open_llm_vtuber.agent.agents.basic_memory_agent import (  # noqa: E402
     BasicMemoryAgent,
 )
 from src.open_llm_vtuber.mcpp.tool_executor import ToolExecutor  # noqa: E402
-from src.open_llm_vtuber.workspace_controller import WorkspaceController  # noqa: E402
+from src.open_llm_vtuber.workspace_controller import (  # noqa: E402
+    MAX_DECISION_ACTIONS,
+    WorkspaceController,
+    _compact_action_choices,
+    _decision_state,
+)
+from src.open_llm_vtuber.workspace_intent import workspace_fast_ack_text  # noqa: E402
 from src.open_llm_vtuber.workspace_security import (  # noqa: E402
     harden_workspace_tool_result,
     normalize_workspace_event,
@@ -45,6 +53,52 @@ def user_item(text: str) -> dict:
 
 
 class WorkspaceEventBoundaryTests(unittest.TestCase):
+    def test_workspace_build_request_gets_immediate_ack_without_claiming_completion(self):
+        self.assertEqual(
+            workspace_fast_ack_text("帮我做一个五子棋，我们两个对战"),
+            "好，我现在就准备，做好我们马上开始。",
+        )
+        self.assertEqual(workspace_fast_ack_text("今天天气怎么样"), "")
+
+    def test_decision_state_does_not_duplicate_large_action_catalogs(self):
+        state = {
+            "board": [[0, 1], [0, 0]],
+            "availableActions": [{"id": "move-1"}],
+            "nested": {"legalMoves": [1, 2], "turn": "white"},
+        }
+        compact = _decision_state(state)
+        self.assertNotIn("availableActions", compact)
+        self.assertNotIn("legalMoves", compact["nested"])
+        self.assertEqual(compact["board"], [[0, 1], [0, 0]])
+
+    def test_dense_grid_candidates_are_bounded_but_remain_page_advertised(self):
+        board = [[0 for _ in range(15)] for _ in range(15)]
+        board[7][7] = "black"
+        grants = [
+            {
+                "id": f"place-{row}-{col}",
+                "action": "place-piece",
+                "payload": {"row": row, "col": col},
+            }
+            for row in range(15)
+            for col in range(15)
+            if (row, col) != (7, 7)
+        ]
+        choices = _compact_action_choices(grants, {"board": board})
+        advertised_ids = {grant["id"] for grant in grants}
+        self.assertLessEqual(len(choices), MAX_DECISION_ACTIONS)
+        self.assertTrue({choice["id"] for choice in choices} <= advertised_ids)
+        self.assertLessEqual(
+            max(
+                max(
+                    abs(choice["payload"]["row"] - 7),
+                    abs(choice["payload"]["col"] - 7),
+                )
+                for choice in choices
+            ),
+            5,
+        )
+
     def test_server_replaces_page_prompt_and_client_security_flags(self):
         prepared = prepare_workspace_event_message(
             {
@@ -287,6 +341,36 @@ class DeniedToolExecutorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("matching persona", error)
 
+    async def test_action_id_is_resolved_to_the_exact_advertised_action(self):
+        executor = ToolExecutor(object(), object())
+        normalized, error = executor.apply_tool_policy(
+            "send_workspace_action",
+            {
+                "persona": "XiaoKe",
+                "action_id": "move-7-8",
+                "action": "fabricated-action",
+                "payload": {"secret": "not allowed"},
+            },
+            {
+                "enforce": True,
+                "allowed_tool_names": {"send_workspace_action"},
+                "workspace_persona": "XiaoKe",
+                "workspace_action_grants": [
+                    {
+                        "id": "move-7-8",
+                        "action": "place-piece",
+                        "payload": {"row": 7, "col": 8},
+                    }
+                ],
+                "source": "workspace_event",
+            },
+        )
+        self.assertIsNone(error)
+        self.assertEqual(normalized["action"], "place-piece")
+        self.assertEqual(normalized["payload"], {"row": 7, "col": 8})
+        self.assertEqual(normalized["action_id"], "move-7-8")
+
+
     async def test_only_one_semantic_action_is_allowed_per_event(self):
         executor = ToolExecutor(object(), object())
         policy = workspace_event_tool_policy(
@@ -350,6 +434,64 @@ class DeniedToolExecutorTests(unittest.IsolatedAsyncioTestCase):
             consume=True,
         )
         self.assertIn("page-advertised", injected_action_error)
+
+
+class WorkspaceCoreActionTests(unittest.TestCase):
+    def test_action_id_is_revalidated_against_the_current_page_state(self):
+        state = {
+            "updated_ms": 10,
+            "state": {
+                "protocolAvailable": True,
+                "state_version": 4,
+                "page": {"id": "board-1"},
+                "appState": {
+                    "availableActions": [
+                        {
+                            "id": "place-6-7",
+                            "action": "place-piece",
+                            "payload": {"row": 6, "col": 7},
+                        }
+                    ]
+                },
+            },
+        }
+        commands = []
+
+        def append_command(_persona, command):
+            commands.append(command)
+
+        def wait_result(_persona, command_id, _updated_ms, _wait_ms):
+            result = {"id": command_id, "handled": True, "accepted": True}
+            return result, state
+
+        with (
+            patch("workspace_core.read_workspace_state_file", return_value=state),
+            patch("workspace_core.append_workspace_command", side_effect=append_command),
+            patch("workspace_core.wait_for_action_result", side_effect=wait_result),
+            patch("workspace_core.state_is_fresh", return_value=True),
+        ):
+            result = json.loads(
+                workspace_core.send_workspace_action(
+                    "XiaoKe", action_id="place-6-7"
+                )
+            )
+
+        self.assertTrue(result["confirmed"])
+        self.assertEqual(commands[0]["action"], "place-piece")
+        self.assertEqual(commands[0]["payload"], {"row": 6, "col": 7})
+
+    def test_unknown_action_id_is_rejected_before_a_command_is_written(self):
+        state = {
+            "state": {
+                "appState": {"availableActions": []},
+                "page": {"id": "board-1"},
+            }
+        }
+        with patch("workspace_core.read_workspace_state_file", return_value=state):
+            with self.assertRaisesRegex(ValueError, "not advertised"):
+                workspace_core.send_workspace_action(
+                    "XiaoKe", action_id="invented-action"
+                )
 
 
 class WorkspaceControllerTests(unittest.IsolatedAsyncioTestCase):
@@ -461,6 +603,121 @@ class WorkspaceControllerTests(unittest.IsolatedAsyncioTestCase):
         await controller.wait_idle()
 
         self.assertEqual(sent_actions, [])
+        await controller.close()
+
+    async def test_model_selects_an_action_on_every_new_turn(self):
+        class FakeLLM:
+            def __init__(self):
+                self.selected_ids = ["move-12", "move-24"]
+                self.calls = 0
+
+            async def chat_completion(self, _messages, _system_prompt):
+                selected = self.selected_ids[self.calls]
+                self.calls += 1
+                yield json.dumps(
+                    {
+                        "selectedActionId": selected,
+                        "briefComment": "这一步我自己选。",
+                    },
+                    ensure_ascii=False,
+                )
+
+        llm = FakeLLM()
+
+        class Agent:
+            _llm = llm
+
+        class Context:
+            workspace_awareness = {}
+            agent_engine = Agent()
+
+        current = {"version": 1, "destination": 2}
+        sent_actions = []
+
+        def options(destination):
+            return [
+                {
+                    "id": f"move-{destination}",
+                    "action": "move",
+                    "payload": {"to": destination},
+                },
+                {
+                    "id": f"move-{destination + 10}",
+                    "action": "move",
+                    "payload": {"to": destination + 10},
+                },
+            ]
+
+        def event(version, destination):
+            return {
+                **self.event(version, destination),
+                "appState": {
+                    "currentTurn": "melomate",
+                    "availableActions": options(destination),
+                },
+            }
+
+        async def read_state(_persona):
+            version = current["version"]
+            destination = current["destination"]
+            payload = json.loads(self.state_result(version, destination))
+            payload["state"]["state"]["appState"]["availableActions"] = options(
+                destination
+            )
+            return json.dumps(payload)
+
+        async def send_action(persona, action, payload, wait_ms, page_id, version):
+            sent_actions.append((persona, action, payload, wait_ms, page_id, version))
+            return json.dumps({"confirmed": True})
+
+        async def send_text(_text):
+            return None
+
+        controller = WorkspaceController(
+            Context(), send_text, read_state, send_action, debounce_seconds=0
+        )
+        controller.submit(event(1, 2))
+        await controller.wait_idle()
+        current.update(version=2, destination=14)
+        controller.submit(event(2, 14))
+        await controller.wait_idle()
+
+        self.assertEqual(llm.calls, 2)
+        self.assertEqual([item[2] for item in sent_actions], [{"to": 12}, {"to": 24}])
+        self.assertEqual([item[5] for item in sent_actions], [1, 2])
+        await controller.close()
+
+    async def test_invalid_first_model_answer_is_retried_without_random_move(self):
+        class FakeLLM:
+            calls = 0
+
+            async def chat_completion(self, _messages, _system_prompt):
+                self.calls += 1
+                if self.calls == 1:
+                    yield "not valid JSON"
+                else:
+                    yield '{"selectedActionId":"move-8"}'
+
+        llm = FakeLLM()
+
+        class Agent:
+            _llm = llm
+
+        class Context:
+            workspace_awareness = {}
+            agent_engine = Agent()
+
+        controller = WorkspaceController(Context(), lambda _text: None)
+        selected, _ = await controller._choose_action(
+            "XiaoKe",
+            {"board": [[0]]},
+            [
+                {"id": "move-7", "action": "move", "payload": {"to": 7}},
+                {"id": "move-8", "action": "move", "payload": {"to": 8}},
+            ],
+        )
+        self.assertEqual(selected, "move-8")
+        self.assertEqual(llm.calls, 2)
         await controller.close()
 
 

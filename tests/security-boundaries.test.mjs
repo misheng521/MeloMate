@@ -17,6 +17,28 @@ test("settings remain actionable while the backend reconnects", () => {
   assert.match(mainSource, /后端未连接，点击重试/);
 });
 
+test("workspace bridge dispatches each control exactly once", () => {
+  const serverSource = readFileSync(resolve(projectRoot, "server.mjs"), "utf8");
+  const bridgeStart = serverSource.indexOf("function workspaceControlScript(");
+  const bridgeEnd = serverSource.indexOf("function sendWorkspaceHtml(", bridgeStart);
+  const bridgeSource = serverSource.slice(bridgeStart, bridgeEnd);
+
+  assert.match(
+    bridgeSource,
+    /if \(typeof window\.MeloMateGameAction === "function"\)[\s\S]*?} else {[\s\S]*?document\.dispatchEvent\(actionEvent\)/,
+  );
+  assert.equal(
+    (bridgeSource.match(/new CustomEvent\("melomate-action"/g) || []).length,
+    1,
+  );
+  assert.doesNotMatch(bridgeSource, /window\.dispatchEvent\(windowEvent\)/);
+  assert.doesNotMatch(bridgeSource, /window\.dispatchEvent\(event\)/);
+  assert.match(
+    bridgeSource,
+    /nextResult\.confirmed === false \|\| nextResult\.ok === false/,
+  );
+});
+
 async function freePort() {
   const probe = createServer();
   await new Promise((resolveListen, rejectListen) => {
@@ -191,6 +213,37 @@ test("local services enforce origin, host and per-launch authentication boundari
     body: JSON.stringify({ persona: "security-test-persona", state: reportedState }),
   });
   assert.equal(matchingStateResponse.status, 200);
+  const updatedState = {
+    ...reportedState,
+    state_version: 2,
+    appState: {
+      availableActions: [
+        { id: "move-7-8", action: "place-piece", payload: { row: 7, col: 8 } },
+      ],
+    },
+  };
+  const updatedStateResponse = await fetch(`${workspaceOrigin}/api/workspace-state`, {
+    method: "POST",
+    headers: {
+      Origin: workspaceOrigin,
+      "Content-Type": "application/json",
+      "X-MeloMate-Workspace-Access": fixtureWorkspaceToken,
+    },
+    body: JSON.stringify({ persona: "security-test-persona", state: updatedState }),
+  });
+  assert.equal(updatedStateResponse.status, 200);
+  const persistedState = JSON.parse(
+    readFileSync(resolve(fixtureRoot, ".control", "state.json"), "utf8"),
+  );
+  assert.equal(persistedState.state.state_version, 2);
+  const eventLines = readFileSync(
+    resolve(fixtureRoot, ".control", "events.jsonl"),
+    "utf8",
+  )
+    .trim()
+    .split(/\r?\n/)
+    .map((line) => JSON.parse(line));
+  assert.equal(eventLines.at(-1).state_version, 2);
   const crossPersonaStateResponse = await fetch(`${workspaceOrigin}/api/workspace-state`, {
     method: "POST",
     headers: {

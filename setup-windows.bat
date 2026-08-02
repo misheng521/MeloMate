@@ -72,6 +72,11 @@ if errorlevel 1 (
 )
 "%VENV_PYTHON%" -c "import importlib.util as u, sys; mods=['fastapi','uvicorn','websockets','loguru','pydantic','yaml','numpy','soundfile','httpx','requests','aiohttp','openai','anthropic','edge_tts','pysbd','langdetect','pydub','sherpa_onnx','onnxruntime','multipart','chardet','jinja2','tqdm','mcp','letta_client','win32crypt']; missing=[m for m in mods if u.find_spec(m) is None]; print('Missing core dependencies: '+', '.join(missing)) if missing else print('Core backend dependencies verified.'); raise SystemExit(1 if missing else 0)"
 if errorlevel 1 goto :fail
+"%VENV_PYTHON%" "%ROOT%backend\check_runtime_dependencies.py"
+if errorlevel 1 (
+  echo [ERROR] Core dependency versions are incompatible.
+  goto :fail
+)
 "%VENV_PYTHON%" -c "import sys; sys.path.insert(0, r'%ROOT%backend'); from src.open_llm_vtuber.service_context import ServiceContext; from src.open_llm_vtuber.websocket_handler import WebSocketHandler; print('Core backend imports verified.')"
 if errorlevel 1 (
   echo [ERROR] Core backend import verification failed.

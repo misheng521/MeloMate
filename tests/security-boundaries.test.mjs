@@ -1,13 +1,21 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHmac } from "node:crypto";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+test("settings remain actionable while the backend reconnects", () => {
+  const mainSource = readFileSync(resolve(projectRoot, "src", "main.ts"), "utf8");
+
+  assert.match(mainSource, /const shouldDisable = isSettingsReadOnly \|\| isApplyingSettings;/);
+  assert.match(mainSource, /async function waitForWebSocketReady\(/);
+  assert.match(mainSource, /后端未连接，点击重试/);
+});
 
 async function freePort() {
   const probe = createServer();

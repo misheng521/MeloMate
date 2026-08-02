@@ -248,7 +248,8 @@ const referenceAudioPlayer = document.querySelector<HTMLAudioElement>("#referenc
 const referenceAudioName = document.querySelector<HTMLSpanElement>("#referenceAudioName")!;
 const applySettings = document.querySelector<HTMLButtonElement>("#applySettings")!;
 const applySettingsDefaultText = applySettings.textContent?.trim() || "应用配置";
-const applySettingsLoadingText = "正在加载";
+const applySettingsOfflineText = "后端未连接，点击重试";
+const applySettingsApplyingText = "正在连接并应用…";
 const subtitle = document.querySelector<HTMLDivElement>("#subtitle")!;
 const status = document.querySelector<HTMLSpanElement>("#status")!;
 const appShell = document.querySelector<HTMLElement>(".app-shell")!;
@@ -280,6 +281,7 @@ let ws: WebSocket | null = null;
 let isCapturing = false;
 let isCaptureStarting = false;
 let isWsReady = false;
+let isApplyingSettings = false;
 let websocketReconnectTimer = 0;
 let websocketReconnectAttempt = 0;
 let pendingUserLine: HTMLParagraphElement | null = null;
@@ -1558,11 +1560,15 @@ function syncSettingsPanelMode() {
 
 function syncApplySettingsButtonState() {
   const isBackendLoading = !isWsReady;
-  const shouldDisable = isSettingsReadOnly || isBackendLoading;
+  const shouldDisable = isSettingsReadOnly || isApplyingSettings;
   applySettings.disabled = shouldDisable;
   applySettings.setAttribute("aria-disabled", String(shouldDisable));
-  applySettings.classList.toggle("is-loading", isBackendLoading);
-  applySettings.textContent = isBackendLoading ? applySettingsLoadingText : applySettingsDefaultText;
+  applySettings.classList.toggle("is-loading", isApplyingSettings);
+  applySettings.textContent = isApplyingSettings
+    ? applySettingsApplyingText
+    : isBackendLoading
+      ? applySettingsOfflineText
+      : applySettingsDefaultText;
 }
 
 function syncScreenVisionControls() {
@@ -2465,6 +2471,16 @@ function connectWebSocket() {
   };
 }
 
+async function waitForWebSocketReady(timeoutMs = 10_000) {
+  connectWebSocket();
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (isWsReady && ws?.readyState === WebSocket.OPEN) return true;
+    await new Promise<void>((resolveWait) => window.setTimeout(resolveWait, 100));
+  }
+  return false;
+}
+
 function handleControlMessage(text: string, turnId?: string) {
   if (text === "conversation-chain-start") {
     if (!acceptAssistantTurn(turnId)) return;
@@ -3278,9 +3294,29 @@ function stopCaptureInternal(announce: boolean) {
 }
 
 async function applyCurrentSettings() {
+  if (isApplyingSettings) return;
+  isApplyingSettings = true;
+  syncApplySettingsButtonState();
+  try {
+    if (!isWsReady) {
+      appendLine("system", "正在重新连接 MeloMate 后端…");
+      const connected = await waitForWebSocketReady();
+      if (!connected) {
+        appendLine("system", "无法连接 MeloMate 后端，请确认 start.bat 窗口仍在运行，然后重试。");
+        return;
+      }
+    }
+    await applyCurrentSettingsWhenConnected();
+  } finally {
+    isApplyingSettings = false;
+    syncApplySettingsButtonState();
+  }
+}
+
+async function applyCurrentSettingsWhenConnected() {
   if (!isWsReady) {
     syncApplySettingsButtonState();
-    appendLine("system", "MeloMate 后端还在连接中，请稍后再应用配置。");
+    appendLine("system", "MeloMate 后端连接已断开，请重试。");
     return;
   }
   const wasCapturing = isCapturing;

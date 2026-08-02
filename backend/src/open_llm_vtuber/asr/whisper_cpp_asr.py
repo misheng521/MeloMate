@@ -26,11 +26,9 @@ class VoiceRecognition(ASRInterface):
 
     def transcribe_np(self, audio: np.ndarray) -> str:
         if self.prompt is not None:
-            segments = self.model.transcribe(
-                audio, new_segment_callback=logger.info, initial_prompt=self.prompt
-            )
+            segments = self.model.transcribe(audio, initial_prompt=self.prompt)
         else:
-            segments = self.model.transcribe(audio, new_segment_callback=logger.info)
+            segments = self.model.transcribe(audio)
         full_text = ""
         for segment in segments:
             full_text += segment.text

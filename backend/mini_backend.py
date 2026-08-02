@@ -18,6 +18,9 @@ from src.open_llm_vtuber.config_manager import load_config_with_character, valid
 from src.open_llm_vtuber.server import WebSocketServer
 
 
+MAX_WEBSOCKET_MESSAGE_BYTES = 15 * 1024 * 1024
+
+
 def init_logger() -> None:
     logger.remove()
     logger.add(
@@ -51,6 +54,8 @@ def main() -> None:
         host=server_config.host,
         port=server_config.port,
         log_level="info",
+        ws_max_size=MAX_WEBSOCKET_MESSAGE_BYTES,
+        ws_max_queue=16,
     )
 
 

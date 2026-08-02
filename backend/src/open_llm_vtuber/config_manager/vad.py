@@ -2,6 +2,7 @@
 from pydantic import ValidationInfo, Field, model_validator
 from typing import Literal, Optional, Dict, ClassVar
 from .i18n import I18nMixin, Description
+from .provider_dependencies import require_provider_dependencies
 
 
 class SileroVADConfig(I18nMixin):
@@ -54,11 +55,13 @@ class VADConfig(I18nMixin):
     }
 
     @model_validator(mode="after")
-    def check_asr_config(cls, values: "VADConfig", info: ValidationInfo):
-        vad_model = values.silero_vad
-
-        # Only validate the selected ASR model
-        if vad_model == "silero_vad" and values.silero_vad is not None:
-            values.silero_vad.model_validate(values.silero_vad.model_dump())
-
+    def check_vad_config(cls, values: "VADConfig", info: ValidationInfo):
+        vad_model = values.vad_model
+        if vad_model is not None:
+            selected = getattr(values, vad_model, None)
+            if selected is None:
+                raise ValueError(
+                    f"Configuration section 'vad_config.{vad_model}' is required when that VAD provider is selected"
+                )
+            require_provider_dependencies("vad", vad_model)
         return values

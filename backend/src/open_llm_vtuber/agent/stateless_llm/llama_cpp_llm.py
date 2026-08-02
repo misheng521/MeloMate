@@ -44,7 +44,7 @@ class LLM(StatelessLLMInterface):
         Yields:
         - str: The content of each chunk from the model response.
         """
-        logger.debug(f"Generating completion for messages: {messages}")
+        logger.debug(f"Generating completion from {len(messages)} message(s)")
 
         try:
             # Add system prompt if provided

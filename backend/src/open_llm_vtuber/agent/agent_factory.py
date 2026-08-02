@@ -45,15 +45,16 @@ class AgentFactory:
                 raise ValueError("LLM provider not specified for basic memory agent")
 
             # Get the LLM config for this provider
-            llm_config: dict = llm_configs.get(llm_provider)
-            interrupt_method: Literal["system", "user"] = llm_config.pop(
-                "interrupt_method", "user"
-            )
-
-            if not llm_config:
+            raw_llm_config = llm_configs.get(llm_provider)
+            if not raw_llm_config:
                 raise ValueError(
                     f"Configuration not found for LLM provider: {llm_provider}"
                 )
+            # The context can be reused; never pop fields from its shared config.
+            llm_config: dict = dict(raw_llm_config)
+            interrupt_method: Literal["system", "user"] = llm_config.pop(
+                "interrupt_method", "user"
+            )
 
             # Create the stateless LLM
             llm = StatelessLLMFactory.create_llm(
@@ -83,28 +84,6 @@ class AgentFactory:
                 tool_manager=tool_manager,
                 tool_executor=tool_executor,
                 mcp_prompt_string=mcp_prompt_string,
-            )
-
-        elif conversation_agent_choice == "mem0_agent":
-            from .agents.mem0_llm import LLM as Mem0LLM
-
-            mem0_settings = agent_settings.get("mem0_agent", {})
-            if not mem0_settings:
-                raise ValueError("Mem0 agent settings not found")
-
-            # Validate required settings
-            required_fields = ["base_url", "model", "mem0_config"]
-            for field in required_fields:
-                if field not in mem0_settings:
-                    raise ValueError(
-                        f"Missing required field '{field}' in mem0_agent settings"
-                    )
-
-            return Mem0LLM(
-                user_id=kwargs.get("user_id", "default"),
-                system=system_prompt,
-                live2d_model=live2d_model,
-                **mem0_settings,
             )
 
         elif conversation_agent_choice == "hume_ai_agent":

@@ -17,19 +17,12 @@ langdetect>=1.0
 pydub>=0.25
 sherpa-onnx>=1.10
 onnxruntime>=1.18
-python-multipart>=0.0.9
 chardet>=5.2
 jinja2>=3.1
 tqdm>=4.66
 mcp>=1.0
 letta-client>=0.1
-torch==2.10.0
-torchaudio==2.10.0
-transformers>=5.3.0
-accelerate>=0.30
-librosa>=0.10
-omnivoice>=0.1
-huggingface_hub>=0.24
+pywin32>=306; sys_platform == "win32"
 
 # Optional providers may require extra packages:
 # azure-cognitiveservices-speech

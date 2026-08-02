@@ -116,7 +116,7 @@ class MCPClient:
                 if response.content and hasattr(response.content[0], "text")
                 else "Unknown server error"
             )
-            logger.error(f"MCPC: Error calling tool '{tool_name}': {error_text}")
+            logger.error(f"MCPC: Tool '{tool_name}' returned an error")
             # Return error information within the standard structure
             return {
                 "metadata": getattr(response, "metadata", {}),
@@ -159,10 +159,13 @@ class MCPClient:
         logger.info(
             f"MCPC: Closing client instance and {len(self.active_sessions)} active connections..."
         )
-        await self.exit_stack.aclose()
-        self.active_sessions.clear()
-        self._list_tools_cache.clear()  # Clear cache on close
+        exit_stack = self.exit_stack
         self.exit_stack = AsyncExitStack()
+        try:
+            await exit_stack.aclose()
+        finally:
+            self.active_sessions.clear()
+            self._list_tools_cache.clear()
         logger.info("MCPC: Client instance closed.")
 
     async def __aenter__(self) -> "MCPClient":

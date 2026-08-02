@@ -44,9 +44,11 @@ def sentence_divider(
             # Process the mixed stream using the updated SentenceDivider
             async for item in divider.process_stream(stream_from_func):
                 if isinstance(item, SentenceWithTags):
-                    logger.debug(f"sentence_divider yielding sentence: {item}")
+                    logger.debug("sentence_divider yielding sentence")
                 elif isinstance(item, dict):
-                    logger.debug(f"sentence_divider yielding dict: {item}")
+                    logger.debug(
+                        f"sentence_divider yielding event type={item.get('type')}"
+                    )
                 yield item  # Yield either SentenceWithTags or dict
             # Flushing is handled within divider.process_stream
 
@@ -198,8 +200,10 @@ def tts_filter(
                             ignore_angle_brackets=config.ignore_angle_brackets,
                         )
 
-                    logger.debug(f"[{display.name}] display: {display.text}")
-                    logger.debug(f"[{display.name}] tts: {tts}")
+                    logger.debug(
+                        f"Prepared display/TTS sentence "
+                        f"(display_chars={len(display.text)}, tts_chars={len(tts)})"
+                    )
 
                     yield SentenceOutput(
                         display_text=display,

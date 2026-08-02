@@ -2,6 +2,7 @@
 from pydantic import ValidationInfo, Field, model_validator
 from typing import Literal, Optional, Dict, ClassVar
 from .i18n import I18nMixin, Description
+from .provider_dependencies import require_provider_dependencies
 
 CartesiaLanguages = Literal[
     "en",
@@ -712,7 +713,7 @@ class TTSConfig(I18nMixin):
     melo_tts: Optional[MeloTTSConfig] = Field(None, alias="melo_tts")
     coqui_tts: Optional[CoquiTTSConfig] = Field(None, alias="coqui_tts")
     x_tts: Optional[XTTSConfig] = Field(None, alias="x_tts")
-    gpt_sovits_tts: Optional[GPTSoVITSConfig] = Field(None, alias="gpt_sovits")
+    gpt_sovits_tts: Optional[GPTSoVITSConfig] = Field(None, alias="gpt_sovits_tts")
     fish_api_tts: Optional[FishAPITTSConfig] = Field(None, alias="fish_api_tts")
     sherpa_onnx_tts: Optional[SherpaOnnxTTSConfig] = Field(
         None, alias="sherpa_onnx_tts"
@@ -774,43 +775,10 @@ class TTSConfig(I18nMixin):
     @model_validator(mode="after")
     def check_tts_config(cls, values: "TTSConfig", info: ValidationInfo):
         tts_model = values.tts_model
-
-        # Only validate the selected TTS model
-        if tts_model == "azure_tts" and values.azure_tts is not None:
-            values.azure_tts.model_validate(values.azure_tts.model_dump())
-        elif tts_model == "bark_tts" and values.bark_tts is not None:
-            values.bark_tts.model_validate(values.bark_tts.model_dump())
-        elif tts_model == "edge_tts" and values.edge_tts is not None:
-            values.edge_tts.model_validate(values.edge_tts.model_dump())
-        elif tts_model == "cosyvoice_tts" and values.cosyvoice_tts is not None:
-            values.cosyvoice_tts.model_validate(values.cosyvoice_tts.model_dump())
-        elif tts_model == "cosyvoice2_tts" and values.cosyvoice2_tts is not None:
-            values.cosyvoice2_tts.model_validate(values.cosyvoice2_tts.model_dump())
-        elif tts_model == "melo_tts" and values.melo_tts is not None:
-            values.melo_tts.model_validate(values.melo_tts.model_dump())
-        elif tts_model == "coqui_tts" and values.coqui_tts is not None:
-            values.coqui_tts.model_validate(values.coqui_tts.model_dump())
-        elif tts_model == "x_tts" and values.x_tts is not None:
-            values.x_tts.model_validate(values.x_tts.model_dump())
-        elif tts_model == "gpt_sovits_tts" and values.gpt_sovits_tts is not None:
-            values.gpt_sovits_tts.model_validate(values.gpt_sovits_tts.model_dump())
-        elif tts_model == "fish_api_tts" and values.fish_api_tts is not None:
-            values.fish_api_tts.model_validate(values.fish_api_tts.model_dump())
-        elif tts_model == "sherpa_onnx_tts" and values.sherpa_onnx_tts is not None:
-            values.sherpa_onnx_tts.model_validate(values.sherpa_onnx_tts.model_dump())
-        elif tts_model == "siliconflow_tts" and values.siliconflow_tts is not None:
-            values.siliconflow_tts.model_validate(values.siliconflow_tts.model_dump())
-        elif tts_model == "openai_tts" and values.openai_tts is not None:
-            values.openai_tts.model_validate(values.openai_tts.model_dump())
-        elif tts_model == "spark_tts" and values.spark_tts is not None:
-            values.spark_tts.model_validate(values.spark_tts.model_dump())
-        elif tts_model == "minimax_tts" and values.minimax_tts is not None:
-            values.minimax_tts.model_validate(values.minimax_tts.model_dump())
-        elif tts_model == "elevenlabs_tts" and values.elevenlabs_tts is not None:
-            values.elevenlabs_tts.model_validate(values.elevenlabs_tts.model_dump())
-        elif tts_model == "cartesia_tts" and values.cartesia_tts is not None:
-            values.cartesia_tts.model_validate(values.cartesia_tts.model_dump())
-
-        elif tts_model == "piper_tts" and values.piper_tts is not None:
-            values.piper_tts.model_validate(values.piper_tts.model_dump())
+        selected = getattr(values, tts_model, None)
+        if selected is None:
+            raise ValueError(
+                f"Configuration section 'tts_config.{tts_model}' is required when that TTS provider is selected"
+            )
+        require_provider_dependencies("tts", tts_model)
         return values

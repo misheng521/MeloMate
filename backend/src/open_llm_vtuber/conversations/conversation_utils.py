@@ -1,5 +1,6 @@
 import asyncio
 import re
+import uuid
 from typing import Optional, Union, Any, List, Dict
 import numpy as np
 import json
@@ -7,7 +8,7 @@ import httpx
 from loguru import logger
 
 from ..message_handler import message_handler
-from .types import WebSocketSend, BroadcastContext
+from .types import WebSocketSend
 from .tts_manager import TTSTaskManager
 from ..agent.output_types import SentenceOutput, AudioOutput
 from ..agent.input_types import BatchInput, TextData, ImageData, TextSource, ImageSource
@@ -15,6 +16,11 @@ from ..asr.asr_interface import ASRInterface
 from ..live2d_model import Live2dModel
 from ..tts.tts_interface import TTSInterface
 from ..utils.stream_audio import prepare_audio_payload
+
+
+PLAYBACK_COMPLETION_TIMEOUT_SECONDS = 180.0
+MAX_TRANSLATION_CALLS_PER_RESPONSE = 32
+MAX_TRANSLATION_CHARS_PER_RESPONSE = 32_000
 
 
 def clean_response_fragment(text: str) -> str:
@@ -299,8 +305,11 @@ async def handle_sentence_output(
 ) -> str:
     """Handle sentence output type with optional translation support"""
     full_response = ""
+    translation_calls = 0
+    translation_characters = 0
+    translation_budget_reported = False
     async for display_text, tts_text, actions in output:
-        logger.debug(f"Processing output: '''{tts_text}'''...")
+        logger.debug(f"Processing agent sentence (tts_chars={len(tts_text)})")
 
         display_text.text = live2d_model.remove_emotion_keywords(display_text.text)
         display_text.text = remove_stage_directions(display_text.text)
@@ -313,8 +322,26 @@ async def handle_sentence_output(
             continue
         if translate_engine:
             if len(re.sub(r'[\s.,!?，。！？"\'「」『』（）：；]+', "", tts_text)):
-                tts_text = translate_engine.translate(tts_text)
-            logger.info(f"Text after translation: '''{tts_text}'''...")
+                if (
+                    translation_calls >= MAX_TRANSLATION_CALLS_PER_RESPONSE
+                    or translation_characters + len(tts_text)
+                    > MAX_TRANSLATION_CHARS_PER_RESPONSE
+                ):
+                    if not translation_budget_reported:
+                        logger.warning(
+                            "Translation skipped after reaching the per-response budget"
+                        )
+                        translation_budget_reported = True
+                else:
+                    translation_calls += 1
+                    translation_characters += len(tts_text)
+                    try:
+                        tts_text = await translate_engine.async_translate(tts_text)
+                    except Exception as exc:
+                        logger.warning(
+                            "Translation unavailable; using original TTS text "
+                            f"({type(exc).__name__})"
+                        )
         else:
             logger.debug("No translation engine available. Skipping translation.")
 
@@ -390,36 +417,51 @@ async def finalize_conversation_turn(
     tts_manager: TTSTaskManager,
     websocket_send: WebSocketSend,
     client_uid: str,
-    broadcast_ctx: Optional[BroadcastContext] = None,
 ) -> None:
     """Finalize a conversation turn"""
-    if tts_manager.task_list:
-        await asyncio.gather(*tts_manager.task_list)
-        await websocket_send(json.dumps({"type": "backend-synth-complete"}))
-
-        response = await message_handler.wait_for_response(
-            client_uid, "frontend-playback-complete"
+    await tts_manager.finish()
+    playback_request_id = uuid.uuid4().hex
+    message_handler.register_response_waiter(
+        client_uid,
+        "frontend-playback-complete",
+        playback_request_id,
+    )
+    try:
+        await websocket_send(
+            json.dumps(
+                {
+                    "type": "backend-synth-complete",
+                    "request_id": playback_request_id,
+                }
+            )
         )
+    except BaseException:
+        message_handler.cancel_response_waiter(
+            client_uid,
+            "frontend-playback-complete",
+            playback_request_id,
+        )
+        raise
 
-        if not response:
-            logger.warning(f"No playback completion response from {client_uid}")
-            return
+    response = await message_handler.wait_for_response(
+        client_uid,
+        "frontend-playback-complete",
+        playback_request_id,
+        timeout=PLAYBACK_COMPLETION_TIMEOUT_SECONDS,
+    )
+    if not response:
+        logger.warning(
+            f"No playback completion response for request {playback_request_id} "
+            f"from {client_uid}; ending the turn after timeout"
+        )
 
     await websocket_send(json.dumps({"type": "force-new-message"}))
 
-    if broadcast_ctx and broadcast_ctx.broadcast_func:
-        await broadcast_ctx.broadcast_func(
-            broadcast_ctx.group_members,
-            {"type": "force-new-message"},
-            broadcast_ctx.current_client_uid,
-        )
-
-    await send_conversation_end_signal(websocket_send, broadcast_ctx)
+    await send_conversation_end_signal(websocket_send)
 
 
 async def send_conversation_end_signal(
     websocket_send: WebSocketSend,
-    broadcast_ctx: Optional[BroadcastContext],
     session_emoji: str = "session",
 ) -> None:
     """Send conversation chain end signal"""
@@ -430,18 +472,12 @@ async def send_conversation_end_signal(
 
     await websocket_send(json.dumps(chain_end_msg))
 
-    if broadcast_ctx and broadcast_ctx.broadcast_func and broadcast_ctx.group_members:
-        await broadcast_ctx.broadcast_func(
-            broadcast_ctx.group_members,
-            chain_end_msg,
-        )
-
     logger.info(f"Conversation chain {session_emoji} completed.")
 
 
-def cleanup_conversation(tts_manager: TTSTaskManager, session_emoji: str) -> None:
+async def cleanup_conversation(tts_manager: TTSTaskManager, session_emoji: str) -> None:
     """Clean up conversation resources"""
-    tts_manager.clear()
+    await tts_manager.clear()
     logger.debug(f"Clearing up conversation {session_emoji}.")
 
 

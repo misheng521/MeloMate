@@ -96,7 +96,9 @@ class AsyncLLM(StatelessLLMInterface):
                     {"role": "system", "content": system},
                     *messages,
                 ]
-            logger.debug(f"Messages: {messages_with_system}")
+            logger.debug(
+                f"Sending {len(messages_with_system)} message(s) to the LLM"
+            )
 
             available_tools = tools if self.support_tools else NOT_GIVEN
 
@@ -111,7 +113,8 @@ class AsyncLLM(StatelessLLMInterface):
                 tools=available_tools,
             )
             logger.debug(
-                f"Tool Support: {self.support_tools}, Available tools: {available_tools}"
+                f"Tool support={self.support_tools}, "
+                f"available_tools={0 if available_tools is NOT_GIVEN else len(available_tools)}"
             )
 
             async for chunk in stream:
@@ -126,9 +129,7 @@ class AsyncLLM(StatelessLLMInterface):
                     )
 
                     if has_tool_calls:
-                        logger.debug(
-                            f"Tool calls detected in chunk: {chunk.choices[0].delta.tool_calls}"
-                        )
+                        logger.debug("Tool-call delta detected")
                         in_tool_call = True
                         # Process tool calls in the current chunk
                         for tool_call in chunk.choices[0].delta.tool_calls:
@@ -174,7 +175,9 @@ class AsyncLLM(StatelessLLMInterface):
                     elif in_tool_call and not has_tool_calls:
                         in_tool_call = False
                         # Convert accumulated tool calls to the required format and output
-                        logger.info(f"Complete tool calls: {accumulated_tool_calls}")
+                        logger.info(
+                            f"Completed {len(accumulated_tool_calls)} tool call(s)"
+                        )
 
                         # Use the from_dict method to create a ToolCallObject instance from a dictionary
                         complete_tool_calls = [
@@ -195,7 +198,9 @@ class AsyncLLM(StatelessLLMInterface):
 
             # If stream ends while still in a tool call, make sure to yield the tool call
             if in_tool_call and accumulated_tool_calls:
-                logger.info(f"Final tool call at stream end: {accumulated_tool_calls}")
+                logger.info(
+                    f"Completed {len(accumulated_tool_calls)} tool call(s) at stream end"
+                )
 
                 # Create a ToolCallObject instance from a dictionary using the from_dict method.
                 complete_tool_calls = [
@@ -225,10 +230,10 @@ class AsyncLLM(StatelessLLMInterface):
                 )
                 yield "__API_NOT_SUPPORT_TOOLS__"
                 return
-            logger.error(f"LLM API: Error occurred: {e}")
+            logger.error(f"LLM API error: {type(e).__name__}")
             logger.info(f"Base URL: {self.base_url}")
             logger.info(f"Model: {self.model}")
-            logger.info(f"Messages: {messages}")
+            logger.info(f"Message count: {len(messages)}")
             logger.info(f"temperature: {self.temperature}")
             yield "Error calling the chat endpoint: Error occurred while generating response. See the logs for details."
 

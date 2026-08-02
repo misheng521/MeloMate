@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { basename, dirname, extname, join, normalize, relative, resolve, sep } from "node:path";
 
@@ -13,10 +13,167 @@ const contentRoots = {
   "/reference_sounds": resolve(appRoot, "reference_sounds"),
 };
 const workspaceRoot = resolve(appRoot, "workspace");
-const preferredPort = Number(process.env.PORT || 5178);
+
+function configuredPort(value) {
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    console.error("[ERROR] PORT must be an integer from 1 to 65535.");
+    process.exit(1);
+  }
+  return port;
+}
+
+function configuredBackendWsUrl(value) {
+  try {
+    const url = new URL(value || "ws://127.0.0.1:12393/client-ws");
+    if (url.protocol !== "ws:" && url.protocol !== "wss:") throw new Error("invalid protocol");
+    return url.toString();
+  } catch {
+    console.error("[ERROR] MELOMATE_BACKEND_WS_URL must be a valid ws:// or wss:// URL.");
+    process.exit(1);
+  }
+}
+
+const preferredPort = configuredPort(process.env.PORT || 5178);
+const workspacePort = configuredPort(process.env.MELOMATE_WORKSPACE_PORT || 5179);
+const backendWsUrl = configuredBackendWsUrl(process.env.MELOMATE_BACKEND_WS_URL);
+const launchToken = String(process.env.MELOMATE_LAUNCH_TOKEN || "standalone");
+const sessionToken = String(process.env.MELOMATE_SESSION_TOKEN || randomBytes(32).toString("base64url"));
 const voicemeeterPath = "C:\\Program Files (x86)\\VB\\Voicemeeter\\voicemeeterpro.exe";
 const voicemeeterProcessName = "voicemeeterpro";
 const workspaceEventLimit = 200;
+const workspaceEventWaiters = new Map();
+const mainOrigins = new Set([
+  `http://127.0.0.1:${preferredPort}`,
+  `http://localhost:${preferredPort}`,
+]);
+const workspaceOrigins = new Set([
+  `http://127.0.0.1:${workspacePort}`,
+  `http://localhost:${workspacePort}`,
+]);
+const workspaceBaseUrl = `http://127.0.0.1:${workspacePort}`;
+
+if (workspacePort === preferredPort) {
+  console.error("[ERROR] MELOMATE_WORKSPACE_PORT must differ from the frontend port.");
+  process.exit(1);
+}
+
+function constantTimeEqual(actual, expected) {
+  const actualBuffer = Buffer.from(String(actual || ""));
+  const expectedBuffer = Buffer.from(String(expected || ""));
+  return actualBuffer.length === expectedBuffer.length && timingSafeEqual(actualBuffer, expectedBuffer);
+}
+
+function allowedHost(request, port) {
+  const host = String(request.headers.host || "").toLowerCase();
+  return host === `127.0.0.1:${port}` || host === `localhost:${port}`;
+}
+
+function requestComesFrom(request, allowedOrigins) {
+  const origin = String(request.headers.origin || "");
+  if (origin) return allowedOrigins.has(origin);
+
+  const fetchSite = String(request.headers["sec-fetch-site"] || "").toLowerCase();
+  if (fetchSite) return fetchSite === "same-origin";
+
+  const referer = String(request.headers.referer || "");
+  if (!referer) return false;
+  try {
+    return allowedOrigins.has(new URL(referer).origin);
+  } catch {
+    return false;
+  }
+}
+
+function hasSessionToken(request) {
+  return constantTimeEqual(request.headers["x-melomate-session"], sessionToken);
+}
+
+function workspaceAccessToken(persona) {
+  const safePersona = safeName(persona, "");
+  if (!safePersona) return "";
+  return createHmac("sha256", sessionToken)
+    .update(`melomate-workspace:${safePersona}`, "utf8")
+    .digest("base64url");
+}
+
+function hasWorkspaceAccess(request, persona) {
+  const expected = workspaceAccessToken(persona);
+  return Boolean(expected) && constantTimeEqual(
+    request.headers["x-melomate-workspace-access"],
+    expected,
+  );
+}
+
+function authorizeMainApi(request) {
+  return allowedHost(request, preferredPort) && requestComesFrom(request, mainOrigins) && hasSessionToken(request);
+}
+
+function reject(response, statusCode = 403, message = "Forbidden", headers = mainSecurityHeaders) {
+  response.writeHead(statusCode, headers({ "Content-Type": "text/plain; charset=utf-8" }));
+  response.end(message);
+}
+
+function mainSecurityHeaders(extra = {}) {
+  return {
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": [
+      "default-src 'self'",
+      "base-uri 'none'",
+      "object-src 'none'",
+      "frame-ancestors 'none'",
+      "form-action 'self'",
+      "script-src 'self' 'wasm-unsafe-eval'",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data: blob:",
+      "font-src 'self' data:",
+      "media-src 'self' data: blob:",
+      "worker-src 'self' blob:",
+      "connect-src 'self' ws://127.0.0.1:* ws://localhost:* wss://127.0.0.1:* wss://localhost:* http://127.0.0.1:* http://localhost:* https://127.0.0.1:* https://localhost:*",
+      "frame-src 'none'",
+    ].join("; "),
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Permissions-Policy": [
+      "camera=()",
+      "display-capture=(self)",
+      "geolocation=()",
+      "microphone=(self)",
+      "payment=()",
+      "serial=()",
+      "usb=()",
+    ].join(", "),
+    "Referrer-Policy": "no-referrer",
+    "X-DNS-Prefetch-Control": "off",
+    "X-Download-Options": "noopen",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "X-Permitted-Cross-Domain-Policies": "none",
+    "X-XSS-Protection": "0",
+    ...extra,
+  };
+}
+
+function workspaceSecurityHeaders(extra = {}) {
+  return {
+    "Cache-Control": "no-store",
+    "Content-Security-Policy":
+      "sandbox allow-scripts allow-same-origin allow-forms allow-modals allow-popups " +
+      "allow-popups-to-escape-sandbox allow-downloads allow-top-navigation-by-user-activation " +
+      "allow-pointer-lock allow-presentation; frame-ancestors 'self'",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Permissions-Policy": "camera=(), display-capture=(), geolocation=(), microphone=(), payment=(), serial=(), usb=()",
+    "Referrer-Policy": "no-referrer",
+    "X-DNS-Prefetch-Control": "off",
+    "X-Download-Options": "noopen",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "SAMEORIGIN",
+    "X-Permitted-Cross-Domain-Policies": "none",
+    "X-XSS-Protection": "0",
+    ...extra,
+  };
+}
 
 function newWorkspacePageId() {
   return `${Date.now()}${String(Math.floor(Math.random() * 1_000_000)).padStart(6, "0")}`;
@@ -33,6 +190,13 @@ const types = {
   ".js": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".json": "application/json; charset=utf-8",
+  ".txt": "text/plain; charset=utf-8",
+  ".md": "text/markdown; charset=utf-8",
+  ".csv": "text/csv; charset=utf-8",
+  ".xml": "application/xml; charset=utf-8",
+  ".yaml": "application/yaml; charset=utf-8",
+  ".yml": "application/yaml; charset=utf-8",
+  ".pdf": "application/pdf",
   ".png": "image/png",
   ".jpg": "image/jpeg",
   ".jpeg": "image/jpeg",
@@ -47,11 +211,23 @@ const types = {
   ".flac": "audio/flac",
   ".m4a": "audio/mp4",
   ".ogg": "audio/ogg",
+  ".mp4": "video/mp4",
+  ".webm": "video/webm",
 };
 
 function isInside(basePath, filePath) {
   const child = relative(basePath, filePath);
   return child === "" || (!child.startsWith("..") && !child.includes(`..${sep}`));
+}
+
+function existingFileInside(basePath, filePath) {
+  try {
+    const realBase = realpathSync(basePath);
+    const realFile = realpathSync(filePath);
+    return isInside(realBase, realFile) && statSync(realFile).isFile() ? realFile : null;
+  } catch {
+    return null;
+  }
 }
 
 function safeResolve(basePath, requestPath = "") {
@@ -142,16 +318,30 @@ function resolveWorkspaceFile(pathname) {
   const prefix = "/workspace-files/";
   if (!pathname.startsWith(prefix)) return null;
 
-  const parts = pathname.slice(prefix.length).split("/").filter(Boolean).map(decodeURIComponent);
+  let parts;
+  try {
+    parts = pathname.slice(prefix.length).split("/").filter(Boolean).map(decodeURIComponent);
+  } catch {
+    return null;
+  }
   const persona = safeName(parts.shift() || "");
-  if (!persona || !parts.length) return null;
+  const accessToken = parts.shift() || "";
+  if (!persona || !constantTimeEqual(accessToken, workspaceAccessToken(persona)) || !parts.length) return null;
 
   const personaRoot = resolve(workspaceRoot, persona);
   const filePath = resolve(personaRoot, safeWorkspaceFolder(parts.join("/")));
-  if (!isInside(personaRoot, filePath) || !existsSync(filePath) || !statSync(filePath).isFile()) {
-    return null;
-  }
-  return filePath;
+  return isInside(personaRoot, filePath) ? existingFileInside(personaRoot, filePath) : null;
+}
+
+function workspaceFileUrl(persona, requestedPath) {
+  const safePersona = safeName(persona, "");
+  const safePath = safeWorkspaceFolder(requestedPath);
+  if (!safePersona || !safePath) return "";
+  const personaRoot = resolve(workspaceRoot, safePersona);
+  const filePath = resolve(personaRoot, safePath);
+  if (!isInside(personaRoot, filePath) || !existingFileInside(personaRoot, filePath)) return "";
+  const encodedPath = safePath.split("/").map(encodeURIComponent).join("/");
+  return `${workspaceBaseUrl}/workspace-files/${encodeURIComponent(safePersona)}/${workspaceAccessToken(safePersona)}/${encodedPath}`;
 }
 
 function workspacePersonaFromFile(filePath) {
@@ -220,12 +410,21 @@ function appendWorkspaceEvent(persona, previous, nextState) {
   const target = workspaceEventsPath(persona);
   if (!target) return;
   const lines = existsSync(target) ? readFileSync(target, "utf8").split(/\r?\n/).filter(Boolean) : [];
+  let previousCreatedMs = 0;
+  if (lines.length) {
+    try {
+      previousCreatedMs = Number(JSON.parse(lines[lines.length - 1]).created_ms || 0);
+    } catch {
+      previousCreatedMs = 0;
+    }
+  }
   const previousActionId = previous?.state?.lastAction?.id || "";
   const nextActionId = nextState.lastAction?.id || "";
   const event = {
     id: randomUUID(),
     type: nextState.closed ? "workspace-page-closed" : "workspace-state-changed",
-    created_ms: Date.now(),
+    created_ms: Math.max(Date.now(), previousCreatedMs + 1),
+    state_version: Number(nextState.state_version || 0),
     persona: safeName(persona),
     page: nextState.page,
     appState: nextState.appState,
@@ -238,6 +437,37 @@ function appendWorkspaceEvent(persona, previous, nextState) {
         : "Workspace page was opened.",
   };
   writeFileSync(target, [...lines.slice(-workspaceEventLimit + 1), JSON.stringify(event)].join("\n") + "\n", "utf8");
+  notifyWorkspaceEventWaiters(persona);
+}
+
+function notifyWorkspaceEventWaiters(persona) {
+  const safePersona = safeName(persona);
+  const waiters = workspaceEventWaiters.get(safePersona);
+  if (!waiters) return;
+  workspaceEventWaiters.delete(safePersona);
+  for (const resolveWaiter of waiters) resolveWaiter();
+}
+
+async function waitForWorkspaceEvents(persona, sinceMs, waitMs) {
+  const safePersona = safeName(persona);
+  const existing = readWorkspaceEvents(safePersona, sinceMs);
+  if (existing.length || waitMs <= 0) return existing;
+
+  await new Promise((resolveWaiter) => {
+    const waiters = workspaceEventWaiters.get(safePersona) || new Set();
+    let timeoutId;
+    const finish = () => {
+      clearTimeout(timeoutId);
+      waiters.delete(finish);
+      if (!waiters.size) workspaceEventWaiters.delete(safePersona);
+      resolveWaiter();
+    };
+    waiters.add(finish);
+    workspaceEventWaiters.set(safePersona, waiters);
+    timeoutId = setTimeout(finish, Math.max(100, Math.min(waitMs, 20_000)));
+    if (readWorkspaceEvents(safePersona, sinceMs).length) finish();
+  });
+  return readWorkspaceEvents(safePersona, sinceMs);
 }
 
 function writeWorkspaceState(persona, state) {
@@ -310,17 +540,20 @@ function readRequestBody(request) {
   });
 }
 
-function workspaceControlScript(persona, pageId) {
+function workspaceControlScript(persona, pageId, accessToken, logicalPath) {
   return `<script>
 (() => {
   const persona = ${JSON.stringify(persona)};
   const pageId = ${JSON.stringify(pageId)};
+  const accessToken = ${JSON.stringify(accessToken)};
+  const logicalPath = ${JSON.stringify(logicalPath)};
+  const accessHeaders = Object.freeze({ "X-MeloMate-Workspace-Access": accessToken });
+  const bridgeFetch = window.fetch.bind(window);
   const openedAtMs = Date.now();
   let since = Date.now();
   const seen = new Set();
-  let lastStateJson = "";
-  let lastBroadcastActionId = "";
-  const workspaceChannel = "BroadcastChannel" in window ? new BroadcastChannel("melomate-workspace") : null;
+  let lastStateSignature = "";
+  let stateVersion = 0;
   const actions = [];
   const codeByKey = {
     " ": "Space",
@@ -430,47 +663,39 @@ function workspaceControlScript(persona, pageId) {
     return null;
   }
 
-  function broadcastWorkspaceEvent(type, report) {
-    if (!workspaceChannel) return;
-    const actionId = report.lastAction && report.lastAction.id ? String(report.lastAction.id) : "";
-    const actionEvent = Boolean(actionId && actionId !== lastBroadcastActionId);
-    if (actionId) lastBroadcastActionId = actionId;
-    workspaceChannel.postMessage({
-      id: pageId + "-" + Date.now(),
-      type,
-      created_ms: Date.now(),
-      persona,
-      page: report.page,
-      appState: report.appState,
-      lastAction: report.lastAction || null,
-      actionEvent,
-      summary: type === "workspace-page-closed" ? "Workspace page was closed." : "Workspace page state changed."
-    });
-  }
-
   async function publishState(nextState, force = false) {
+    const latestAction = actions.length ? actions[actions.length - 1] : null;
+    const stateSignature = JSON.stringify({
+      protocolAvailable: nextState != null,
+      appState: nextState,
+      lastAction: latestAction,
+      title: document.title,
+      path: logicalPath
+    });
+    const changed = stateSignature !== lastStateSignature;
+    if (changed) {
+      lastStateSignature = stateSignature;
+      stateVersion += 1;
+    }
+    if (!force && !changed) return;
     const report = {
       protocolAvailable: nextState != null,
       appState: nextState,
-      lastAction: actions.length ? actions[actions.length - 1] : null,
+      lastAction: latestAction,
       actions,
+      state_version: stateVersion,
       page: {
         id: pageId,
         title: document.title,
-        path: location.pathname,
-        href: location.href,
+        path: logicalPath,
+        href: logicalPath,
         opened_at_ms: openedAtMs
       },
       reported_ms: Date.now()
     };
-    const stateJson = JSON.stringify(report);
-    const changed = stateJson !== lastStateJson;
-    if (!force && !changed) return;
-    lastStateJson = stateJson;
-    if (changed) broadcastWorkspaceEvent("workspace-state-changed", report);
-    await fetch("/api/workspace-state", {
+    await bridgeFetch("/api/workspace-state", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...accessHeaders },
       body: JSON.stringify({ persona, state: report })
     });
   }
@@ -481,28 +706,33 @@ function workspaceControlScript(persona, pageId) {
       appState: null,
       lastAction: actions.length ? actions[actions.length - 1] : null,
       actions,
+      state_version: stateVersion + 1,
       page: {
         id: pageId,
         title: document.title,
-        path: location.pathname,
-        href: location.href,
+        path: logicalPath,
+        href: logicalPath,
         opened_at_ms: openedAtMs,
         closed: true
       },
       closed: true,
       reported_ms: Date.now()
     };
-    broadcastWorkspaceEvent("workspace-page-closed", report);
-    navigator.sendBeacon(
-      "/api/workspace-state",
-      new Blob([JSON.stringify({ persona, state: report })], { type: "application/json" })
-    );
+    void bridgeFetch("/api/workspace-state", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...accessHeaders },
+      body: JSON.stringify({ persona, state: report }),
+      keepalive: true
+    });
   }
 
   async function poll() {
     try {
-      const params = new URLSearchParams({ persona, since: String(since) });
-      const response = await fetch("/api/workspace-control?" + params.toString(), { cache: "no-store" });
+      const params = new URLSearchParams({ persona, since: String(since), page_id: pageId });
+      const response = await bridgeFetch("/api/workspace-control?" + params.toString(), {
+        cache: "no-store",
+        headers: accessHeaders
+      });
       if (!response.ok) return;
       const payload = await response.json();
       for (const command of payload.commands || []) {
@@ -535,16 +765,27 @@ function workspaceControlScript(persona, pageId) {
 </script>`;
 }
 
-function sendWorkspaceHtml(filePath, response) {
+function sendWorkspaceHtml(filePath, response, headOnly = false) {
+  if (headOnly) {
+    response.writeHead(200, workspaceSecurityHeaders({ "Content-Type": types[".html"] }));
+    response.end();
+    return;
+  }
   const persona = workspacePersonaFromFile(filePath);
   const html = readFileSync(filePath, "utf8");
-  const script = workspaceControlScript(persona, newWorkspacePageId());
-  const bodyClose = /<\/body\s*>/i;
-  const content = bodyClose.test(html) ? html.replace(bodyClose, `${script}</body>`) : `${html}\n${script}`;
-  response.writeHead(200, {
-    "Content-Type": types[".html"],
-    "Cache-Control": "no-store",
-  });
+  const personaRoot = resolve(workspaceRoot, persona);
+  const logicalPath = relative(personaRoot, filePath).replace(/\\/g, "/");
+  const script = workspaceControlScript(
+    persona,
+    newWorkspacePageId(),
+    workspaceAccessToken(persona),
+    logicalPath,
+  );
+  const headOpen = /<head(?:\s[^>]*)?>/i;
+  const content = headOpen.test(html)
+    ? html.replace(headOpen, (match) => `${match}${script}`)
+    : `${script}\n${html}`;
+  response.writeHead(200, workspaceSecurityHeaders({ "Content-Type": types[".html"] }));
   response.end(content);
 }
 
@@ -584,11 +825,15 @@ function listLive2DModels() {
     .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
 }
 
-async function handleWorkspaceStateRequest(request, response) {
+async function handleWorkspaceStateRequest(request, response, requireWorkspaceAccess = false) {
   if (request.method !== "POST" || request.url !== "/api/workspace-state") return false;
   try {
     const body = await readRequestBody(request);
     const payload = JSON.parse(body || "{}");
+    if (requireWorkspaceAccess && !hasWorkspaceAccess(request, payload.persona || "")) {
+      reject(response);
+      return true;
+    }
     const ok = writeWorkspaceState(payload.persona || "", payload.state ?? null);
     jsonResponse(response, ok ? 200 : 400, { ok });
   } catch (error) {
@@ -597,7 +842,7 @@ async function handleWorkspaceStateRequest(request, response) {
   return true;
 }
 
-function handleContentApiRequest(request, response) {
+async function handleContentApiRequest(request, response, requireWorkspaceAccess = false) {
   if (request.method !== "GET") return false;
   const url = new URL(request.url || "/", "http://localhost");
   const pathname = url.pathname;
@@ -618,10 +863,35 @@ function handleContentApiRequest(request, response) {
   }
 
   if (pathname === "/api/workspace-control") {
+    const persona = url.searchParams.get("persona") || "";
+    if (requireWorkspaceAccess && !hasWorkspaceAccess(request, persona)) {
+      reject(response);
+      return true;
+    }
+    const pageId = String(url.searchParams.get("page_id") || "").slice(0, 128);
+    if (requireWorkspaceAccess && !pageId) {
+      reject(response, 400, "page_id is required");
+      return true;
+    }
     const since = Number(url.searchParams.get("since") || 0);
+    const commands = readWorkspaceCommands(persona, since);
     jsonResponse(response, 200, {
       ok: true,
-      commands: readWorkspaceCommands(url.searchParams.get("persona") || "", since),
+      commands: requireWorkspaceAccess
+        ? commands.filter((command) => !command.page_id || command.page_id === pageId)
+        : commands,
+    });
+    return true;
+  }
+
+  if (pathname === "/api/workspace-open-url") {
+    const openedUrl = workspaceFileUrl(
+      url.searchParams.get("persona") || "",
+      url.searchParams.get("path") || "",
+    );
+    jsonResponse(response, openedUrl ? 200 : 404, {
+      ok: Boolean(openedUrl),
+      url: openedUrl,
     });
     return true;
   }
@@ -634,9 +904,14 @@ function handleContentApiRequest(request, response) {
 
   if (pathname === "/api/workspace-events") {
     const since = Number(url.searchParams.get("since") || 0);
+    const waitMs = Number(url.searchParams.get("wait_ms") || 0);
     jsonResponse(response, 200, {
       ok: true,
-      events: readWorkspaceEvents(url.searchParams.get("persona") || "", since),
+      events: await waitForWorkspaceEvents(
+        url.searchParams.get("persona") || "",
+        since,
+        Number.isFinite(waitMs) ? waitMs : 0,
+      ),
     });
     return true;
   }
@@ -644,17 +919,20 @@ function handleContentApiRequest(request, response) {
   return false;
 }
 
-function resolveRequest(url) {
-  const encodedPathname = new URL(url, "http://localhost").pathname;
-  const workspaceFile = resolveWorkspaceFile(encodedPathname);
-  if (workspaceFile) {
-    return workspaceFile;
+function resolveMainRequest(url) {
+  let pathname;
+  try {
+    const encodedPathname = new URL(url, "http://localhost").pathname;
+    pathname = decodeURIComponent(encodedPathname);
+  } catch {
+    return null;
   }
-
-  const pathname = decodeURIComponent(encodedPathname);
   const assetPath = resolveAliasedAsset(pathname);
   if (assetPath) {
-    return assetPath;
+    const matchingRoot = Object.entries(contentRoots).find(
+      ([prefix]) => pathname === prefix || pathname.startsWith(`${prefix}/`),
+    )?.[1];
+    return matchingRoot ? existingFileInside(matchingRoot, assetPath) : null;
   }
 
   const cleanPath = normalize(pathname).replace(/^([/\\])+/, "");
@@ -664,20 +942,57 @@ function resolveRequest(url) {
     return null;
   }
 
-  if (existsSync(filePath) && statSync(filePath).isDirectory()) {
-    filePath = join(filePath, "index.html");
+  try {
+    if (existsSync(filePath) && statSync(filePath).isDirectory()) {
+      filePath = join(filePath, "index.html");
+    }
+  } catch {
+    return null;
   }
 
-  if (!existsSync(filePath)) {
-    filePath = join(root, "index.html");
-  }
-
-  return filePath;
+  return existingFileInside(root, filePath);
 }
 
 function jsonResponse(response, statusCode, payload) {
-  response.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
+  response.writeHead(statusCode, mainSecurityHeaders({ "Content-Type": "application/json; charset=utf-8" }));
   response.end(JSON.stringify(payload));
+}
+
+function handleRuntimeRequest(request, response) {
+  if (request.method !== "GET") return false;
+  const pathname = new URL(request.url || "/", "http://localhost").pathname;
+  if (pathname === "/api/health") {
+    if (!allowedHost(request, preferredPort) || !constantTimeEqual(request.headers["x-melomate-launch"], launchToken)) {
+      reject(response);
+      return true;
+    }
+    response.writeHead(200, mainSecurityHeaders({ "Content-Type": "application/json; charset=utf-8" }));
+    response.end(
+      JSON.stringify({
+        ok: true,
+        app: "MeloMate",
+        service: "frontend",
+        port: preferredPort,
+      }),
+    );
+    return true;
+  }
+  if (pathname === "/runtime-config.js") {
+    if (!allowedHost(request, preferredPort) || !requestComesFrom(request, mainOrigins)) {
+      reject(response);
+      return true;
+    }
+    response.writeHead(200, mainSecurityHeaders({ "Content-Type": "text/javascript; charset=utf-8" }));
+    response.end(
+      `window.__MELOMATE_RUNTIME_CONFIG__ = Object.freeze(${JSON.stringify({
+        backendWsUrl,
+        sessionToken,
+        workspaceBaseUrl,
+      })});\n`,
+    );
+    return true;
+  }
+  return false;
 }
 
 function openVoicemeeter() {
@@ -749,42 +1064,161 @@ function handleVoicemeeterRequest(request, response) {
   return false;
 }
 
-function listen(port) {
+function sendFile(filePath, response, headers, headOnly = false) {
+  const responseHeaders = headers({
+    "Content-Type": types[extname(filePath).toLowerCase()] || "application/octet-stream",
+  });
+  if (headOnly) {
+    response.writeHead(200, responseHeaders);
+    response.end();
+    return;
+  }
+  const stream = createReadStream(filePath);
+  stream.once("open", () => {
+    response.writeHead(200, responseHeaders);
+    stream.pipe(response);
+  });
+  stream.once("error", (error) => {
+    if (!response.headersSent) {
+      reject(response, error.code === "ENOENT" ? 404 : 500, error.code === "ENOENT" ? "Not found" : "Read failed", headers);
+    } else {
+      response.destroy(error);
+    }
+  });
+}
+
+function workspaceFileHeaders(filePath) {
+  const extension = extname(filePath).toLowerCase();
+  const contentType = types[extension] || "application/octet-stream";
+  const extra = { "Content-Type": contentType };
+  if (contentType === "application/octet-stream") {
+    extra["Content-Disposition"] = `attachment; filename*=UTF-8''${encodeURIComponent(basename(filePath))}`;
+  }
+  return workspaceSecurityHeaders(extra);
+}
+
+function listen(mainPort, isolatedWorkspacePort) {
   const server = createServer(async (request, response) => {
+    try {
+    if (!allowedHost(request, mainPort)) {
+      reject(response, 421, "Misdirected request");
+      return;
+    }
+    if (handleRuntimeRequest(request, response)) return;
+
+    const pathname = new URL(request.url || "/", "http://localhost").pathname;
+    if (pathname.startsWith("/workspace-files/")) {
+      reject(response, 404, "Workspace content is served from an isolated origin.");
+      return;
+    }
+    if (pathname.startsWith("/api/") && !authorizeMainApi(request)) {
+      reject(response);
+      return;
+    }
     if (await handleWorkspaceStateRequest(request, response)) return;
-    if (handleContentApiRequest(request, response)) return;
+    if (await handleContentApiRequest(request, response)) return;
     if (handleVoicemeeterRequest(request, response)) return;
 
-    const filePath = resolveRequest(request.url || "/");
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      response.setHeader("Allow", "GET, HEAD");
+      reject(response, 405, "Method not allowed");
+      return;
+    }
+
+    const filePath = resolveMainRequest(request.url || "/");
 
     if (!filePath || !existsSync(filePath)) {
-      response.writeHead(404);
-      response.end("Not found");
+      reject(response, 404, "Not found");
       return;
     }
 
-    if (isInside(workspaceRoot, filePath) && extname(filePath).toLowerCase() === ".html") {
-      sendWorkspaceHtml(filePath, response);
+    sendFile(filePath, response, mainSecurityHeaders, request.method === "HEAD");
+    } catch (error) {
+      console.error(`[ERROR] Main request failed: ${error instanceof Error ? error.message : String(error)}`);
+      if (!response.headersSent) reject(response, 500, "Internal server error");
+      else response.destroy();
+    }
+  });
+
+  const workspaceServer = createServer(async (request, response) => {
+    try {
+    if (!allowedHost(request, isolatedWorkspacePort)) {
+      reject(response, 421, "Misdirected request", workspaceSecurityHeaders);
       return;
     }
-    response.writeHead(200, {
-      "Content-Type": types[extname(filePath)] || "application/octet-stream",
-      "Cache-Control": "no-store",
-    });
-    createReadStream(filePath).pipe(response);
+
+    const pathname = new URL(request.url || "/", "http://localhost").pathname;
+    if (pathname.startsWith("/api/")) {
+      if (!requestComesFrom(request, workspaceOrigins)) {
+        reject(response, 403, "Forbidden", workspaceSecurityHeaders);
+        return;
+      }
+      if (await handleWorkspaceStateRequest(request, response, true)) return;
+      if (pathname === "/api/workspace-control" && await handleContentApiRequest(request, response, true)) return;
+      reject(response, 404, "Not found", workspaceSecurityHeaders);
+      return;
+    }
+
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      response.setHeader("Allow", "GET, HEAD");
+      reject(response, 405, "Method not allowed", workspaceSecurityHeaders);
+      return;
+    }
+
+    const filePath = resolveWorkspaceFile(pathname);
+    if (!filePath) {
+      reject(response, 404, "Not found", workspaceSecurityHeaders);
+      return;
+    }
+    if (extname(filePath).toLowerCase() === ".html") {
+      sendWorkspaceHtml(filePath, response, request.method === "HEAD");
+      return;
+    }
+    sendFile(
+      filePath,
+      response,
+      () => workspaceFileHeaders(filePath),
+      request.method === "HEAD",
+    );
+    } catch (error) {
+      console.error(`[ERROR] Workspace request failed: ${error instanceof Error ? error.message : String(error)}`);
+      if (!response.headersSent) reject(response, 500, "Internal server error", workspaceSecurityHeaders);
+      else response.destroy();
+    }
   });
 
   server.on("error", (error) => {
     if (error.code === "EADDRINUSE") {
-      listen(port + 1);
+      console.error(
+        `[ERROR] Frontend port 127.0.0.1:${mainPort} is already in use. ` +
+          "MeloMate did not stop or reuse the owning process.",
+      );
+      workspaceServer.close();
+      process.exitCode = 1;
       return;
     }
-    throw error;
+    console.error(`[ERROR] Frontend server failed: ${error.message}`);
+    workspaceServer.close();
+    process.exitCode = 1;
   });
 
-  server.listen(port, "127.0.0.1", () => {
-    console.log(`MeloMate running at http://127.0.0.1:${port}/`);
+  server.listen(mainPort, "127.0.0.1", () => {
+    console.log(`MeloMate running at http://127.0.0.1:${mainPort}/`);
+  });
+
+  workspaceServer.on("error", (error) => {
+    if (error.code === "EADDRINUSE") {
+      console.error(`[ERROR] Workspace port 127.0.0.1:${isolatedWorkspacePort} is already in use.`);
+    } else {
+      console.error(`[ERROR] Workspace server failed: ${error.message}`);
+    }
+    server.close();
+    process.exitCode = 1;
+  });
+
+  workspaceServer.listen(isolatedWorkspacePort, "127.0.0.1", () => {
+    console.log(`MeloMate isolated workspace at ${workspaceBaseUrl}/`);
   });
 }
 
-listen(preferredPort);
+listen(preferredPort, workspacePort);

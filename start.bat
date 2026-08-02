@@ -33,7 +33,7 @@ if not exist "%ROOT%backend\.venv\Scripts\python.exe" (
   exit /b 1
 )
 
-"%ROOT%backend\.venv\Scripts\python.exe" -c "import importlib.util as u; mods=['fastapi','uvicorn','websockets','loguru','pydantic','yaml','numpy','soundfile','httpx','requests','aiohttp','openai','anthropic','edge_tts','pysbd','langdetect','pydub','sherpa_onnx','onnxruntime','multipart','chardet','jinja2','tqdm','mcp','letta_client','torch','torchaudio','transformers','accelerate','librosa','omnivoice']; missing=[m for m in mods if u.find_spec(m) is None]; print(', '.join(missing)); raise SystemExit(1 if missing else 0)" >nul 2>nul
+"%ROOT%backend\.venv\Scripts\python.exe" -c "import importlib.util as u; mods=['fastapi','uvicorn','websockets','loguru','pydantic','yaml','numpy','soundfile','httpx','requests','aiohttp','openai','anthropic','edge_tts','pysbd','langdetect','pydub','sherpa_onnx','onnxruntime','multipart','chardet','jinja2','tqdm','mcp','letta_client','win32crypt']; missing=[m for m in mods if u.find_spec(m) is None]; print(', '.join(missing)); raise SystemExit(1 if missing else 0)" >nul 2>nul
 if errorlevel 1 (
   echo [ERROR] MeloMate backend dependencies are not installed correctly.
   echo Run setup-windows.bat and wait until it says "Setup finished."
@@ -46,15 +46,19 @@ if not exist "%ROOT%models\backend\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-
   echo [WARN] Voice recognition may fail unless backend\conf.yaml is changed to another ASR provider.
 )
 
-"%ROOT%backend\.venv\Scripts\python.exe" -c "import importlib.util as u; missing=[m for m in ['torchaudio','transformers','accelerate','librosa','omnivoice'] if not u.find_spec(m)]; raise SystemExit(1 if missing else 0)" >nul 2>nul
+"%ROOT%backend\.venv\Scripts\python.exe" -c "import sys; sys.path.insert(0, r'%ROOT%backend'); from src.open_llm_vtuber.utils.optional_dependencies import voice_clone_dependencies_available; raise SystemExit(0 if voice_clone_dependencies_available() else 1)" >nul 2>nul
 if errorlevel 1 (
   echo [WARN] OmniVoice voice cloning dependencies are not fully installed.
-  echo [WARN] Normal MeloMate audio still works. To enable cloning, install:
-  echo [WARN] %ROOT%backend\omnivoice-requirements.txt
+  echo [WARN] Normal MeloMate audio still works.
+  echo [WARN] To enable cloning, rerun setup-windows.bat and choose Y.
 )
 
 echo Starting MeloMate...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=(Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 5178 -State Listen -ErrorAction SilentlyContinue).OwningProcess; if ($p) { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue }" >nul 2>nul
-start "MeloMate Backend" /min "%ROOT%backend\.venv\Scripts\python.exe" "%ROOT%backend\mini_backend.py"
-start "" /min cmd /c "timeout /t 1 /nobreak >nul & start "" http://127.0.0.1:5178/"
-node server.mjs
+"%ROOT%backend\.venv\Scripts\python.exe" "%ROOT%backend\launch_melomate.py"
+set "START_RESULT=%ERRORLEVEL%"
+if not "%START_RESULT%"=="0" (
+  echo.
+  echo MeloMate did not start. No existing port owner was terminated.
+  if not "%MELOMATE_NO_PAUSE%"=="1" pause
+)
+exit /b %START_RESULT%

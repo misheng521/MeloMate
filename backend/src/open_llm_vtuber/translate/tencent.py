@@ -10,6 +10,10 @@ from loguru import logger
 from .translate_interface import TranslateInterface
 
 
+NETWORK_TIMEOUT = httpx.Timeout(15.0, connect=5.0, write=5.0, pool=5.0)
+MAX_TRANSLATION_RESPONSE_BYTES = 1024 * 1024
+
+
 def sign(key, msg):
     """Generate HMAC-SHA256 signature"""
     return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
@@ -25,6 +29,7 @@ class TencentTranslate(TranslateInterface):
         source_lang: str = "zh",
         target_lang: str = "ja",
     ):
+        super().__init__()
         self.secret_id = secret_id
         self.secret_key = secret_key
         self.token = token
@@ -95,6 +100,7 @@ class TencentTranslate(TranslateInterface):
 
     def translate(self, text: str) -> str:
         """Translate text"""
+        self._consume_request_budget(text)
         timestamp = int(time.time())
         date = datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y-%m-%d")
 
@@ -110,12 +116,28 @@ class TencentTranslate(TranslateInterface):
         headers = self._prepare_headers(payload, timestamp, date)
 
         try:
-            response = httpx.post(
-                url="https://" + self.host, headers=headers, data=payload
-            )
-            res = response.json()
-            logger.info(f"Request successful: {res}")
-            return res.get("Response", {}).get("TargetText", "Translation failed")
+            with httpx.Client(
+                timeout=NETWORK_TIMEOUT, follow_redirects=False
+            ) as client:
+                with client.stream(
+                    "POST",
+                    "https://" + self.host,
+                    headers=headers,
+                    content=payload,
+                ) as response:
+                    response.raise_for_status()
+                    body = bytearray()
+                    for chunk in response.iter_bytes():
+                        body.extend(chunk)
+                        if len(body) > MAX_TRANSLATION_RESPONSE_BYTES:
+                            raise ValueError("Translation response exceeds the size limit")
+            result = json.loads(bytes(body)).get("Response", {})
+            if result.get("Error"):
+                raise RuntimeError("Tencent translation service returned an error")
+            translated = result.get("TargetText")
+            if not translated:
+                raise ValueError("Translation service returned an empty result")
+            return self._validate_output(translated)
         except Exception as e:
-            logger.critical(f"API call error: {e}")
-            raise e
+            logger.error(f"Tencent translation failed: {type(e).__name__}")
+            raise

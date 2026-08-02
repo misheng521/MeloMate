@@ -84,10 +84,10 @@ def validate_config(config_data: dict) -> Config:
     try:
         return Config(**config_data)
     except ValidationError as e:
-        logger.critical(f"Error validating configuration: {e}")
-        logger.error("Configuration data:")
-        logger.error(config_data)
-        raise e
+        logger.critical(
+            f"Configuration validation failed with {e.error_count()} error(s)"
+        )
+        raise
 
 
 def load_config_with_character(

@@ -13,7 +13,7 @@ class Config(I18nMixin, BaseModel):
     Main configuration for the application.
     """
 
-    system_config: SystemConfig = Field(default=None, alias="system_config")
+    system_config: SystemConfig = Field(..., alias="system_config")
     character_config: CharacterConfig = Field(..., alias="character_config")
     live_config: LiveConfig = Field(default=LiveConfig(), alias="live_config")
 

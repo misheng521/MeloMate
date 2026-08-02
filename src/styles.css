@@ -864,14 +864,21 @@ audio {
 }
 
 .secret-row {
-  grid-template-columns: minmax(0, 1fr) 44px;
+  grid-template-columns: minmax(0, 1fr) 44px 52px;
 }
 
-.eye-button {
+.eye-button,
+.clear-secret-button {
   border: 1px solid rgba(36, 31, 34, 0.14);
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.82);
   cursor: pointer;
+}
+
+.clear-secret-button:disabled {
+  color: rgba(34, 31, 36, 0.42);
+  cursor: not-allowed;
+  background: rgba(245, 242, 240, 0.86);
 }
 
 .voice-chat-actions {

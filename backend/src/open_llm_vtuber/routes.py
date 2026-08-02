@@ -1,10 +1,8 @@
+import hmac
 import os
-import json
 from uuid import uuid4
-import numpy as np
-from datetime import datetime
 from pathlib import Path
-from fastapi import APIRouter, WebSocket, UploadFile, File, Response
+from fastapi import APIRouter, WebSocket, Response
 from starlette.responses import JSONResponse
 from starlette.websockets import WebSocketDisconnect
 from loguru import logger
@@ -12,6 +10,48 @@ from .service_context import ServiceContext
 from .websocket_handler import WebSocketHandler
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
+SESSION_PROTOCOL_PREFIX = "melomate.session."
+
+
+def _allowed_frontend_origins() -> set[str]:
+    configured = os.environ.get(
+        "MELOMATE_FRONTEND_ORIGIN", "http://127.0.0.1:5178"
+    )
+    return {
+        origin.strip().rstrip("/")
+        for origin in configured.split(",")
+        if origin.strip()
+    }
+
+
+def _authenticated_websocket_protocol(websocket: WebSocket) -> str | None:
+    expected = os.environ.get("MELOMATE_SESSION_TOKEN", "")
+    if not expected:
+        return None
+
+    origin = websocket.headers.get("origin", "").rstrip("/")
+    if origin and origin not in _allowed_frontend_origins():
+        return None
+
+    expected_protocol = f"{SESSION_PROTOCOL_PREFIX}{expected}"
+    protocols = {
+        value.strip()
+        for value in websocket.headers.get("sec-websocket-protocol", "").split(",")
+        if value.strip()
+    }
+    for protocol in protocols:
+        if hmac.compare_digest(protocol, expected_protocol):
+            return protocol
+    return None
+
+
+async def _accept_authenticated_websocket(websocket: WebSocket) -> bool:
+    protocol = _authenticated_websocket_protocol(websocket)
+    if not protocol:
+        await websocket.close(code=1008)
+        return False
+    await websocket.accept(subprotocol=protocol)
+    return True
 
 
 def init_client_ws_route(default_context_cache: ServiceContext) -> APIRouter:
@@ -31,7 +71,8 @@ def init_client_ws_route(default_context_cache: ServiceContext) -> APIRouter:
     @router.websocket("/client-ws")
     async def websocket_endpoint(websocket: WebSocket):
         """WebSocket endpoint for client connections"""
-        await websocket.accept()
+        if not await _accept_authenticated_websocket(websocket):
+            return
         client_uid = str(uuid4())
 
         try:
@@ -65,6 +106,9 @@ def init_proxy_route(server_url: str) -> APIRouter:
     @router.websocket("/proxy-ws")
     async def proxy_endpoint(websocket: WebSocket):
         """WebSocket endpoint for proxy connections"""
+        if not _authenticated_websocket_protocol(websocket):
+            await websocket.close(code=1008)
+            return
         try:
             await proxy_handler.handle_client_connection(websocket)
         except Exception as e:
@@ -124,118 +168,5 @@ def init_webtool_routes(default_context_cache: ServiceContext) -> APIRouter:
                 "characters": valid_characters,
             }
         )
-
-    @router.post("/asr")
-    async def transcribe_audio(file: UploadFile = File(...)):
-        """
-        Endpoint for transcribing audio using the ASR engine
-        """
-        logger.info(f"Received audio file for transcription: {file.filename}")
-
-        try:
-            contents = await file.read()
-
-            # Validate minimum file size
-            if len(contents) < 44:  # Minimum WAV header size
-                raise ValueError("Invalid WAV file: File too small")
-
-            # Decode the WAV header and get actual audio data
-            wav_header_size = 44  # Standard WAV header size
-            audio_data = contents[wav_header_size:]
-
-            # Validate audio data size
-            if len(audio_data) % 2 != 0:
-                raise ValueError("Invalid audio data: Buffer size must be even")
-
-            # Convert to 16-bit PCM samples to float32
-            try:
-                audio_array = (
-                    np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
-                    / 32768.0
-                )
-            except ValueError as e:
-                raise ValueError(
-                    f"Audio format error: {str(e)}. Please ensure the file is 16-bit PCM WAV format."
-                )
-
-            # Validate audio data
-            if len(audio_array) == 0:
-                raise ValueError("Empty audio data")
-
-            text = await default_context_cache.asr_engine.async_transcribe_np(
-                audio_array
-            )
-            logger.info(f"Transcription result: {text}")
-            return {"text": text}
-
-        except ValueError as e:
-            logger.error(f"Audio format error: {e}")
-            return Response(
-                content=json.dumps({"error": str(e)}),
-                status_code=400,
-                media_type="application/json",
-            )
-        except Exception as e:
-            logger.error(f"Error during transcription: {e}")
-            return Response(
-                content=json.dumps(
-                    {"error": "Internal server error during transcription"}
-                ),
-                status_code=500,
-                media_type="application/json",
-            )
-
-    @router.websocket("/tts-ws")
-    async def tts_endpoint(websocket: WebSocket):
-        """WebSocket endpoint for TTS generation"""
-        await websocket.accept()
-        logger.info("TTS WebSocket connection established")
-
-        try:
-            while True:
-                data = await websocket.receive_json()
-                text = data.get("text")
-                if not text:
-                    continue
-
-                logger.info(f"Received text for TTS: {text}")
-
-                # Split text into sentences
-                sentences = [s.strip() for s in text.split(".") if s.strip()]
-
-                try:
-                    # Generate and send audio for each sentence
-                    for sentence in sentences:
-                        sentence = sentence + "."  # Add back the period
-                        file_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid4())[:8]}"
-                        audio_path = (
-                            await default_context_cache.tts_engine.async_generate_audio(
-                                text=sentence, file_name_no_ext=file_name
-                            )
-                        )
-                        logger.info(
-                            f"Generated audio for sentence: {sentence} at: {audio_path}"
-                        )
-
-                        await websocket.send_json(
-                            {
-                                "status": "partial",
-                                "audioPath": audio_path,
-                                "text": sentence,
-                            }
-                        )
-
-                    # Send completion signal
-                    await websocket.send_json({"status": "complete"})
-
-                except Exception as e:
-                    logger.error(f"Error generating TTS: {e}")
-                    await websocket.send_json({"status": "error", "message": str(e)})
-
-        except WebSocketDisconnect:
-            logger.info("TTS WebSocket client disconnected")
-        except Exception as e:
-            logger.error(f"Error in TTS WebSocket connection: {e}")
-            await websocket.close()
 
     return router

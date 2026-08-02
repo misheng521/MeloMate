@@ -146,8 +146,10 @@
             <div class="secret-row">
               <input id="apiKey" type="password" autocomplete="off" />
               <button id="toggleApiKey" class="eye-button" type="button" aria-label="显示 API Key">显示</button>
+              <button id="clearApiKey" class="clear-secret-button" type="button" disabled>清除</button>
             </div>
           </label>
+          <p id="apiKeyHint" class="field-hint">Key 不会写入浏览器；应用后由 Windows 当前用户加密保存。</p>
 
           <div class="settings-divider" aria-hidden="true"></div>
 
@@ -174,8 +176,12 @@
             <div class="secret-row">
               <input id="screenVisionApiKey" type="password" autocomplete="off" />
               <button id="toggleScreenVisionApiKey" class="eye-button" type="button" aria-label="显示 API Key">显示</button>
+              <button id="clearScreenVisionApiKey" class="clear-secret-button" type="button" disabled>清除</button>
             </div>
           </label>
+          <p id="screenVisionApiKeyHint" class="field-hint collapsible-field" data-collapse="screen-vision">
+            Key 不会写入浏览器；应用后由 Windows 当前用户加密保存。
+          </p>
 
           <label class="field collapsible-field" data-collapse="screen-vision">
             <span>定时截图间隔（秒）</span>
@@ -192,9 +198,18 @@
             <input id="voiceCloneToggle" type="checkbox" />
           </label>
 
+          <p id="voiceCloneAvailabilityHint" class="field-hint">
+            正在检查语音克隆组件…
+          </p>
+
           <label class="field collapsible-field" data-collapse="voice-clone">
             <span>参考音频</span>
-            <input id="referenceAudioInput" type="file" accept="audio/*" disabled />
+            <input
+              id="referenceAudioInput"
+              type="file"
+              accept=".wav,.mp3,.flac,.ogg,audio/wav,audio/mpeg,audio/flac,audio/ogg"
+              disabled
+            />
           </label>
 
           <div class="field collapsible-field" data-collapse="voice-clone">
@@ -233,6 +248,7 @@
       </aside>
     </main>
 
+    <script src="./runtime-config.js"></script>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

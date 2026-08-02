@@ -1,4 +1,5 @@
 import asyncio
+import os
 import http.cookies
 import random
 import traceback
@@ -8,7 +9,6 @@ from loguru import logger
 import aiohttp
 import websockets
 import sys
-import os
 
 from .live_interface import LivePlatformInterface
 
@@ -96,8 +96,16 @@ class BiliBiliLivePlatform(LivePlatformInterface):
         """
         try:
             # Connect to the proxy WebSocket
+            session_token = os.environ.get("MELOMATE_SESSION_TOKEN", "")
+            subprotocols = (
+                [f"melomate.session.{session_token}"] if session_token else None
+            )
             self._websocket = await websockets.connect(
-                proxy_url, ping_interval=20, ping_timeout=10, close_timeout=5
+                proxy_url,
+                ping_interval=20,
+                ping_timeout=10,
+                close_timeout=5,
+                subprotocols=subprotocols,
             )
             self._connected = True
             logger.info(f"Connected to proxy at {proxy_url}")
@@ -197,7 +205,7 @@ class BiliBiliLivePlatform(LivePlatformInterface):
         try:
             message = {"type": "text-input", "text": text}
             await self._websocket.send(json.dumps(message))
-            logger.info(f"Sent danmaku to VTuber: {text}")
+            logger.info(f"Sent danmaku to VTuber (chars={len(text)})")
             return True
         except Exception as e:
             logger.error(f"Error sending message to proxy: {e}")
@@ -220,15 +228,9 @@ class BiliBiliLivePlatform(LivePlatformInterface):
                     message = await self._websocket.recv()
                     data = json.loads(message)
 
-                    # Log received message (truncate audio data for readability)
-                    if "audio" in data:
-                        log_data = data.copy()
-                        log_data["audio"] = (
-                            f"[Audio data, length: {len(data['audio'])}]"
-                        )
-                        logger.debug(f"Received message from VTuber: {log_data}")
-                    else:
-                        logger.debug(f"Received message from VTuber: {data}")
+                    logger.debug(
+                        f"Received VTuber message type={data.get('type', 'unknown')}"
+                    )
 
                     # Process the message
                     await self.handle_incoming_messages(data)
@@ -278,7 +280,10 @@ class BiliBiliLivePlatform(LivePlatformInterface):
                 client: The BiliBili Live client
                 message: The danmaku message
             """
-            logger.debug(f"[Room {client.room_id}] {message.uname}: {message.msg}")
+            logger.debug(
+                f"Received danmaku in room {client.room_id} "
+                f"(chars={len(message.msg)})"
+            )
             asyncio.create_task(self.platform._handle_danmaku(message.msg))
 
         def _on_heartbeat(

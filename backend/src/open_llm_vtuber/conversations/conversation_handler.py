@@ -7,13 +7,10 @@ import numpy as np
 from fastapi import WebSocket
 from loguru import logger
 
-from ..chat_group import ChatGroupManager
 from ..chat_history_manager import store_message
 from ..service_context import ServiceContext
-from .group_conversation import process_group_conversation
 from .single_conversation import process_single_conversation
 from .conversation_utils import EMOJI_LIST
-from .types import GroupConversationState
 from prompts import prompt_loader
 
 
@@ -23,9 +20,6 @@ async def handle_conversation_trigger(
     client_uid: str,
     context: ServiceContext,
     websocket: WebSocket,
-    client_contexts: Dict[str, ServiceContext],
-    client_connections: Dict[str, WebSocket],
-    chat_group_manager: ChatGroupManager,
     received_data_buffers: Dict[str, np.ndarray],
     current_conversation_tasks: Dict[str, Optional[asyncio.Task]],
     pending_conversation_inputs: Dict[str, List[Dict[str, Any]]],
@@ -35,7 +29,6 @@ async def handle_conversation_trigger(
     reply_started_flags: Dict[str, bool],
     workspace_work_flags: Dict[str, bool],
     workspace_revision_flags: Dict[str, bool],
-    broadcast_to_group: Callable,
 ) -> None:
     """Handle triggers that start a conversation"""
     metadata = None
@@ -93,120 +86,133 @@ async def handle_conversation_trigger(
         "session_emoji": session_emoji,
     }
 
-    group = chat_group_manager.get_client_group(client_uid)
-    if group and len(group.members) > 1:
-        # Use group_id as task key for group conversations
-        task_key = group.group_id
-        if (
-            task_key not in current_conversation_tasks
-            or current_conversation_tasks[task_key].done()
-        ):
-            logger.info(f"Starting new group conversation for {task_key}")
+    pending_queue = pending_conversation_inputs.setdefault(client_uid, [])
+    active_task = current_conversation_tasks.get(client_uid)
 
-            current_conversation_tasks[task_key] = asyncio.create_task(
-                process_group_conversation(
-                    client_contexts=client_contexts,
-                    client_connections=client_connections,
-                    broadcast_func=broadcast_to_group,
-                    group_members=group.members,
-                    initiator_client_uid=client_uid,
-                    user_input=user_input,
-                    images=images,
-                    screen_vision=screen_vision,
-                    session_emoji=session_emoji,
-                    metadata=metadata,
-                )
-            )
-    else:
-        # Use client_uid as task key for individual conversations
-        pending_queue = pending_conversation_inputs.setdefault(client_uid, [])
+    has_content = _queued_input_has_content(queued_input)
+    if not has_content and not pending_queue and not in_flight_conversation_inputs.get(client_uid):
+        logger.debug("Ignoring empty input with no pending conversation content.")
+        return
+
+    active_is_workspace_event = any(
+        _is_workspace_event_item(item)
+        for item in in_flight_conversation_inputs.get(client_uid, [])
+    )
+    if (
+        active_task
+        and not active_task.done()
+        and active_is_workspace_event
+        and not _is_workspace_event_item(queued_input)
+        and has_content
+    ):
+        await handle_individual_interrupt(
+            client_uid=client_uid,
+            current_conversation_tasks=current_conversation_tasks,
+            context=context,
+            heard_response="",
+        )
+        await websocket.send_text(json.dumps({"type": "interrupt-signal", "text": ""}))
         active_task = current_conversation_tasks.get(client_uid)
 
-        has_content = _queued_input_has_content(queued_input)
-        if not has_content and not pending_queue and not in_flight_conversation_inputs.get(client_uid):
-            logger.debug("Ignoring empty input with no pending conversation content.")
+    if active_task and not active_task.done():
+        if _is_workspace_event_item(queued_input):
+            if has_content:
+                _queue_input_by_priority(pending_queue, queued_input)
+            logger.info(
+                f"Queued isolated workspace event for {client_uid}; a conversation is active."
+            )
             return
 
-        if active_task and not active_task.done():
-            if workspace_work_flags.get(client_uid):
-                if has_content:
-                    if _looks_like_workspace_revision(queued_input):
-                        queued_input["metadata"] = {
-                            **(queued_input.get("metadata") or {}),
-                            "workspace_revision": True,
-                        }
-                    pending_queue.append(queued_input)
-                logger.info(
-                    f"Queued user input for {client_uid}; workspace work is active."
-                )
+        if workspace_work_flags.get(client_uid):
+            if has_content:
+                if _looks_like_workspace_revision(queued_input):
+                    queued_input["metadata"] = {
+                        **(queued_input.get("metadata") or {}),
+                        "workspace_revision": True,
+                    }
+                _queue_input_by_priority(pending_queue, queued_input)
+            logger.info(
+                f"Queued user input for {client_uid}; workspace work is active."
+            )
+            return
+
+        if reply_started_flags.get(client_uid):
+            if not has_content:
+                logger.debug("Ignoring empty input while a reply is active.")
                 return
 
-            if reply_started_flags.get(client_uid):
-                if has_content:
-                    if workspace_revision_flags.get(client_uid) and _looks_like_workspace_revision(queued_input):
-                        queued_input["metadata"] = {
-                            **(queued_input.get("metadata") or {}),
-                            "workspace_revision": True,
-                        }
-                    await handle_individual_interrupt(
-                        client_uid=client_uid,
-                        current_conversation_tasks=current_conversation_tasks,
-                        context=context,
-                        heard_response="",
-                    )
-                    await websocket.send_text(
-                        json.dumps({"type": "interrupt-signal", "text": ""})
-                    )
-                    current_conversation_tasks.pop(client_uid, None)
-                    pending_queue.append(queued_input)
-                    has_content = False
-                else:
-                    logger.debug("Ignoring empty input while a reply is active.")
-                    return
+            if workspace_revision_flags.get(client_uid) and _looks_like_workspace_revision(queued_input):
+                queued_input["metadata"] = {
+                    **(queued_input.get("metadata") or {}),
+                    "workspace_revision": True,
+                }
+            await handle_individual_interrupt(
+                client_uid=client_uid,
+                current_conversation_tasks=current_conversation_tasks,
+                context=context,
+                heard_response="",
+            )
+            await websocket.send_text(
+                json.dumps({"type": "interrupt-signal", "text": ""})
+            )
+            _queue_input_by_priority(pending_queue, queued_input)
+        else:
+            if has_content:
+                deferred_events = [
+                    item for item in pending_queue if _is_workspace_event_item(item)
+                ]
+                merged_inputs = [
+                    *in_flight_conversation_inputs.get(client_uid, []),
+                    *[
+                        item
+                        for item in pending_queue
+                        if not _is_workspace_event_item(item)
+                    ],
+                    queued_input,
+                ]
+                pending_queue[:] = [*merged_inputs, *deferred_events]
+                in_flight_conversation_inputs.pop(client_uid, None)
+                await _cancel_conversation_task(
+                    client_uid,
+                    current_conversation_tasks,
+                )
+                logger.info(
+                    f"Restarting unreplied turn for {client_uid} with {len(merged_inputs)} merged input(s)."
+                )
             else:
-                if has_content:
-                    merged_inputs = [
-                        *in_flight_conversation_inputs.get(client_uid, []),
-                        *pending_queue,
-                        queued_input,
-                    ]
-                    pending_queue[:] = merged_inputs
-                    in_flight_conversation_inputs.pop(client_uid, None)
-                    active_task.cancel()
-                    logger.info(
-                        f"Restarting unreplied turn for {client_uid} with {len(merged_inputs)} merged input(s)."
-                    )
-                elif pending_queue:
+                if pending_queue:
                     logger.info(
                         f"Empty trigger received for {client_uid}; pending unreplied input will be processed."
                     )
                 return
+    elif has_content:
+        _queue_input_by_priority(pending_queue, queued_input)
 
-        if has_content:
-            pending_queue.append(queued_input)
+    if not pending_queue:
+        return
 
-        active_task = current_conversation_tasks.get(client_uid)
-        if active_task and not active_task.done():
-            logger.info(
-                f"Queued user input for {client_uid}; {len(pending_queue)} pending item(s)."
-            )
-            return
-
-        current_conversation_tasks[client_uid] = asyncio.create_task(
-            _drain_single_conversation_queue(
-                context=context,
-                websocket_send=websocket.send_text,
-                client_uid=client_uid,
-                current_conversation_tasks=current_conversation_tasks,
-                pending_conversation_inputs=pending_conversation_inputs,
-                in_flight_conversation_inputs=in_flight_conversation_inputs,
-                transcription_cache=transcription_cache,
-                announced_transcription_ids=announced_transcription_ids,
-                reply_started_flags=reply_started_flags,
-                workspace_work_flags=workspace_work_flags,
-                workspace_revision_flags=workspace_revision_flags,
-            )
+    active_task = current_conversation_tasks.get(client_uid)
+    if active_task and not active_task.done():
+        logger.info(
+            f"Queued user input for {client_uid}; {len(pending_queue)} pending item(s)."
         )
+        return
+
+    current_conversation_tasks[client_uid] = asyncio.create_task(
+        _drain_single_conversation_queue(
+            context=context,
+            websocket_send=websocket.send_text,
+            client_uid=client_uid,
+            current_conversation_tasks=current_conversation_tasks,
+            pending_conversation_inputs=pending_conversation_inputs,
+            in_flight_conversation_inputs=in_flight_conversation_inputs,
+            transcription_cache=transcription_cache,
+            announced_transcription_ids=announced_transcription_ids,
+            reply_started_flags=reply_started_flags,
+            workspace_work_flags=workspace_work_flags,
+            workspace_revision_flags=workspace_revision_flags,
+        )
+    )
 
 
 def _queued_input_has_content(item: Dict[str, Any]) -> bool:
@@ -216,6 +222,38 @@ def _queued_input_has_content(item: Dict[str, Any]) -> bool:
     if isinstance(user_input, np.ndarray):
         return user_input.size > 0
     return user_input is not None
+
+
+def _is_workspace_event_item(item: Dict[str, Any]) -> bool:
+    metadata = item.get("metadata")
+    return isinstance(metadata, dict) and metadata.get("workspace_event") is True
+
+
+def _queue_input_by_priority(
+    pending_queue: List[Dict[str, Any]], item: Dict[str, Any]
+) -> None:
+    """Keep real user input ahead of passive workspace telemetry."""
+    if _is_workspace_event_item(item):
+        pending_queue.append(item)
+        return
+    for index, pending in enumerate(pending_queue):
+        if _is_workspace_event_item(pending):
+            pending_queue.insert(index, item)
+            return
+    pending_queue.append(item)
+
+
+def _pop_compatible_input_batch(
+    pending_queue: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Never merge untrusted telemetry into a user-authored conversation turn."""
+    first = pending_queue.pop(0)
+    batch = [first]
+    if _is_workspace_event_item(first):
+        return batch
+    while pending_queue and not _is_workspace_event_item(pending_queue[0]):
+        batch.append(pending_queue.pop(0))
+    return batch
 
 
 def _looks_like_workspace_revision(item: Dict[str, Any]) -> bool:
@@ -316,8 +354,7 @@ async def _drain_single_conversation_queue(
             if not pending_queue:
                 return
 
-            batch = pending_queue[:]
-            pending_queue.clear()
+            batch = _pop_compatible_input_batch(pending_queue)
             in_flight_conversation_inputs[client_uid] = batch
             reply_started_flags[client_uid] = False
             workspace_work_flags[client_uid] = False
@@ -364,31 +401,14 @@ async def _drain_single_conversation_queue(
             )
             in_flight_conversation_inputs.pop(client_uid, None)
     finally:
-        current_conversation_tasks.pop(client_uid, None)
-        in_flight_conversation_inputs.pop(client_uid, None)
-        reply_started_flags.pop(client_uid, None)
-        workspace_work_flags.pop(client_uid, None)
-        if not pending_conversation_inputs.get(client_uid):
-            workspace_revision_flags.pop(client_uid, None)
-        if pending_conversation_inputs.get(client_uid):
-            logger.info(
-                f"Restarting conversation queue for {client_uid}; input arrived during drain shutdown."
-            )
-            current_conversation_tasks[client_uid] = asyncio.create_task(
-                _drain_single_conversation_queue(
-                    context=context,
-                    websocket_send=websocket_send,
-                    client_uid=client_uid,
-                    current_conversation_tasks=current_conversation_tasks,
-                    pending_conversation_inputs=pending_conversation_inputs,
-                    in_flight_conversation_inputs=in_flight_conversation_inputs,
-                    transcription_cache=transcription_cache,
-                    announced_transcription_ids=announced_transcription_ids,
-                    reply_started_flags=reply_started_flags,
-                    workspace_work_flags=workspace_work_flags,
-                    workspace_revision_flags=workspace_revision_flags,
-                )
-            )
+        current_task = asyncio.current_task()
+        if current_conversation_tasks.get(client_uid) is current_task:
+            current_conversation_tasks.pop(client_uid, None)
+            in_flight_conversation_inputs.pop(client_uid, None)
+            reply_started_flags.pop(client_uid, None)
+            workspace_work_flags.pop(client_uid, None)
+            if not pending_conversation_inputs.get(client_uid):
+                workspace_revision_flags.pop(client_uid, None)
 
 
 def _merge_metadata(items: List[Optional[Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
@@ -420,11 +440,10 @@ async def handle_individual_interrupt(
     context: ServiceContext,
     heard_response: str,
 ):
-    if client_uid in current_conversation_tasks:
-        task = current_conversation_tasks[client_uid]
-        if task and not task.done():
-            task.cancel()
-            logger.info("🛑 Conversation task was successfully interrupted")
+    task = current_conversation_tasks.get(client_uid)
+    if task:
+        await _cancel_conversation_task(client_uid, current_conversation_tasks)
+        logger.info("🛑 Conversation task was successfully interrupted")
 
         try:
             context.agent_engine.handle_interrupt(heard_response)
@@ -448,70 +467,30 @@ async def handle_individual_interrupt(
             )
 
 
-async def handle_group_interrupt(
-    group_id: str,
-    heard_response: str,
+async def _cancel_conversation_task(
+    client_uid: str,
     current_conversation_tasks: Dict[str, Optional[asyncio.Task]],
-    chat_group_manager: ChatGroupManager,
-    client_contexts: Dict[str, ServiceContext],
-    broadcast_to_group: Callable,
-) -> None:
-    """Handles interruption for a group conversation"""
-    task = current_conversation_tasks.get(group_id)
-    if not task or task.done():
-        return
+) -> Optional[asyncio.Task]:
+    """Cancel the task currently owned by a client and wait for its finalizer."""
+    task = current_conversation_tasks.get(client_uid)
+    if not task:
+        return None
 
-    # Get state and speaker info before cancellation
-    state = GroupConversationState.get_state(group_id)
-    current_speaker_uid = state.current_speaker_uid if state else None
+    if task is asyncio.current_task():
+        raise RuntimeError("A conversation worker cannot cancel itself")
 
-    # Get context from current speaker
-    context = None
-    group = chat_group_manager.get_group_by_id(group_id)
-    if current_speaker_uid:
-        context = client_contexts.get(current_speaker_uid)
-        logger.info(f"Found current speaker context for {current_speaker_uid}")
-    if not context and group and group.members:
-        logger.warning(f"No context found for group {group_id}, using first member")
-        context = client_contexts.get(next(iter(group.members)))
+    if not task.done():
+        task.cancel()
 
-    # Now cancel the task
-    task.cancel()
     try:
         await task
     except asyncio.CancelledError:
-        logger.info(f"🛑 Group conversation {group_id} cancelled successfully.")
+        pass
+    except Exception as exc:
+        logger.warning(
+            f"Conversation task for {client_uid} failed while being stopped: {exc}"
+        )
 
-    current_conversation_tasks.pop(group_id, None)
-    GroupConversationState.remove_state(group_id)  # Clean up state after we've used it
-
-    # Store messages with speaker info
-    if context and group:
-        for member_uid in group.members:
-            if member_uid in client_contexts:
-                try:
-                    member_ctx = client_contexts[member_uid]
-                    member_ctx.agent_engine.handle_interrupt(heard_response)
-                    store_message(
-                        conf_uid=member_ctx.character_config.conf_uid,
-                        history_uid=member_ctx.history_uid,
-                        role="ai",
-                        content=heard_response,
-                        name=context.character_config.character_name,
-                    )
-                    store_message(
-                        conf_uid=member_ctx.character_config.conf_uid,
-                        history_uid=member_ctx.history_uid,
-                        role="system",
-                        content="[Interrupted by user]",
-                    )
-                except Exception as e:
-                    logger.error(f"Error handling interrupt for {member_uid}: {e}")
-
-    await broadcast_to_group(
-        list(group.members),
-        {
-            "type": "interrupt-signal",
-            "text": "conversation-interrupted",
-        },
-    )
+    if current_conversation_tasks.get(client_uid) is task:
+        current_conversation_tasks.pop(client_uid, None)
+    return task

@@ -1,5 +1,4 @@
 import asyncio
-import os
 import re
 import threading
 from pathlib import Path
@@ -10,6 +9,7 @@ import torch
 from loguru import logger
 
 from .tts_interface import TTSInterface
+from ..utils.model_downloads import local_hf_snapshot
 
 
 STYLE_SPEED_MULTIPLIERS = {
@@ -25,43 +25,15 @@ def _project_models_dir() -> Path:
     return Path(__file__).resolve().parents[4] / "models" / "backend"
 
 
-def _local_hf_snapshot(repo_id: str) -> Optional[str]:
-    cache_root = Path(os.environ.get("HF_HOME") or _project_models_dir())
-    repo_cache = cache_root / "hub" / f"models--{repo_id.replace('/', '--')}"
-    ref_file = repo_cache / "refs" / "main"
-    if ref_file.exists():
-        revision = ref_file.read_text(encoding="utf-8").strip()
-        snapshot = repo_cache / "snapshots" / revision
-        if snapshot.is_dir():
-            return str(snapshot)
-    snapshots_dir = repo_cache / "snapshots"
-    if snapshots_dir.is_dir():
-        snapshots = [p for p in snapshots_dir.iterdir() if p.is_dir()]
-        if snapshots:
-            return str(snapshots[0])
-    return None
-
-
-def _download_hf_snapshot(repo_id: str) -> str:
-    from huggingface_hub import snapshot_download
-
-    cache_root = _project_models_dir()
-    cache_root.mkdir(parents=True, exist_ok=True)
-    os.environ["HF_HOME"] = str(cache_root)
-    return snapshot_download(repo_id=repo_id, cache_dir=str(cache_root / "hub"))
-
-
 def _ensure_hf_snapshot(repo_id: str) -> str:
-    snapshot = _local_hf_snapshot(repo_id)
+    snapshot = local_hf_snapshot(repo_id, _project_models_dir())
     if snapshot is not None:
-        logger.info(f"Using local model cache for {repo_id}: {snapshot}")
+        logger.info(f"Using verified pinned model cache for {repo_id}")
         return snapshot
-
-    logger.info(
-        f"Model {repo_id} was not found in local cache. "
-        "Downloading to MeloMate models/backend..."
+    raise RuntimeError(
+        f"Required voice-clone model is not installed: {repo_id}. "
+        "Run download-omnivoice-model.bat before enabling voice cloning."
     )
-    return _download_hf_snapshot(repo_id)
 
 
 class TTSEngine(TTSInterface):
@@ -95,22 +67,39 @@ class TTSEngine(TTSInterface):
         ref_text: Optional[str] = None,
         language: Optional[str] = None,
     ) -> None:
-        self.enabled = enabled
-        self.ref_audio_path = ref_audio_path
-        self.ref_text = ref_text or None
-        self.language = language or None
+        with self._sync_lock:
+            self.enabled = enabled
+            self.ref_audio_path = ref_audio_path
+            self.ref_text = ref_text or None
+            self.language = language or None
+            if not enabled:
+                self._release_model_locked()
+
+    def _release_model_locked(self) -> None:
+        """Release model state while the caller holds ``_sync_lock``."""
+        self._model = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _close_sync(self) -> None:
+        with self._sync_lock:
+            self.enabled = False
+            self.ref_audio_path = ""
+            self.ref_text = None
+            self.language = None
+            self._release_model_locked()
+
+    async def close(self) -> None:
+        """Release the optional model and reference data owned by this session."""
+        await asyncio.to_thread(self._close_sync)
 
     def is_ready(self) -> bool:
         return self.enabled and bool(self.ref_audio_path) and Path(self.ref_audio_path).exists()
 
     def prepare_model_cache(self) -> None:
-        """Download voice-clone models into the project cache if they are missing."""
+        """Verify that pinned voice-clone model snapshots are installed."""
         if not self.enabled:
             return
-
-        model_cache = _project_models_dir()
-        os.environ.setdefault("HF_HOME", str(model_cache))
-        os.environ.setdefault("MODELSCOPE_CACHE", str(model_cache))
         _ensure_hf_snapshot(self.model_name)
         _ensure_hf_snapshot("openai/whisper-large-v3-turbo")
 
@@ -119,9 +108,6 @@ class TTSEngine(TTSInterface):
             return self._model
 
         try:
-            model_cache = _project_models_dir()
-            os.environ.setdefault("HF_HOME", str(model_cache))
-            os.environ.setdefault("MODELSCOPE_CACHE", str(model_cache))
             from omnivoice import OmniVoice
             from omnivoice.utils.common import get_best_device
         except Exception as exc:
@@ -180,7 +166,7 @@ class TTSEngine(TTSInterface):
 
             logger.info(
                 f"Generating OmniVoice clone audio with style={voice_style_key}, "
-                f"speed={speed:.2f}, steps={self.num_step} for: {text[:80]}"
+                f"speed={speed:.2f}, steps={self.num_step}, text_chars={len(text)}"
             )
             audios = model.generate(
                 text=synth_text,

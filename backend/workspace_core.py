@@ -1,10 +1,14 @@
+import base64
+import hashlib
+import hmac
 import json
 import os
 import re
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+import webbrowser
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -26,6 +30,22 @@ def safe_name(value: str, fallback: str = "default") -> str:
     value = re.sub(r"\s+", "_", value)
     value = value.strip(" .")
     return value or fallback
+
+
+def workspace_access_token(persona: str) -> str:
+    """Create the same launch-scoped, persona-bound token as the frontend server."""
+    secret = os.getenv("MELOMATE_SESSION_TOKEN", "")
+    if not secret:
+        raise RuntimeError(
+            "Workspace files must be opened through the MeloMate launcher."
+        )
+    persona_name = safe_name(persona)
+    digest = hmac.new(
+        secret.encode("utf-8"),
+        f"melomate-workspace:{persona_name}".encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
 
 
 def ensure_inside(base: Path, target: Path) -> Path:
@@ -59,12 +79,6 @@ def workspace_path(persona: str, relative_path: str = "") -> Path:
 
 def response(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False)
-
-
-def safe_slug(value: str, fallback: str = "reminder") -> str:
-    slug = safe_name(value, fallback)
-    slug = re.sub(r"_+", "_", slug)[:36].strip("_")
-    return slug or fallback
 
 
 def create_workspace_folder(persona: str, folder: str) -> str:
@@ -209,53 +223,6 @@ def list_workspace(persona: str, folder: str = "") -> str:
     return response({"ok": True, "persona": safe_name(persona), "entries": entries})
 
 
-def schedule_reminder(persona: str, message: str, delay_minutes: float = 0, due_at: str = "") -> str:
-    now = datetime.now().astimezone()
-    if delay_minutes and delay_minutes > 0:
-        due_time = now + timedelta(minutes=float(delay_minutes))
-    elif due_at:
-        normalized_due_at = str(due_at).strip()
-        if normalized_due_at.endswith("Z"):
-            normalized_due_at = f"{normalized_due_at[:-1]}+00:00"
-        try:
-            due_time = datetime.fromisoformat(normalized_due_at)
-            if due_time.tzinfo is None:
-                due_time = due_time.astimezone()
-        except ValueError:
-            due_time = now
-    else:
-        due_time = now
-
-    reminder_text = str(message or "").strip()
-    if not reminder_text:
-        raise ValueError("message is required.")
-
-    reminder_dir = workspace_path(persona, "reminders/pending")
-    reminder_dir.mkdir(parents=True, exist_ok=True)
-
-    filename = f"{due_time.strftime('%Y%m%d-%H%M%S')}-{safe_slug(reminder_text)}.json"
-    target = ensure_inside(persona_root(persona), reminder_dir / filename)
-    payload = {
-        "type": "reminder",
-        "status": "pending",
-        "persona": safe_name(persona),
-        "message": reminder_text,
-        "created_at": now.isoformat(timespec="seconds"),
-        "due_at": due_time.isoformat(timespec="seconds"),
-        "source_time": "device-local-time",
-    }
-    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return response(
-        {
-            "ok": True,
-            "persona": safe_name(persona),
-            "path": target.relative_to(WORKSPACE_ROOT).as_posix(),
-            "due_at": payload["due_at"],
-            "message": reminder_text,
-        }
-    )
-
-
 def send_workspace_key(
     persona: str,
     key: str,
@@ -359,6 +326,14 @@ def state_page_id(state: dict[str, Any] | None) -> str:
     return str(page.get("id") or "") if isinstance(page, dict) else ""
 
 
+def state_version(state: dict[str, Any] | None) -> int:
+    value = state_payload(state).get("state_version")
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def state_protocol_available(state: dict[str, Any] | None) -> bool:
     payload = state_payload(state)
     return bool(payload.get("protocolAvailable") and payload.get("appState") is not None)
@@ -435,6 +410,8 @@ def send_workspace_action(
     action: str,
     payload: dict[str, Any] | None = None,
     wait_ms: int = 900,
+    expected_page_id: str = "",
+    expected_state_version: int | None = None,
 ) -> str:
     clean_action = str(action or "").strip()
     if not clean_action:
@@ -443,8 +420,32 @@ def send_workspace_action(
         raise ValueError("payload must be an object.")
 
     previous_state = read_workspace_state_file(persona)
+    current_page_id = state_page_id(previous_state)
+    current_version = state_version(previous_state)
+    if expected_page_id and current_page_id != str(expected_page_id):
+        return response(
+            {
+                "ok": False,
+                "sent": False,
+                "confirmed": False,
+                "stale": True,
+                "message": "STALE_WORKSPACE_STATE: the open page changed before the action was sent.",
+            }
+        )
+    if expected_state_version is not None and current_version != int(
+        expected_state_version
+    ):
+        return response(
+            {
+                "ok": False,
+                "sent": False,
+                "confirmed": False,
+                "stale": True,
+                "message": "STALE_WORKSPACE_STATE: the page state changed before the action was sent.",
+            }
+        )
     previous_updated_ms = state_updated_ms(previous_state)
-    page_id = state_page_id(previous_state)
+    page_id = current_page_id
     now = datetime.now().astimezone()
     command = {
         "id": uuid4().hex,
@@ -531,21 +532,30 @@ def open_workspace_item(persona: str, path: str) -> str:
         raise FileNotFoundError("workspace item was not found.")
 
     opened_url = ""
-    if target.is_file() and target.suffix.lower() == ".html":
+    if target.is_file():
         persona_name = safe_name(persona)
         relative_item = target.relative_to(persona_root(persona)).as_posix()
-        base_url = os.getenv("MELOMATE_FRONTEND_URL", "http://127.0.0.1:5178").rstrip("/")
-        opened_url = f"{base_url}/workspace-files/{quote(persona_name)}/{quote(relative_item, safe='/')}"
-        open_target = opened_url
+        base_url = os.getenv(
+            "MELOMATE_WORKSPACE_URL", "http://127.0.0.1:5179"
+        ).rstrip("/")
+        access_token = workspace_access_token(persona_name)
+        opened_url = (
+            f"{base_url}/workspace-files/{quote(persona_name)}/"
+            f"{access_token}/{quote(relative_item, safe='/')}"
+        )
+        if not webbrowser.open(opened_url):
+            raise RuntimeError("the workspace item could not be opened in a browser.")
     else:
-        open_target = str(target)
-
-    if sys.platform == "win32":
-        os.startfile(open_target)  # type: ignore[attr-defined]
-    elif sys.platform == "darwin":
-        subprocess.Popen(["open", open_target])
-    else:
-        subprocess.Popen(["xdg-open", open_target])
+        if sys.platform == "win32":
+            windows_root = Path(os.environ.get("WINDIR", r"C:\Windows"))
+            explorer = windows_root / "explorer.exe"
+            if not explorer.is_file():
+                raise RuntimeError("Windows Explorer was not found.")
+            subprocess.Popen([str(explorer), str(target)])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["/usr/bin/open", str(target)])
+        else:
+            subprocess.Popen(["/usr/bin/xdg-open", str(target)])
 
     branch = target.parent if target.is_file() else target
     return response(
@@ -553,7 +563,7 @@ def open_workspace_item(persona: str, path: str) -> str:
             "ok": True,
             "persona": safe_name(persona),
             "opened": True,
-            "url": opened_url,
+            "url": "",
             "branch": branch.relative_to(WORKSPACE_ROOT).as_posix(),
         }
     )

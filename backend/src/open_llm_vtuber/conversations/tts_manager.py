@@ -22,6 +22,8 @@ STYLE_SPEED_MULTIPLIERS = {
     "excited": 1.16,
 }
 
+TTS_DRAIN_TIMEOUT_SECONDS = 30.0
+
 
 def select_voice_style(text: str, voice_style: Optional[Dict[str, str]]) -> Tuple[str, Optional[str]]:
     if not voice_style:
@@ -55,9 +57,10 @@ class TTSTaskManager:
         self.task_list: List[asyncio.Task] = []
         self._lock = asyncio.Lock()
         # Queue to store ordered payloads
-        self._payload_queue: asyncio.Queue[Dict] = asyncio.Queue()
+        self._payload_queue: asyncio.Queue[Tuple[Dict, int]] = asyncio.Queue()
         # Task to handle sending payloads in order
         self._sender_task: Optional[asyncio.Task] = None
+        self._sender_error: Optional[Exception] = None
         # Counter for maintaining order
         self._sequence_counter = 0
         self._next_sequence_to_send = 0
@@ -91,6 +94,7 @@ class TTSTaskManager:
 
             # Start sender task if not running
             if not self._sender_task or self._sender_task.done():
+                self._sender_error = None
                 self._sender_task = asyncio.create_task(
                     self._process_payload_queue(websocket_send)
                 )
@@ -109,6 +113,7 @@ class TTSTaskManager:
 
         # Start sender task if not running
         if not self._sender_task or self._sender_task.done():
+            self._sender_error = None
             self._sender_task = asyncio.create_task(
                 self._process_payload_queue(websocket_send)
             )
@@ -136,9 +141,9 @@ class TTSTaskManager:
         buffered_payloads: Dict[int, Dict] = {}
 
         while True:
+            # Get payload from queue
+            payload, sequence_number = await self._payload_queue.get()
             try:
-                # Get payload from queue
-                payload, sequence_number = await self._payload_queue.get()
                 buffered_payloads[sequence_number] = payload
 
                 # Send payloads in order
@@ -146,11 +151,11 @@ class TTSTaskManager:
                     next_payload = buffered_payloads.pop(self._next_sequence_to_send)
                     await websocket_send(json.dumps(next_payload))
                     self._next_sequence_to_send += 1
-
+            except Exception as exc:
+                self._sender_error = exc
+                raise
+            finally:
                 self._payload_queue.task_done()
-
-            except asyncio.CancelledError:
-                break
 
     async def _send_silent_payload(
         self,
@@ -217,7 +222,7 @@ class TTSTaskManager:
         voice_style_prompt: Optional[str] = None,
     ) -> str:
         """Generate audio file from text"""
-        logger.debug(f"🏃Generating audio for '''{text}'''...")
+        logger.debug(f"Generating audio (chars={len(text)})")
         kwargs = {
             "text": text,
             "file_name_no_ext": f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid.uuid4())[:8]}",
@@ -229,12 +234,75 @@ class TTSTaskManager:
             kwargs["voice_style_key"] = voice_style_key
         return await tts_engine.async_generate_audio(**kwargs)
 
-    def clear(self) -> None:
-        """Clear all pending tasks and reset state"""
-        self.task_list.clear()
+    async def finish(self, timeout: float = TTS_DRAIN_TIMEOUT_SECONDS) -> None:
+        """Wait until every generated payload has actually been sent."""
+        if self.task_list:
+            await asyncio.gather(*self.task_list)
+
+        if self._sender_task and self._sender_task.done():
+            await self._sender_task
+
+        queue_join_task = asyncio.create_task(self._payload_queue.join())
+        wait_targets = {queue_join_task}
         if self._sender_task:
-            self._sender_task.cancel()
+            wait_targets.add(self._sender_task)
+
+        done, _ = await asyncio.wait(
+            wait_targets,
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            queue_join_task.cancel()
+            await asyncio.gather(queue_join_task, return_exceptions=True)
+            raise TimeoutError("Timed out while sending generated TTS payloads")
+
+        if self._sender_task and self._sender_task in done:
+            sender_stopped_before_drain = not queue_join_task.done()
+            try:
+                await self._sender_task
+            finally:
+                if not queue_join_task.done():
+                    queue_join_task.cancel()
+                    await asyncio.gather(queue_join_task, return_exceptions=True)
+            if sender_stopped_before_drain:
+                raise RuntimeError("TTS payload sender stopped before the queue drained")
+
+        await queue_join_task
+        if self._sender_error is not None:
+            sender_error = self._sender_error
+            if self._sender_task:
+                await asyncio.gather(self._sender_task, return_exceptions=True)
+            raise RuntimeError("Failed to send a generated TTS payload") from sender_error
+        if self._sender_task and self._sender_task.done():
+            await self._sender_task
+
+    async def clear(self) -> None:
+        """Cancel all pending work, await shutdown, and reset state."""
+        tasks = list(self.task_list)
+        self.task_list.clear()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        sender_task = self._sender_task
+        self._sender_task = None
+        if sender_task and not sender_task.done():
+            sender_task.cancel()
+        if sender_task:
+            await asyncio.gather(sender_task, return_exceptions=True)
+
+        while True:
+            try:
+                self._payload_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                self._payload_queue.task_done()
+
         self._sequence_counter = 0
         self._next_sequence_to_send = 0
-        # Create a new queue to clear any pending items
+        self._sender_error = None
         self._payload_queue = asyncio.Queue()

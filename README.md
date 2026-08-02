@@ -14,63 +14,121 @@ This repository is the **source edition**. It is intended for development, GitHu
 Optional:
 
 - Voicemeeter Pro, if you want the extra virtual audio output controls.
-- Backend ASR/TTS models for fully local speech features.
+- OmniVoice voice cloning. The normal microphone, speech recognition, LLM, and
+  configured TTS path do not require its PyTorch packages.
 
 ## Quick Start
 
-For Windows users, run the setup script from the project root:
+Install 64-bit Python 3.11 and Node.js 20 or newer first. Make sure both
+`python` and `node` are available in a new Command Prompt, then run the single
+installer from the project root:
 
 ```bash
 setup-windows.bat
 ```
 
-This installs frontend dependencies, creates `backend/.venv`, and installs backend Python dependencies from `backend/requirements.txt`.
+The installer always installs and verifies the common application first. It
+then asks:
 
-Then build and run:
+- `Install voice cloning now? [Y/N]`
+- Choose `N` for the smaller normal installation. Setup finishes without
+  PyTorch, OmniVoice, or the cloning models.
+- Choose `Y` to continue in the same installer. If an NVIDIA GPU is detected,
+  choose `G` for CUDA 12.8 or `C` for CPU. Without an NVIDIA driver, CPU mode is
+  selected automatically.
+
+The optional download is large and can take a while. Do not close the window
+until it reports `Setup finished successfully`. The script also builds the
+frontend, so no separate build command is needed.
+
+Configure the LLM provider/API key in `backend/conf.yaml` (or in the app's
+settings), then start MeloMate:
 
 ```bash
-npm run build
 start.bat
 ```
 
-For NVIDIA GPU voice cloning, use the GPU setup script instead. It installs the
-normal dependencies first, then replaces PyTorch with the CUDA 12.8 build:
+Open the address below if the browser does not open automatically:
 
-```bash
-setup-windows-gpu.bat
+```text
+http://127.0.0.1:5178/
 ```
 
-This is required for RTX 50 series cards such as RTX 5070. If the GPU check
-prints `cuda available: False`, install the latest NVIDIA driver or use the
-normal CPU setup.
+Device choices, API endpoints, and model names are remembered by the local
+browser profile. Chat and screen-vision API keys are never written to browser
+storage or the project directory. On Windows, applying settings stores only
+current-user-bound DPAPI ciphertext in
+`%LOCALAPPDATA%\MeloMate\credentials-v1.json`; saved keys are loaded directly
+inside the backend and are not returned to the page. Use the **Clear** button
+beside either key to remove its saved credential. Feature switches still start
+off on every new page load.
 
-Before using OmniVoice voice cloning for the first time, download the model:
+`start.bat` never terminates an existing port owner. It checks the configured
+frontend and backend ports before launch, starts only its own child processes,
+verifies both services with a per-launch identity token, and opens the browser
+only after both services are ready. If a port is occupied, close the owning
+application or choose another port; MeloMate exits without touching it.
 
-```bash
-download-omnivoice-model.bat
+To change the frontend port for one launch:
+
+```bat
+set MELOMATE_FRONTEND_PORT=5180
+start.bat
 ```
 
-When voice cloning is enabled, MeloMate checks `models/backend` first. If the
-models are missing, it downloads both `k2-fsa/OmniVoice` and
-`openai/whisper-large-v3-turbo` into `models/backend`, then loads them from the
-local cache. Whisper is used to transcribe the reference audio automatically.
+The launcher opens the selected frontend port automatically. The backend port
+comes from `system_config.port` in `backend/conf.yaml`, and the browser receives
+the matching WebSocket address at runtime. The two ports must be different.
+
+You can rerun `setup-windows.bat` later and choose `Y` to add voice cloning to
+the same installation. `setup-windows-gpu.bat` remains only as a compatibility
+shortcut that preselects the NVIDIA option; the main installer is recommended.
+
+`download-omnivoice-model.bat` is a repair/redownload helper. The main installer
+already calls it when voice cloning is selected, so it is not a normal extra
+installation step.
+
+All runtime models are local-first and pinned to tested versions; MeloMate does
+not require the latest Hugging Face revision. To avoid a long Hugging Face
+download, download all three `MeloMate-Model-Cache.7z.001/.002/.003` parts from
+the [`v1.0.0-models` Release](https://github.com/misheng521/MeloMate/releases/tag/v1.0.0-models),
+extract `.001` into `models/backend/`, and then run the normal installer. The
+installer verifies and reuses the extracted local OmniVoice and Whisper cache.
+
+The default microphone ASR uses SenseVoice. You can either let MeloMate fetch
+its two fixed, SHA-256-verified files, or download the fixed archive from the
+[`models-v0.1.0` Release](https://github.com/misheng521/MeloMate/releases/tag/models-v0.1.0),
+place it in the project root, and run `install-sensevoice-model.bat`. The script
+checks the Release archive hash, rejects unsafe archive paths and links,
+extracts into a temporary directory, verifies both model files, and installs
+them atomically.
+
+For unattended installation, these environment variables are supported:
+
+```bat
+set MELOMATE_VOICE_CLONE=0
+set MELOMATE_NO_PAUSE=1
+setup-windows.bat
+```
+
+Use `MELOMATE_VOICE_CLONE=1` together with
+`MELOMATE_VOICE_CLONE_DEVICE=cpu` or `gpu` to install the optional feature
+without prompts.
 
 If you prefer to install manually, run:
 
 ```bash
-npm install
+npm ci
 cd backend
 python -m venv .venv
 .venv\Scripts\python -m pip install --upgrade pip
 .venv\Scripts\python -m pip install -r requirements.txt
 cd ..
+npm run build
 ```
 
-The default app URL is:
-
-```text
-http://127.0.0.1:5178/
-```
+Manual commands above install only the common application. Use the unified
+installer for validated voice-cloning installation and model download.
 
 ## Development
 
@@ -79,6 +137,12 @@ Frontend development server:
 ```bash
 npm run dev
 ```
+
+The Vite development server is a developer tool, not the production runtime.
+Its custom middleware is implemented separately from `server.mjs`; production-
+only APIs such as Voicemeeter control and the complete workspace event behavior
+may therefore be unavailable or behave differently under `npm run dev`. Use
+`start.bat` for end-to-end acceptance testing and normal use.
 
 Backend development server:
 

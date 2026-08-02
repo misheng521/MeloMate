@@ -18,7 +18,6 @@ type SavedSettings = {
   voiceChatOutputEnabled?: boolean;
   voiceChatOutputDeviceId?: string;
   voiceCloneEnabled?: boolean;
-  referenceAudioName?: string;
   screenVisionEnabled?: boolean;
   screenVisionEndpoint?: string;
   screenVisionModel?: string;
@@ -29,7 +28,7 @@ type SavedSettings = {
 };
 
 type MicVadInstance = {
-  start: () => void;
+  start: () => void | Promise<void>;
   pause: () => void;
   destroy: () => void;
 };
@@ -51,17 +50,31 @@ type WsMessage = {
   texts?: string[];
   input_id?: string;
   turn_id?: string;
+  request_id?: string;
   message?: string;
+  reason?: string;
+  status?: string;
+  page_id?: string;
+  state_version?: number;
+  action?: string;
   audio?: string | null;
   volumes?: number[];
   slice_length?: number;
   display_text?: DisplayText;
-  forwarded?: boolean;
   conf_name?: string;
   character_name?: string;
   client_uid?: string;
   success?: boolean;
   enabled?: boolean;
+  available?: boolean;
+  chat_api_key_saved?: boolean;
+  screen_vision_api_key_saved?: boolean;
+  chat_config_applied?: boolean;
+  cleared?: "chat" | "screen_vision";
+  capabilities?: {
+    voice_clone?: boolean;
+    voice_clone_missing?: string[];
+  };
   configs?: CharacterConfigOption[];
 };
 
@@ -80,6 +93,7 @@ type WorkspaceEvent = {
   id: string;
   type: "workspace-state-changed" | "workspace-page-closed";
   created_ms: number;
+  state_version?: number;
   persona?: string;
   page?: { id?: string; title?: string; path?: string; closed?: boolean };
   appState?: unknown;
@@ -113,10 +127,18 @@ type AssetPanelTab = "background" | "character" | "workspace";
 declare global {
   interface Window {
     vad?: VadModule;
+    __MELOMATE_RUNTIME_CONFIG__?: {
+      backendWsUrl?: string;
+      sessionToken?: string;
+      workspaceBaseUrl?: string;
+    };
   }
 }
 
 const settingsStorageKey = "melomate-settings";
+const credentialProfileStorageKey = "melomate-credential-profile";
+const maxVoiceCloneReferenceBytes = 10 * 1024 * 1024;
+const allowedVoiceCloneReferenceExtensions = new Set([".wav", ".mp3", ".flac", ".ogg"]);
 const backgroundManifestUrl = "/api/backgrounds";
 const live2DModelManifestUrl = "/api/live2d-models";
 const workspaceManifestUrl = "/api/workspace";
@@ -144,14 +166,35 @@ const fallbackLive2DModelOptions: Live2DModelOption[] = [
 ];
 let live2dModelOptions: Live2DModelOption[] = fallbackLive2DModelOptions;
 const referenceAudioDbName = "melomate-reference-audio";
-const referenceAudioStoreName = "files";
-const referenceAudioRecordKey = "last-reference";
 const moonshotApiEndpoint = "https://api.moonshot.cn/v1";
 const defaultApiEndpoint = "https://api.deepseek.com";
 const defaultModel = "deepseek-chat";
 const defaultScreenVisionEndpoint = moonshotApiEndpoint;
 const defaultScreenVisionModel = "moonshot-v1-8k-vision-preview";
-const openLlmWsUrl = "ws://127.0.0.1:12393/client-ws";
+const appSessionToken = window.__MELOMATE_RUNTIME_CONFIG__?.sessionToken?.trim() || "";
+const workspaceBaseUrl =
+  window.__MELOMATE_RUNTIME_CONFIG__?.workspaceBaseUrl?.trim().replace(/\/$/, "") || "http://127.0.0.1:5179";
+
+function authenticatedFetch(input: RequestInfo | URL, init: RequestInit = {}) {
+  const headers = new Headers(init.headers);
+  if (appSessionToken) headers.set("X-MeloMate-Session", appSessionToken);
+  return fetch(input, { ...init, headers });
+}
+
+function backendWebSocketUrl() {
+  const fallback = "ws://127.0.0.1:12393/client-ws";
+  const configured = window.__MELOMATE_RUNTIME_CONFIG__?.backendWsUrl?.trim();
+  if (!configured) return fallback;
+  try {
+    const url = new URL(configured);
+    return url.protocol === "ws:" || url.protocol === "wss:" ? url.toString() : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+const openLlmWsUrl = backendWebSocketUrl();
+const backendWebSocketProtocols = appSessionToken ? [`melomate.session.${appSessionToken}`] : [];
 const websocketReconnectDelays = [400, 800, 1200, 2000, 3000];
 const vadChunkSize = 4096;
 const vadSampleRate = 16000;
@@ -164,7 +207,7 @@ const screenVisionJpegQuality = 0.85;
 const defaultProactiveIdleSeconds = "120";
 const proactiveSpeakCheckIntervalMs = 10_000;
 const proactiveSpeakChance = 0.35;
-const workspaceEventPollMs = 700;
+const workspaceEventLongPollMs = 15_000;
 const preferredVoiceChatOutputDevicePattern = /^voicemeeter\s+input\b/i;
 const voiceChatOutputDevicePattern = /voicemeeter\s+(input|in\s*\d+|aux\s+input|vaio3\s+input)|vb-audio\s+voicemeeter\s+vaio/i;
 const voiceChatMicDevicePattern = /voicemeeter\s+out\s*b2|out\s*b2.*voicemeeter|voicemeeter.*b2/i;
@@ -186,15 +229,20 @@ const endpointInput = document.querySelector<HTMLInputElement>("#endpoint")!;
 const modelInput = document.querySelector<HTMLInputElement>("#model")!;
 const apiKeyInput = document.querySelector<HTMLInputElement>("#apiKey")!;
 const toggleApiKey = document.querySelector<HTMLButtonElement>("#toggleApiKey")!;
+const clearApiKey = document.querySelector<HTMLButtonElement>("#clearApiKey")!;
+const apiKeyHint = document.querySelector<HTMLParagraphElement>("#apiKeyHint")!;
 const screenVisionToggle = document.querySelector<HTMLInputElement>("#screenVisionToggle")!;
 const screenVisionEndpointInput = document.querySelector<HTMLInputElement>("#screenVisionEndpoint")!;
 const screenVisionModelInput = document.querySelector<HTMLInputElement>("#screenVisionModel")!;
 const screenVisionApiKeyInput = document.querySelector<HTMLInputElement>("#screenVisionApiKey")!;
 const toggleScreenVisionApiKey = document.querySelector<HTMLButtonElement>("#toggleScreenVisionApiKey")!;
+const clearScreenVisionApiKey = document.querySelector<HTMLButtonElement>("#clearScreenVisionApiKey")!;
+const screenVisionApiKeyHint = document.querySelector<HTMLParagraphElement>("#screenVisionApiKeyHint")!;
 const screenVisionIntervalInput = document.querySelector<HTMLInputElement>("#screenVisionInterval")!;
 const proactiveSpeakToggle = document.querySelector<HTMLInputElement>("#proactiveSpeakToggle")!;
 const proactiveIdleSecondsInput = document.querySelector<HTMLInputElement>("#proactiveIdleSeconds")!;
 const voiceCloneToggle = document.querySelector<HTMLInputElement>("#voiceCloneToggle")!;
+const voiceCloneAvailabilityHint = document.querySelector<HTMLParagraphElement>("#voiceCloneAvailabilityHint")!;
 const referenceAudioInput = document.querySelector<HTMLInputElement>("#referenceAudioInput")!;
 const referenceAudioPlayer = document.querySelector<HTMLAudioElement>("#referenceAudioPlayer")!;
 const referenceAudioName = document.querySelector<HTMLSpanElement>("#referenceAudioName")!;
@@ -230,6 +278,7 @@ let micStream: MediaStream | null = null;
 let vadInstance: MicVadInstance | null = null;
 let ws: WebSocket | null = null;
 let isCapturing = false;
+let isCaptureStarting = false;
 let isWsReady = false;
 let websocketReconnectTimer = 0;
 let websocketReconnectAttempt = 0;
@@ -242,9 +291,11 @@ let lastAssistantLine: HTMLParagraphElement | null = null;
 let outputVolume = 1;
 let savedSettings: SavedSettings | null = null;
 let audioQueue: Promise<void> = Promise.resolve();
-let backendSynthComplete = false;
+let pendingPlaybackCompletion: { requestId: string; turnId?: string; queueVersion: number } | null = null;
+const acknowledgedPlaybackRequestIds = new Set<string>();
 let lastAssistantText = "";
 let heardAssistantText = "";
+const pendingWorkspaceDialogues: string[] = [];
 let audioQueueVersion = 0;
 let isAssistantResponding = false;
 let isUserSpeaking = false;
@@ -256,6 +307,18 @@ let activeAssistantTurnId = "";
 let referenceAudioBlob: Blob | null = null;
 let referenceAudioStoredName = "";
 let referenceAudioObjectUrl = "";
+let voiceCloneCapability: boolean | null = null;
+const pendingVoiceCloneRequests = new Map<
+  string,
+  { resolve: (success: boolean) => void; timeoutId: number }
+>();
+const pendingCredentialRequests = new Map<
+  string,
+  { resolve: (success: boolean) => void; timeoutId: number }
+>();
+let savedChatApiKeyAvailable = false;
+let savedScreenVisionApiKeyAvailable = false;
+let credentialStatusInitialized = false;
 let backgroundOptions: BackgroundOption[] = [];
 let characterOptions: CharacterConfigOption[] = [];
 let activeAssetPanelTab: AssetPanelTab = "background";
@@ -263,9 +326,8 @@ let currentWorkspaceFolder = "";
 let expandedWorkspaceFolders = new Set<string>();
 let workspaceEntriesCache = new Map<string, WorkspaceEntry[]>();
 let workspaceControlStatus: WorkspaceControlStatus = { label: "未连接", tone: "missing" };
-let workspaceEventTimer = 0;
+let workspaceEventAbortController: AbortController | null = null;
 let lastWorkspaceEventMs = Date.now();
-let workspaceBroadcastChannel: BroadcastChannel | null = null;
 const handledWorkspaceEventIds = new Set<string>();
 let lastAppliedCharacterConfigFile = "";
 let currentAssistantName = "小可";
@@ -307,11 +369,55 @@ function currentTime() {
 function readSavedSettings(): SavedSettings | null {
   try {
     const rawValue = localStorage.getItem(settingsStorageKey);
-    return rawValue ? (JSON.parse(rawValue) as SavedSettings) : null;
+    if (!rawValue) return null;
+    const parsed = JSON.parse(rawValue) as SavedSettings;
+    const {
+      apiKey: _legacyApiKey,
+      screenVisionApiKey: _legacyVisionApiKey,
+      referenceAudioName: _legacyReferenceAudioName,
+      ...safeSettings
+    } = parsed as SavedSettings & { referenceAudioName?: string };
+    if (
+      Object.prototype.hasOwnProperty.call(parsed, "apiKey") ||
+      Object.prototype.hasOwnProperty.call(parsed, "screenVisionApiKey") ||
+      Object.prototype.hasOwnProperty.call(parsed, "referenceAudioName")
+    ) {
+      localStorage.setItem(settingsStorageKey, JSON.stringify(safeSettings));
+    }
+    return {
+      ...safeSettings,
+      apiKey: "",
+      screenVisionApiKey: "",
+    };
   } catch (error) {
     console.warn(error);
     return null;
   }
+}
+
+function credentialProfileId() {
+  try {
+    const existing = localStorage.getItem(credentialProfileStorageKey)?.trim() || "";
+    if (/^[A-Za-z0-9_-]{20,128}$/.test(existing)) return existing;
+    const generated =
+      typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : Array.from(crypto.getRandomValues(new Uint8Array(24)), (value) => value.toString(16).padStart(2, "0")).join("");
+    localStorage.setItem(credentialProfileStorageKey, generated);
+    return generated;
+  } catch {
+    return typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `temporary-${Date.now()}-${Math.random().toString(16).slice(2).padEnd(20, "0")}`;
+  }
+}
+
+const localCredentialProfileId = credentialProfileId();
+
+function persistSavedSettings() {
+  if (!savedSettings) return;
+  const { apiKey: _apiKey, screenVisionApiKey: _screenVisionApiKey, ...safeSettings } = savedSettings;
+  localStorage.setItem(settingsStorageKey, JSON.stringify(safeSettings));
 }
 
 function normalizeStartupSettings(settings: SavedSettings | null): SavedSettings | null {
@@ -368,6 +474,42 @@ function syncSecretToggle(input: HTMLInputElement, button: HTMLButtonElement) {
   button.setAttribute("aria-label", shouldShow ? "隐藏 API Key" : "显示 API Key");
 }
 
+function syncCredentialUi() {
+  apiKeyInput.placeholder = savedChatApiKeyAvailable
+    ? "已由 Windows 加密保存；留空继续使用"
+    : "请输入 API Key";
+  screenVisionApiKeyInput.placeholder = savedScreenVisionApiKeyAvailable
+    ? "已由 Windows 加密保存；留空继续使用"
+    : "请输入识图 API Key";
+  apiKeyHint.textContent = savedChatApiKeyAvailable
+    ? "已绑定当前 Windows 用户安全保存，不会写入浏览器或工作区。"
+    : "Key 不会写入浏览器；应用后由 Windows 当前用户加密保存。";
+  screenVisionApiKeyHint.textContent = savedScreenVisionApiKeyAvailable
+    ? "已绑定当前 Windows 用户安全保存，不会回传给页面。"
+    : "Key 不会写入浏览器；应用后由 Windows 当前用户加密保存。";
+  clearApiKey.disabled = isSettingsReadOnly || !savedChatApiKeyAvailable;
+  clearScreenVisionApiKey.disabled = isSettingsReadOnly || !savedScreenVisionApiKeyAvailable;
+}
+
+function validateChatApiSettings() {
+  if (!endpointInput.value.trim()) {
+    appendLine("system", "请先填写聊天 API 地址。");
+    openSettingsPanel();
+    return false;
+  }
+  if (!modelInput.value.trim()) {
+    appendLine("system", "请先填写聊天模型。");
+    openSettingsPanel();
+    return false;
+  }
+  if (!apiKeyInput.value.trim() && !savedChatApiKeyAvailable) {
+    appendLine("system", "请先填写聊天 API Key。");
+    openSettingsPanel();
+    return false;
+  }
+  return true;
+}
+
 function currentSettings(): SavedSettings {
   return {
     micId: micSelect.value,
@@ -382,8 +524,6 @@ function currentSettings(): SavedSettings {
     voiceChatOutputEnabled: voiceChatOutputToggle.checked && !voiceChatOutputToggle.disabled,
     voiceChatOutputDeviceId: voiceChatOutputSelect.value,
     voiceCloneEnabled: voiceCloneToggle.checked,
-    referenceAudioName:
-      referenceAudioInput.files?.[0]?.name || referenceAudioStoredName || savedSettings?.referenceAudioName || "",
     screenVisionEnabled: screenVisionToggle.checked,
     screenVisionEndpoint: normalizeScreenVisionEndpoint(screenVisionEndpointInput.value),
     screenVisionModel: normalizeScreenVisionModel(screenVisionModelInput.value),
@@ -396,7 +536,7 @@ function currentSettings(): SavedSettings {
 
 function saveSettings() {
   savedSettings = currentSettings();
-  localStorage.setItem(settingsStorageKey, JSON.stringify(savedSettings));
+  persistSavedSettings();
 }
 
 function saveBackground(url: string) {
@@ -404,7 +544,7 @@ function saveBackground(url: string) {
     ...(savedSettings || currentSettings()),
     backgroundUrl: url,
   };
-  localStorage.setItem(settingsStorageKey, JSON.stringify(savedSettings));
+  persistSavedSettings();
 }
 
 function setVideoBackground(url: string) {
@@ -447,7 +587,7 @@ function setAssetPanelTab(tab: AssetPanelTab, shouldOpen = true) {
 
 async function readBackgroundOptions() {
   try {
-    const response = await fetch(backgroundManifestUrl, { cache: "no-store" });
+    const response = await authenticatedFetch(backgroundManifestUrl, { cache: "no-store" });
     if (!response.ok) throw new Error(`Background manifest failed: ${response.status}`);
     const data = (await response.json()) as { backgrounds?: BackgroundOption[] };
     return data.backgrounds?.length ? data.backgrounds : fallbackBackgrounds;
@@ -518,14 +658,14 @@ async function readWorkspaceEntries(folder = currentWorkspaceFolder) {
     persona: workspacePersonaName(),
     folder,
   });
-  const response = await fetch(`${workspaceManifestUrl}?${params.toString()}`, { cache: "no-store" });
+  const response = await authenticatedFetch(`${workspaceManifestUrl}?${params.toString()}`, { cache: "no-store" });
   if (!response.ok) throw new Error(`工作区加载失败：${response.status}`);
   return (await response.json()) as { entries?: WorkspaceEntry[]; folder?: string };
 }
 
 async function readWorkspaceControlStatus(): Promise<WorkspaceControlStatus> {
   const params = new URLSearchParams({ persona: workspacePersonaName() });
-  const response = await fetch(`${workspaceStateUrl}?${params.toString()}`, { cache: "no-store" });
+  const response = await authenticatedFetch(`${workspaceStateUrl}?${params.toString()}`, { cache: "no-store" });
   if (!response.ok) return { label: "未连接", tone: "missing" };
   const data = (await response.json()) as { state?: { updated_ms?: number; state?: { protocolAvailable?: boolean } } | null };
   if (!data.state) return { label: "未连接", tone: "missing" };
@@ -536,14 +676,36 @@ async function readWorkspaceControlStatus(): Promise<WorkspaceControlStatus> {
   return { label: "可控制", tone: "ready" };
 }
 
-function workspaceFileUrl(path: string) {
-  const persona = encodeURIComponent(workspacePersonaName());
-  const filePath = path
-    .split("/")
-    .filter(Boolean)
-    .map((part) => encodeURIComponent(part))
-    .join("/");
-  return `/workspace-files/${persona}/${filePath}`;
+async function workspaceFileUrl(path: string) {
+  const params = new URLSearchParams({
+    persona: workspacePersonaName(),
+    path,
+  });
+  const response = await authenticatedFetch(`/api/workspace-open-url?${params.toString()}`, {
+    cache: "no-store",
+  });
+  if (!response.ok) throw new Error(`工作区文件地址创建失败：${response.status}`);
+  const payload = (await response.json()) as { url?: string };
+  if (!payload.url || !payload.url.startsWith(`${workspaceBaseUrl}/workspace-files/`)) {
+    throw new Error("工作区文件地址无效");
+  }
+  return payload.url;
+}
+
+async function openWorkspaceFile(path: string) {
+  const target = window.open("about:blank", "_blank");
+  if (!target) {
+    appendLine("system", "浏览器阻止了工作区窗口，请允许此页面打开弹窗后重试。");
+    return;
+  }
+  target.opener = null;
+  try {
+    target.location.replace(await workspaceFileUrl(path));
+  } catch (error) {
+    target.close();
+    appendLine("system", "工作区文件打开失败，请刷新工作区列表后重试。");
+    console.warn(error);
+  }
 }
 
 function clearWorkspaceCache() {
@@ -600,12 +762,14 @@ function renderWorkspaceEntry(entry: WorkspaceEntry, depth = 0) {
     arrow.classList.toggle("expanded", isExpanded);
     row.setAttribute("aria-expanded", String(isExpanded));
     row.addEventListener("click", () => {
+      sendWs({ type: "workspace-item-viewed", path: entry.path });
       void toggleWorkspaceFolder(entry.path);
     });
   } else {
     arrow.textContent = "";
     row.addEventListener("click", () => {
-      window.open(workspaceFileUrl(entry.path), "_blank", "noopener");
+      sendWs({ type: "workspace-item-viewed", path: entry.path });
+      void openWorkspaceFile(entry.path);
     });
   }
 
@@ -701,7 +865,7 @@ function saveLive2DModel(id: string) {
     ...(savedSettings || currentSettings()),
     live2dModelId: id,
   };
-  localStorage.setItem(settingsStorageKey, JSON.stringify(savedSettings));
+  persistSavedSettings();
 }
 
 function syncLive2DModelActiveState() {
@@ -752,7 +916,7 @@ function live2DModelJsonUrl(option: Live2DModelOption) {
 
 async function readLive2DModelOptions() {
   try {
-    const response = await fetch(live2DModelManifestUrl, { cache: "no-store" });
+    const response = await authenticatedFetch(live2DModelManifestUrl, { cache: "no-store" });
     if (!response.ok) throw new Error(`Live2D manifest failed: ${response.status}`);
     const data = (await response.json()) as { models?: Live2DModelOption[] };
     const models = data.models?.filter((option) => option.id && option.directory && option.fileName);
@@ -876,70 +1040,22 @@ function readReferenceAudioAsDataUrl(file: Blob): Promise<string> {
   });
 }
 
-function openReferenceAudioDb(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(referenceAudioDbName, 1);
-    request.addEventListener("upgradeneeded", () => {
-      request.result.createObjectStore(referenceAudioStoreName);
-    });
-    request.addEventListener("success", () => resolve(request.result));
-    request.addEventListener("error", () => reject(request.error || new Error("Reference audio DB failed.")));
-  });
-}
-
-async function readStoredReferenceAudio(): Promise<{ name: string; type: string; blob: Blob } | null> {
-  const db = await openReferenceAudioDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(referenceAudioStoreName, "readonly");
-    const request = tx.objectStore(referenceAudioStoreName).get(referenceAudioRecordKey);
-    request.addEventListener("success", () => {
-      const value = request.result as { name: string; type: string; blob: Blob } | undefined;
-      resolve(value || null);
-      db.close();
-    });
+function purgeLegacyReferenceAudioStorage(): Promise<void> {
+  return new Promise((resolve) => {
+    if (!("indexedDB" in window)) {
+      resolve();
+      return;
+    }
+    const request = indexedDB.deleteDatabase(referenceAudioDbName);
+    request.addEventListener("success", () => resolve(), { once: true });
     request.addEventListener("error", () => {
-      reject(request.error || new Error("Reference audio read failed."));
-      db.close();
-    });
-  });
-}
-
-async function writeStoredReferenceAudio(file: File) {
-  const db = await openReferenceAudioDb();
-  return new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(referenceAudioStoreName, "readwrite");
-    tx.objectStore(referenceAudioStoreName).put(
-      {
-        name: file.name,
-        type: file.type || "audio/wav",
-        blob: file,
-      },
-      referenceAudioRecordKey,
-    );
-    tx.addEventListener("complete", () => {
+      console.warn(request.error || new Error("Legacy reference audio cleanup failed."));
       resolve();
-      db.close();
-    });
-    tx.addEventListener("error", () => {
-      reject(tx.error || new Error("Reference audio save failed."));
-      db.close();
-    });
-  });
-}
-
-async function deleteStoredReferenceAudio() {
-  const db = await openReferenceAudioDb();
-  return new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(referenceAudioStoreName, "readwrite");
-    tx.objectStore(referenceAudioStoreName).delete(referenceAudioRecordKey);
-    tx.addEventListener("complete", () => {
+    }, { once: true });
+    request.addEventListener("blocked", () => {
+      console.warn("Legacy reference audio cleanup is waiting for another old MeloMate tab to close.");
       resolve();
-      db.close();
-    });
-    tx.addEventListener("error", () => {
-      reject(tx.error || new Error("Reference audio delete failed."));
-      db.close();
-    });
+    }, { once: true });
   });
 }
 
@@ -963,29 +1079,23 @@ function setReferenceAudioPreview(blob: Blob | null, name = "") {
   referenceAudioName.textContent = name;
 }
 
-async function restoreReferenceAudio() {
-  if (!savedSettings?.voiceCloneEnabled) return;
-
-  try {
-    const stored = await readStoredReferenceAudio();
-    if (stored) {
-      setReferenceAudioPreview(stored.blob, stored.name);
-      savedSettings.referenceAudioName = stored.name;
-      localStorage.setItem(settingsStorageKey, JSON.stringify(savedSettings));
-      syncVoiceCloneControls();
-      return;
-    }
-  } catch (error) {
-    console.warn(error);
-  }
-
-}
-
 function syncVoiceCloneControls() {
+  if (voiceCloneCapability === false) {
+    voiceCloneToggle.checked = false;
+  }
   const enabled = voiceCloneToggle.checked;
+  voiceCloneToggle.disabled = isSettingsReadOnly || voiceCloneCapability !== true;
+  voiceCloneAvailabilityHint.hidden = voiceCloneCapability === true;
+  voiceCloneAvailabilityHint.textContent =
+    voiceCloneCapability === null
+      ? "正在检查语音克隆组件…"
+      : "语音克隆未安装；重新运行 setup-windows.bat 并选择安装即可启用。";
   setCollapsedGroup("voice-clone", !enabled);
-  referenceAudioInput.disabled = isSettingsReadOnly || !enabled;
-  referenceAudioPlayer.classList.toggle("disabled-audio", isSettingsReadOnly || !enabled || !referenceAudioPlayer.src);
+  referenceAudioInput.disabled = isSettingsReadOnly || voiceCloneCapability !== true || !enabled;
+  referenceAudioPlayer.classList.toggle(
+    "disabled-audio",
+    isSettingsReadOnly || voiceCloneCapability !== true || !enabled || !referenceAudioPlayer.src,
+  );
   if (isSettingsReadOnly) {
     referenceAudioPlayer.pause();
   }
@@ -994,14 +1104,35 @@ function syncVoiceCloneControls() {
     setReferenceAudioPreview(null);
     referenceAudioName.textContent = "未选择参考音频";
   } else if (!referenceAudioInput.files?.[0] && !referenceAudioBlob) {
-    referenceAudioName.textContent = savedSettings?.referenceAudioName || "请选择 3-10 秒参考音频";
+    referenceAudioName.textContent = "请选择 3-10 秒参考音频";
   }
+}
+
+function validateVoiceCloneReference(audio: Blob, name: string, announce = true) {
+  const normalizedName = name.trim().toLowerCase();
+  const dotIndex = normalizedName.lastIndexOf(".");
+  const extension = dotIndex >= 0 ? normalizedName.slice(dotIndex) : "";
+  let message = "";
+  if (!audio.size) {
+    message = "参考音频为空，请重新选择。";
+  } else if (audio.size > maxVoiceCloneReferenceBytes) {
+    message = "参考音频过大，最大允许 10 MB。";
+  } else if (!allowedVoiceCloneReferenceExtensions.has(extension)) {
+    message = "参考音频格式不支持，请使用 WAV、MP3、FLAC 或 OGG。";
+  }
+  if (message && announce) appendLine("system", message);
+  return !message;
 }
 
 function validateVoiceCloneSettings() {
   if (!voiceCloneToggle.checked) return true;
-  if (referenceAudioInput.files?.[0]) return true;
-  if (referenceAudioBlob) return true;
+  if (voiceCloneCapability !== true) {
+    appendLine("system", "语音克隆组件尚未安装，请重新运行 setup-windows.bat 并选择安装语音克隆。");
+    return false;
+  }
+  const audio = referenceAudioInput.files?.[0] || referenceAudioBlob;
+  const audioName = referenceAudioInput.files?.[0]?.name || referenceAudioStoredName;
+  if (audio) return validateVoiceCloneReference(audio, audioName);
   appendLine("system", "已开启语音克隆，请先在设置里选择参考音频。");
   return false;
 }
@@ -1241,11 +1372,39 @@ function appendAssistantLine(text: string, speakerName?: string) {
   markConversationActivity();
 }
 
+function renderWorkspaceDialogue(text: string) {
+  const cleanText = sanitizeAssistantReply(text);
+  if (!cleanText) return;
+  appendLine("assistant", cleanText);
+  subtitle.textContent = cleanText;
+  markConversationActivity();
+}
+
+function flushWorkspaceDialogues() {
+  if (isAssistantResponding || isUserSpeaking || isUserInputPriorityActive) return;
+  while (pendingWorkspaceDialogues.length) {
+    renderWorkspaceDialogue(pendingWorkspaceDialogues.shift() || "");
+  }
+}
+
+function appendWorkspaceDialogue(text: string) {
+  const cleanText = sanitizeAssistantReply(text);
+  if (!cleanText) return;
+  if (isAssistantResponding || isUserSpeaking || isUserInputPriorityActive) {
+    if (pendingWorkspaceDialogues[pendingWorkspaceDialogues.length - 1] !== cleanText) {
+      pendingWorkspaceDialogues.push(cleanText);
+      while (pendingWorkspaceDialogues.length > 8) pendingWorkspaceDialogues.shift();
+    }
+    return;
+  }
+  renderWorkspaceDialogue(cleanText);
+}
+
 function setCaptureUi(active: boolean) {
   isCapturing = active;
-  startButton.disabled = active;
+  startButton.disabled = active || isCaptureStarting;
   stopButton.disabled = !active;
-  status.textContent = active ? "捕捉中" : "已停止";
+  status.textContent = isCaptureStarting ? "启动中" : active ? "捕捉中" : "已停止";
   status.classList.toggle("active", active);
   syncSettingsPanelMode();
   syncProactiveSpeakButton();
@@ -1306,7 +1465,7 @@ function saveVolumeSetting() {
     ...(savedSettings || currentSettings()),
     volume: volumeNumber.value,
   };
-  localStorage.setItem(settingsStorageKey, JSON.stringify(savedSettings));
+  persistSavedSettings();
 }
 
 function syncVolumeMuteButton() {
@@ -1329,7 +1488,7 @@ async function askToOpenVoicemeeter() {
   if (!confirm("是否打开 Voicemeeter？")) return;
 
   try {
-    const response = await fetch("/api/open-voicemeeter", { method: "POST" });
+    const response = await authenticatedFetch("/api/open-voicemeeter", { method: "POST" });
     if (!response.ok) {
       appendLine("system", "Voicemeeter 启动失败，请确认已安装到默认路径，并重启 start.bat。");
       return;
@@ -1342,7 +1501,7 @@ async function askToOpenVoicemeeter() {
 
 async function showVoicemeeterWindow() {
   try {
-    const response = await fetch("/api/show-voicemeeter", { method: "POST" });
+    const response = await authenticatedFetch("/api/show-voicemeeter", { method: "POST" });
     if (!response.ok) {
       appendLine("system", "显示 Voicemeeter 失败，请确认已安装到默认路径。");
       return;
@@ -1373,7 +1532,7 @@ function syncCollapsibleSettings() {
 
 function syncSettingsPanelMode() {
   const isSettingsOpen = !settingsPanel.hidden;
-  isSettingsReadOnly = isCapturing && isSettingsOpen;
+  isSettingsReadOnly = (isCapturing || isCaptureStarting) && isSettingsOpen;
   textPanel.classList.toggle("settings-open", isSettingsOpen);
   textPanel.classList.toggle("settings-readonly", isSettingsReadOnly);
 
@@ -1392,6 +1551,7 @@ function syncSettingsPanelMode() {
   syncScreenVisionControls();
   syncProactiveSpeakControls();
   syncCollapsibleSettings();
+  syncCredentialUi();
   syncApplySettingsButtonState();
   syncProactiveSpeakButton();
 }
@@ -1648,7 +1808,20 @@ async function applyAudioOutput() {
     return;
   }
 
-  await responseAudio.setSinkId(speakerSelect.value);
+  const selectedSinkId = speakerSelect.value;
+  try {
+    await responseAudio.setSinkId(selectedSinkId);
+  } catch (error) {
+    console.warn("The selected audio output is unavailable; falling back to the system default output.", error);
+    speakerSelect.value = "";
+    try {
+      await responseAudio.setSinkId("");
+      appendLine("system", "所选扬声器不可用，已自动切换到系统默认输出。");
+    } catch (fallbackError) {
+      console.warn("Falling back to the system default audio output failed.", fallbackError);
+      throw fallbackError;
+    }
+  }
 }
 
 async function applyVoiceChatAudioOutput() {
@@ -1774,97 +1947,203 @@ async function refreshDevices() {
 function sendWs(message: object) {
   if (ws?.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(message));
+    return true;
   }
+  return false;
 }
 
-function workspaceEventPrompt(event: WorkspaceEvent) {
-  const pageName = event.page?.title || event.page?.path || "工作区页面";
-  if (event.type === "workspace-page-closed") {
-    return `工作区事件：用户关闭了「${pageName}」。请像同桌朋友一样自然回应，不要声称还能继续控制这个已关闭页面。`;
-  }
+type WorkspaceSanitizeBudget = { remaining: number; nodes: number; truncated: boolean };
 
-  const stateText = JSON.stringify(event.appState ?? null);
-  return [
-    `工作区事件：「${pageName}」发生了新变化。`,
-    "你正在观察这个固定页面实例。请像现实中同桌互动一样自然回应。",
-    "如果这是游戏/棋局，且状态显示轮到你、currentTurn 是你、或 availableActions 非空，不要等待用户提问：立刻先用 read_workspace_state 确认状态，再用 send_workspace_action 下下一步，确认成功后再说话。",
-    "如果还没轮到你，只简短回应你看到了变化。没确认行动成功时不要声称已行动。",
-    `最新状态：${stateText.slice(0, 1800)}`,
-  ].join("\n");
+function sanitizeWorkspaceValue(
+  value: unknown,
+  depth = 0,
+  budget: WorkspaceSanitizeBudget = { remaining: 12_000, nodes: 1024, truncated: false },
+): unknown {
+  if (budget.remaining <= 0 || budget.nodes <= 0) {
+    budget.truncated = true;
+    return "[truncated]";
+  }
+  budget.nodes -= 1;
+  if (depth > 7) {
+    budget.truncated = true;
+    return "[maximum depth reached]";
+  }
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string") {
+    const allowed = Math.max(0, Math.min(600, budget.remaining));
+    if (value.length > allowed) budget.truncated = true;
+    const result = value.slice(0, allowed);
+    budget.remaining -= result.length;
+    return result;
+  }
+  if (Array.isArray(value)) {
+    if (value.length > 64) budget.truncated = true;
+    const result: unknown[] = [];
+    for (const item of value.slice(0, 64)) {
+      result.push(sanitizeWorkspaceValue(item, depth + 1, budget));
+      if (budget.nodes <= 0) break;
+    }
+    return result;
+  }
+  if (typeof value === "object") {
+    const result: Record<string, unknown> = {};
+    const entries = Object.entries(value as Record<string, unknown>);
+    if (entries.length > 64) budget.truncated = true;
+    for (const [rawKey, item] of entries.slice(0, 64)) {
+      const key = rawKey.slice(0, 80);
+      if (!key || ["__proto__", "prototype", "constructor"].includes(key.toLowerCase())) continue;
+      result[key] = sanitizeWorkspaceValue(item, depth + 1, budget);
+      if (budget.remaining <= 0 || budget.nodes <= 0) break;
+    }
+    return result;
+  }
+  return String(value).slice(0, 600);
 }
 
-async function readWorkspaceEvents() {
+function normalizedWorkspaceEventData(event: WorkspaceEvent) {
+  const budget: WorkspaceSanitizeBudget = { remaining: 12_000, nodes: 1024, truncated: false };
+  const createdMs = Number(event.created_ms);
+  const value: Record<string, unknown> = {
+    id: String(event.id || "").slice(0, 128),
+    type: event.type,
+    created_ms: Number.isFinite(createdMs) ? createdMs : 0,
+    state_version: Math.max(0, Number(event.state_version || 0)),
+    persona: String(event.persona || workspacePersonaName()).slice(0, 128),
+    page: sanitizeWorkspaceValue(event.page ?? {}, 0, budget),
+    appState: sanitizeWorkspaceValue(event.appState ?? null, 0, budget),
+    lastAction: sanitizeWorkspaceValue(event.lastAction ?? null, 0, budget),
+    actionEvent: Boolean(event.actionEvent),
+  };
+  if (budget.truncated) value.truncated = true;
+  return value;
+}
+
+async function readWorkspaceEvents(signal: AbortSignal) {
   const params = new URLSearchParams({
     persona: workspacePersonaName(),
     since: String(lastWorkspaceEventMs),
+    wait_ms: String(workspaceEventLongPollMs),
   });
-  const response = await fetch(`${workspaceEventsUrl}?${params.toString()}`, { cache: "no-store" });
+  const response = await authenticatedFetch(`${workspaceEventsUrl}?${params.toString()}`, {
+    cache: "no-store",
+    signal,
+  });
   if (!response.ok) return [];
   const data = (await response.json()) as { events?: WorkspaceEvent[] };
   return data.events || [];
 }
 
+async function forwardCurrentWorkspaceState(signal: AbortSignal) {
+  const persona = workspacePersonaName();
+  const params = new URLSearchParams({ persona });
+  const response = await authenticatedFetch(`${workspaceStateUrl}?${params.toString()}`, {
+    cache: "no-store",
+    signal,
+  });
+  if (!response.ok) return;
+  const payload = (await response.json()) as {
+    state?: {
+      updated_ms?: number;
+      state?: {
+        protocolAvailable?: boolean;
+        state_version?: number;
+        page?: WorkspaceEvent["page"];
+        appState?: unknown;
+        lastAction?: WorkspaceEvent["lastAction"];
+      };
+    } | null;
+  };
+  const updatedMs = Number(payload.state?.updated_ms || 0);
+  const report = payload.state?.state;
+  if (
+    !report?.protocolAvailable
+    || !report.page?.id
+    || !Number.isFinite(updatedMs)
+    || Date.now() - updatedMs > 5000
+  ) {
+    return;
+  }
+  const version = Math.max(0, Number(report.state_version || 0));
+  forwardWorkspaceEvent({
+    id: `workspace-snapshot-${report.page.id}-${version}-${updatedMs}`,
+    type: "workspace-state-changed",
+    created_ms: updatedMs,
+    state_version: version,
+    persona,
+    page: report.page,
+    appState: report.appState,
+    lastAction: report.lastAction,
+    actionEvent: false,
+  });
+  lastWorkspaceEventMs = Math.max(lastWorkspaceEventMs, updatedMs);
+}
+
 function shouldForwardWorkspaceEvent(event: WorkspaceEvent) {
+  if (!event || typeof event !== "object") return false;
   if (!event.id || handledWorkspaceEventIds.has(event.id)) return false;
-  if (event.actionEvent && event.lastAction?.accepted !== false) return false;
+  if (!["workspace-state-changed", "workspace-page-closed"].includes(event.type)) return false;
+  if (event.persona && event.persona !== workspacePersonaName()) return false;
   return true;
 }
 
 function forwardWorkspaceEvent(event: WorkspaceEvent) {
   if (!isWsReady || !shouldForwardWorkspaceEvent(event)) return;
   handledWorkspaceEventIds.add(event.id);
-  if (handledWorkspaceEventIds.size > 200) handledWorkspaceEventIds.clear();
-  markConversationActivity();
-  setThinking(true);
+  if (handledWorkspaceEventIds.size > 200) {
+    const oldestId = handledWorkspaceEventIds.values().next().value;
+    if (oldestId) handledWorkspaceEventIds.delete(oldestId);
+  }
+
   sendWs({
-    type: "text-input",
-    text: workspaceEventPrompt(event),
-    metadata: {
-      workspace_event: true,
-      skip_memory: true,
-      skip_history: true,
-    },
+    type: "workspace-state-event",
+    event: normalizedWorkspaceEventData(event),
   });
 }
 
-async function pollWorkspaceEvents() {
-  if (!isWsReady) return;
-  try {
-    const events = await readWorkspaceEvents();
-    for (const event of events.slice(-4)) {
-      lastWorkspaceEventMs = Math.max(lastWorkspaceEventMs, Number(event.created_ms || 0));
-      forwardWorkspaceEvent(event);
+async function runWorkspaceEventLoop(controller: AbortController) {
+  while (isWsReady && workspaceEventAbortController === controller && !controller.signal.aborted) {
+    try {
+      const events = await readWorkspaceEvents(controller.signal);
+      const latestByPage = new Map<string, WorkspaceEvent>();
+      for (const event of events) {
+        lastWorkspaceEventMs = Math.max(lastWorkspaceEventMs, Number(event.created_ms || 0));
+        const pageId = String(event.page?.id || event.id || "");
+        const previous = latestByPage.get(pageId);
+        if (!previous || Number(event.created_ms || 0) >= Number(previous.created_ms || 0)) {
+          latestByPage.set(pageId, event);
+        }
+      }
+      for (const event of latestByPage.values()) {
+        forwardWorkspaceEvent(event);
+      }
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      console.warn("Workspace event stream failed; reconnecting.", error);
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
     }
-  } catch (error) {
-    console.warn("Workspace event poll failed.", error);
   }
 }
 
 function startWorkspaceEventLoop() {
-  if (workspaceEventTimer) return;
-  if (!workspaceBroadcastChannel && "BroadcastChannel" in window) {
-    workspaceBroadcastChannel = new BroadcastChannel("melomate-workspace");
-    workspaceBroadcastChannel.onmessage = (event) => {
-      const workspaceEvent = event.data as WorkspaceEvent;
-      if (workspaceEvent?.persona && workspaceEvent.persona !== workspacePersonaName()) return;
-      if (workspaceEvent?.created_ms) {
-        lastWorkspaceEventMs = Math.max(lastWorkspaceEventMs, Number(workspaceEvent.created_ms || 0));
-      }
-      forwardWorkspaceEvent(workspaceEvent);
-    };
-  }
-  void pollWorkspaceEvents();
-  workspaceEventTimer = window.setInterval(() => {
-    void pollWorkspaceEvents();
-  }, workspaceEventPollMs);
+  if (workspaceEventAbortController) return;
+  workspaceEventAbortController = new AbortController();
+  const controller = workspaceEventAbortController;
+  void (async () => {
+    try {
+      await forwardCurrentWorkspaceState(controller.signal);
+    } catch (error) {
+      if (!controller.signal.aborted) console.warn("Workspace state restore failed.", error);
+    }
+    if (!controller.signal.aborted && workspaceEventAbortController === controller) {
+      await runWorkspaceEventLoop(controller);
+    }
+  })();
 }
 
 function stopWorkspaceEventLoop() {
-  if (!workspaceEventTimer) return;
-  window.clearInterval(workspaceEventTimer);
-  workspaceEventTimer = 0;
-  workspaceBroadcastChannel?.close();
-  workspaceBroadcastChannel = null;
+  workspaceEventAbortController?.abort();
+  workspaceEventAbortController = null;
 }
 
 function markConversationActivity() {
@@ -1961,14 +2240,66 @@ function restartProactiveSpeakLoop() {
   }, proactiveSpeakCheckIntervalMs);
 }
 
-function sendClientApiConfig() {
-  const settings = currentSettings();
+function requestCredentialStatus() {
+  const requestId = typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `credentials-${Date.now()}`;
   sendWs({
+    type: "credential-status-request",
+    request_id: requestId,
+    credential_profile_id: localCredentialProfileId,
+  });
+}
+
+function cancelPendingCredentialRequests() {
+  for (const pending of pendingCredentialRequests.values()) {
+    window.clearTimeout(pending.timeoutId);
+    pending.resolve(false);
+  }
+  pendingCredentialRequests.clear();
+}
+
+function sendClientApiConfig(): Promise<boolean> {
+  const settings = currentSettings();
+  if (!settings.apiKey && !savedChatApiKeyAvailable) {
+    return Promise.resolve(false);
+  }
+  const requestId = typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `api-config-${Date.now()}`;
+  const response = new Promise<boolean>((resolve) => {
+    const timeoutId = window.setTimeout(() => {
+      pendingCredentialRequests.delete(requestId);
+      resolve(false);
+    }, 15_000);
+    pendingCredentialRequests.set(requestId, { resolve, timeoutId });
+  });
+  const sent = sendWs({
     type: "client-api-config",
+    request_id: requestId,
+    credential_profile_id: localCredentialProfileId,
     api_base_url: settings.endpoint,
     api_key: settings.apiKey,
+    screen_vision_api_key: settings.screenVisionApiKey || "",
     model: settings.model,
   });
+  if (!sent) {
+    const pending = pendingCredentialRequests.get(requestId);
+    if (pending) {
+      window.clearTimeout(pending.timeoutId);
+      pendingCredentialRequests.delete(requestId);
+      pending.resolve(false);
+    }
+  }
+  return response;
+}
+
+function clearSavedCredential(credential: "chat" | "screen_vision") {
+  const label = credential === "chat" ? "聊天 API Key" : "识图 API Key";
+  if (!window.confirm(`确定清除已安全保存的${label}吗？`)) return;
+  const sent = sendWs({
+    type: "clear-saved-credential",
+    request_id: typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `clear-${Date.now()}`,
+    credential_profile_id: localCredentialProfileId,
+    credential,
+  });
+  if (!sent) appendLine("system", "后端尚未连接，无法清除已保存的 API Key。");
 }
 
 function sendCharacterConfigSwitch() {
@@ -1978,26 +2309,93 @@ function sendCharacterConfigSwitch() {
   lastAppliedCharacterConfigFile = file;
 }
 
-async function sendClientVoiceCloneConfig() {
-  if (!voiceCloneToggle.checked) {
-    sendWs({ type: "client-voice-clone-config", enabled: false });
-    return;
+function updateVoiceCloneCapability(available: boolean) {
+  voiceCloneCapability = available;
+  if (!available && savedSettings?.voiceCloneEnabled) {
+    savedSettings.voiceCloneEnabled = false;
+    persistSavedSettings();
+  }
+  syncVoiceCloneControls();
+}
+
+function persistVoiceCloneDisabled() {
+  voiceCloneToggle.checked = false;
+  if (savedSettings) {
+    savedSettings.voiceCloneEnabled = false;
+    persistSavedSettings();
+  }
+  syncVoiceCloneControls();
+}
+
+function createVoiceCloneRequestId() {
+  return typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `voice-clone-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function cancelPendingVoiceCloneRequests() {
+  for (const request of pendingVoiceCloneRequests.values()) {
+    window.clearTimeout(request.timeoutId);
+    request.resolve(false);
+  }
+  pendingVoiceCloneRequests.clear();
+}
+
+async function sendClientVoiceCloneConfig(): Promise<boolean> {
+  const enabled = voiceCloneToggle.checked;
+  if (voiceCloneCapability !== true) {
+    return !enabled;
   }
 
-  const audio = referenceAudioInput.files?.[0] || referenceAudioBlob;
-  if (!audio) return;
+  const audio = enabled ? referenceAudioInput.files?.[0] || referenceAudioBlob : null;
+  if (enabled && !audio) return false;
+  const audioName = referenceAudioInput.files?.[0]?.name || referenceAudioStoredName;
+  if (audio && !validateVoiceCloneReference(audio, audioName)) {
+    persistVoiceCloneDisabled();
+    return false;
+  }
 
-  const audioBase64 = await readReferenceAudioAsDataUrl(audio);
-  sendWs({
+  let audioBase64: string | undefined;
+  try {
+    audioBase64 = audio ? await readReferenceAudioAsDataUrl(audio) : undefined;
+  } catch (error) {
+    console.warn(error);
+    appendLine("system", "参考音频读取失败，已保持普通语音模式。");
+    persistVoiceCloneDisabled();
+    return false;
+  }
+  const requestId = createVoiceCloneRequestId();
+  const response = new Promise<boolean>((resolve) => {
+    const timeoutId = window.setTimeout(() => {
+      pendingVoiceCloneRequests.delete(requestId);
+      appendLine("system", "语音克隆配置等待超时，已保持普通语音模式。");
+      persistVoiceCloneDisabled();
+      resolve(false);
+    }, 120_000);
+    pendingVoiceCloneRequests.set(requestId, { resolve, timeoutId });
+  });
+
+  const sent = sendWs({
     type: "client-voice-clone-config",
-    enabled: true,
+    enabled,
+    request_id: requestId,
     audio_base64: audioBase64,
     file_name:
-      referenceAudioInput.files?.[0]?.name ||
-      referenceAudioStoredName ||
-      savedSettings?.referenceAudioName ||
-      "reference.wav",
+      enabled
+        ? audioName || "reference.wav"
+        : undefined,
   });
+  if (!sent) {
+    const pending = pendingVoiceCloneRequests.get(requestId);
+    if (pending) {
+      window.clearTimeout(pending.timeoutId);
+      pendingVoiceCloneRequests.delete(requestId);
+      pending.resolve(false);
+    }
+    appendLine("system", "语音克隆配置未发送，已保持普通语音模式。");
+    persistVoiceCloneDisabled();
+  }
+  return response;
 }
 
 function scheduleWebSocketReconnect() {
@@ -2015,7 +2413,7 @@ function scheduleWebSocketReconnect() {
 function connectWebSocket() {
   if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return;
 
-  ws = new WebSocket(openLlmWsUrl);
+  ws = new WebSocket(openLlmWsUrl, backendWebSocketProtocols);
   isWsReady = false;
   syncApplySettingsButtonState();
 
@@ -2032,8 +2430,8 @@ function connectWebSocket() {
     sendCharacterConfigSwitch();
     sendWs({ type: "fetch-history-list" });
     sendWs({ type: "create-new-history" });
-    sendClientApiConfig();
-    void sendClientVoiceCloneConfig();
+    credentialStatusInitialized = false;
+    requestCredentialStatus();
     startWorkspaceEventLoop();
   };
 
@@ -2051,6 +2449,10 @@ function connectWebSocket() {
 
   ws.onclose = () => {
     isWsReady = false;
+    pendingWorkspaceDialogues.length = 0;
+    cancelPendingVoiceCloneRequests();
+    cancelPendingCredentialRequests();
+    credentialStatusInitialized = false;
     stopWorkspaceEventLoop();
     syncApplySettingsButtonState();
     syncProactiveSpeakButton();
@@ -2124,6 +2526,67 @@ function cancelUserInputPriority() {
 }
 
 function handleWsMessage(message: WsMessage) {
+  if (message.type === "credential-status") {
+    savedChatApiKeyAvailable = Boolean(message.chat_api_key_saved);
+    savedScreenVisionApiKeyAvailable = Boolean(message.screen_vision_api_key_saved);
+    syncCredentialUi();
+
+    if (message.success && message.chat_config_applied) {
+      apiKeyInput.value = "";
+      screenVisionApiKeyInput.value = "";
+      if (savedSettings) {
+        savedSettings.apiKey = "";
+        savedSettings.screenVisionApiKey = "";
+        persistSavedSettings();
+      }
+    }
+
+    const pending = message.request_id
+      ? pendingCredentialRequests.get(message.request_id)
+      : undefined;
+    if (pending && message.request_id) {
+      window.clearTimeout(pending.timeoutId);
+      pendingCredentialRequests.delete(message.request_id);
+      pending.resolve(Boolean(message.success && message.chat_config_applied));
+    }
+
+    if (message.cleared) {
+      const label = message.cleared === "chat" ? "聊天 API Key" : "识图 API Key";
+      appendLine("system", message.success ? `已清除安全保存的${label}。` : message.message || `清除${label}失败。`);
+    } else if (message.success === false && message.message) {
+      appendLine("system", message.message);
+    }
+
+    if (!credentialStatusInitialized) {
+      credentialStatusInitialized = true;
+      if (savedChatApiKeyAvailable) void sendClientApiConfig();
+    }
+    return;
+  }
+
+  if (message.type === "workspace-event-rejected") {
+    console.warn("Workspace state event was rejected:", message.reason);
+    return;
+  }
+
+  if (message.type === "workspace-control-status") {
+    const labels: Record<string, WorkspaceControlStatus> = {
+      thinking: { label: "AI观察中", tone: "ready" },
+      acted: { label: "AI已操作", tone: "ready" },
+      paused: { label: "控制暂停", tone: "stale" },
+      error: { label: "控制异常", tone: "stale" },
+      closed: { label: "未连接", tone: "missing" },
+    };
+    workspaceControlStatus = labels[message.status || ""] || workspaceControlStatus;
+    if (activeAssetPanelTab === "workspace" && workspaceEntriesCache.has("")) {
+      renderWorkspaceEntries(workspaceEntriesCache.get("") || []);
+    }
+    if (message.status === "acted" && message.message) {
+      appendWorkspaceDialogue(message.message);
+    }
+    return;
+  }
+
   if (message.type === "control" && message.text) {
     handleControlMessage(message.text, message.turn_id);
     return;
@@ -2165,7 +2628,21 @@ function handleWsMessage(message: WsMessage) {
 
   if (message.type === "backend-synth-complete") {
     if (!shouldAcceptAssistantOutput(message)) return;
-    backendSynthComplete = true;
+    if (!message.request_id) {
+      console.warn("Ignoring backend synthesis completion without a request_id.");
+      return;
+    }
+    if (
+      acknowledgedPlaybackRequestIds.has(message.request_id)
+      || pendingPlaybackCompletion?.requestId === message.request_id
+    ) {
+      return;
+    }
+    pendingPlaybackCompletion = {
+      requestId: message.request_id,
+      turnId: message.turn_id,
+      queueVersion: audioQueueVersion,
+    };
     void finishBackendAudio();
     return;
   }
@@ -2176,6 +2653,21 @@ function handleWsMessage(message: WsMessage) {
   }
 
   if (message.type === "voice-clone-config-applied") {
+    if (typeof message.available === "boolean") {
+      updateVoiceCloneCapability(message.available);
+    }
+    const pending = message.request_id
+      ? pendingVoiceCloneRequests.get(message.request_id)
+      : undefined;
+    if (pending && message.request_id) {
+      window.clearTimeout(pending.timeoutId);
+      pendingVoiceCloneRequests.delete(message.request_id);
+      pending.resolve(Boolean(message.success));
+    }
+    if (!message.success) {
+      persistVoiceCloneDisabled();
+      appendLine("system", message.message || "语音克隆配置失败，已保持普通语音模式。");
+    }
     return;
   }
 
@@ -2185,7 +2677,12 @@ function handleWsMessage(message: WsMessage) {
   }
 
   if (message.type === "config-switched") {
-    sendClientApiConfig();
+    pendingWorkspaceDialogues.length = 0;
+    stopWorkspaceEventLoop();
+    lastWorkspaceEventMs = Date.now();
+    handledWorkspaceEventIds.clear();
+    if (isWsReady) startWorkspaceEventLoop();
+    void sendClientApiConfig();
     void sendClientVoiceCloneConfig();
     return;
   }
@@ -2202,9 +2699,25 @@ function handleWsMessage(message: WsMessage) {
 
   if (message.type === "set-model-and-conf") {
     setCurrentAssistantName(message.character_name || message.conf_name);
+    if (typeof message.capabilities?.voice_clone === "boolean") {
+      updateVoiceCloneCapability(message.capabilities.voice_clone);
+      void sendClientVoiceCloneConfig();
+    }
     if (message.conf_name) {
       console.info("MeloMate config:", message.conf_name, message.client_uid);
     }
+  }
+}
+
+function handleAudioQueueFailure(error: unknown, queueVersion: number) {
+  console.warn("An audio queue item failed; subsequent audio items will continue.", error);
+  if (queueVersion !== audioQueueVersion) return;
+
+  try {
+    appendLine("system", "一段回复音频播放失败，后续音频将继续播放。");
+    setAnswering(false);
+  } catch (uiError) {
+    console.warn("Updating the UI after an audio queue failure failed.", uiError);
   }
 }
 
@@ -2214,24 +2727,24 @@ function queueAudioMessage(message: WsMessage) {
   const text = message.display_text?.text || "";
   const queueVersion = audioQueueVersion;
   const turnId = message.turn_id;
-  audioQueue = audioQueue.then(async () => {
-    if (queueVersion !== audioQueueVersion || !shouldAcceptAssistantOutput({ turn_id: turnId })) return;
+  audioQueue = audioQueue
+    .catch((error) => {
+      handleAudioQueueFailure(error, queueVersion);
+    })
+    .then(async () => {
+      if (queueVersion !== audioQueueVersion || !shouldAcceptAssistantOutput({ turn_id: turnId })) return;
 
-    if (text) {
-      appendAssistantLine(text, message.display_text?.name);
-      if (!message.forwarded) {
-        sendWs({
-          type: "audio-play-start",
-          display_text: message.display_text,
-          forwarded: true,
-        });
+      if (text) {
+        appendAssistantLine(text, message.display_text?.name);
       }
-    }
 
-    if (message.audio) {
-      await playBackendAudio(message.audio, queueVersion, turnId);
-    }
-  });
+      if (message.audio) {
+        await playBackendAudio(message.audio, queueVersion, turnId);
+      }
+    })
+    .catch((error) => {
+      handleAudioQueueFailure(error, queueVersion);
+    });
 }
 
 async function playBackendAudio(audioBase64: string, queueVersion: number, turnId?: string) {
@@ -2288,7 +2801,6 @@ function screenVisionConfigPayload() {
   if (!screenVisionEnabled()) return null;
   return {
     api_base_url: screenVisionEndpointInput.value.trim(),
-    api_key: screenVisionApiKeyInput.value.trim(),
     model: screenVisionModelInput.value.trim(),
   };
 }
@@ -2305,7 +2817,7 @@ function validateScreenVisionSettings() {
     openSettingsPanel();
     return false;
   }
-  if (!screenVisionApiKeyInput.value.trim()) {
+  if (!screenVisionApiKeyInput.value.trim() && !savedScreenVisionApiKeyAvailable) {
     appendLine("system", "请先填写 API Key。");
     openSettingsPanel();
     return false;
@@ -2340,7 +2852,21 @@ function stopScreenVision() {
     window.clearInterval(screenCaptureTimer);
     screenCaptureTimer = 0;
   }
-  screenStream?.getTracks().forEach((track) => track.stop());
+  screenStream?.getTracks().forEach((track) => {
+    try {
+      track.stop();
+    } catch (error) {
+      console.warn("Stopping a screen-capture track failed.", error);
+    }
+  });
+  if (screenVideo) {
+    try {
+      screenVideo.pause();
+      screenVideo.srcObject = null;
+    } catch (error) {
+      console.warn("Releasing the screen-capture video element failed.", error);
+    }
+  }
   screenStream = null;
   screenVideo = null;
   latestScreenImage = null;
@@ -2407,14 +2933,32 @@ async function screenImagesForNextTurn() {
 }
 
 async function finishBackendAudio() {
-  if (!backendSynthComplete) return;
-  backendSynthComplete = false;
+  const completion = pendingPlaybackCompletion;
+  if (!completion) return;
   await audioQueue.catch(() => undefined);
-  sendWs({ type: "frontend-playback-complete" });
+  if (
+    pendingPlaybackCompletion !== completion
+    || completion.queueVersion !== audioQueueVersion
+  ) {
+    return;
+  }
+
+  pendingPlaybackCompletion = null;
+  acknowledgedPlaybackRequestIds.add(completion.requestId);
+  if (acknowledgedPlaybackRequestIds.size > 200) {
+    const oldestRequestId = acknowledgedPlaybackRequestIds.values().next().value;
+    if (oldestRequestId) acknowledgedPlaybackRequestIds.delete(oldestRequestId);
+  }
+  sendWs({
+    type: "frontend-playback-complete",
+    request_id: completion.requestId,
+    turn_id: completion.turnId,
+  });
   setThinking(false);
   isAssistantResponding = false;
   markConversationActivity();
   syncProactiveSpeakButton();
+  flushWorkspaceDialogues();
 }
 
 function stopCurrentResponsePlayback(force = false) {
@@ -2422,7 +2966,7 @@ function stopCurrentResponsePlayback(force = false) {
   if (!force && !isAssistantResponding && !hasActivePlayback) return;
 
   isAssistantResponding = false;
-  backendSynthComplete = false;
+  pendingPlaybackCompletion = null;
   audioQueueVersion += 1;
   audioQueue = Promise.resolve();
 
@@ -2577,83 +3121,127 @@ function prepareSpeechAudio(audio: Float32Array) {
 }
 
 async function startOpenLlmVad() {
-  if (!micStream || vadInstance) return;
+  if (!micStream) {
+    throw new Error("麦克风音频流尚未准备好。");
+  }
+  if (vadInstance) return;
 
   if (!window.vad?.MicVAD) {
-    appendLine("system", "MeloMate 语音检测组件没有加载成功。");
-    return;
+    throw new Error("MeloMate 语音检测组件没有加载成功。");
   }
 
-  vadInstance = await window.vad.MicVAD.new({
-    model: "v5",
-    stream: micStream,
-    preSpeechPadFrames: 30,
-    positiveSpeechThreshold: 0.4,
-    negativeSpeechThreshold: 0.25,
-    redemptionFrames: 40,
-    minSpeechFrames: 2,
-    baseAssetPath: "./libs/",
-    onnxWASMBasePath: "./libs/",
-    onSpeechStart: () => {
-      beginUserVoiceInput();
-    },
-    onSpeechRealStart: () => {
-      beginUserVoiceInput();
-    },
-    onSpeechEnd: (audio: Float32Array) => {
-      void sendAudioPartition(audio);
-    },
-    onVADMisfire: () => {
-      endUserVoiceInput();
-      cancelUserInputPriority();
-      pendingUserLine?.remove();
-      pendingUserLine = null;
-      subtitle.textContent = isCapturing ? "麦克风已启动。" : "麦克风已停止。";
-    },
-  });
+  let instance: MicVadInstance | null = null;
+  try {
+    instance = await window.vad.MicVAD.new({
+      model: "v5",
+      stream: micStream,
+      preSpeechPadFrames: 30,
+      positiveSpeechThreshold: 0.4,
+      negativeSpeechThreshold: 0.25,
+      redemptionFrames: 40,
+      minSpeechFrames: 2,
+      baseAssetPath: "./libs/",
+      onnxWASMBasePath: "./libs/",
+      // Interrupt only after VAD confirms real speech; the provisional start callback can misfire on noise.
+      onSpeechRealStart: () => {
+        beginUserVoiceInput();
+      },
+      onSpeechEnd: (audio: Float32Array) => {
+        void sendAudioPartition(audio);
+      },
+      onVADMisfire: () => {
+        endUserVoiceInput();
+        cancelUserInputPriority();
+        pendingUserLine?.remove();
+        pendingUserLine = null;
+        subtitle.textContent = isCapturing ? "麦克风已启动。" : "麦克风已停止。";
+      },
+    });
 
-  vadInstance.start();
+    await instance.start();
+    vadInstance = instance;
+  } catch (error) {
+    if (instance) {
+      try {
+        instance.pause();
+      } catch (pauseError) {
+        console.warn("Pausing a partially started VAD instance failed.", pauseError);
+      }
+      try {
+        instance.destroy();
+      } catch (destroyError) {
+        console.warn("Destroying a partially started VAD instance failed.", destroyError);
+      }
+    }
+    throw error;
+  }
 }
 
 function stopOpenLlmVad() {
-  vadInstance?.pause();
-  vadInstance?.destroy();
+  const instance = vadInstance;
   vadInstance = null;
+  if (!instance) return;
+
+  try {
+    instance.pause();
+  } catch (error) {
+    console.warn("Pausing VAD failed while stopping capture.", error);
+  }
+  try {
+    instance.destroy();
+  } catch (error) {
+    console.warn("Destroying VAD failed while stopping capture.", error);
+  }
 }
 
 async function startCapture() {
-  if (isCapturing) return;
+  if (isCapturing || isCaptureStarting) return;
   if (!validateVoiceCloneSettings()) return;
   if (!validateScreenVisionSettings()) return;
-  connectWebSocket();
-  if (ws?.readyState === WebSocket.OPEN) {
-    await sendClientVoiceCloneConfig();
-  }
-  if (!(await startScreenVisionIfNeeded())) return;
 
+  isCaptureStarting = true;
+  setCaptureUi(false);
+  let failureMessage = "语音捕获启动失败，已停止所有采集。";
   try {
+    connectWebSocket();
+    if (ws?.readyState === WebSocket.OPEN) {
+      if (!(await sendClientVoiceCloneConfig())) {
+        failureMessage = "语音克隆配置失败，麦克风和屏幕共享均已自动停止。";
+        throw new Error("Voice clone configuration was not applied.");
+      }
+    }
+
     const audio: MediaTrackConstraints = {
       echoCancellation: true,
       noiseSuppression: true,
       autoGainControl: true,
       ...(micSelect.value ? { deviceId: { exact: micSelect.value } } : {}),
     };
+    failureMessage = "没有拿到麦克风权限，允许浏览器使用麦克风后再启动。";
     micStream = await navigator.mediaDevices.getUserMedia({ audio });
     await refreshDevices();
+
+    failureMessage = "屏幕共享未能启动，麦克风已自动停止。";
+    if (!(await startScreenVisionIfNeeded())) {
+      throw new Error("Screen capture did not start.");
+    }
+
+    failureMessage = "语音检测初始化失败，麦克风和屏幕共享均已自动停止。";
+    await startOpenLlmVad();
   } catch (error) {
-    appendLine("system", "没有拿到麦克风权限，允许浏览器使用麦克风后再启动。");
+    stopCaptureInternal(false);
+    appendLine("system", failureMessage);
     console.warn(error);
     return;
   }
 
+  isCaptureStarting = false;
+  setCaptureUi(true);
   pendingUserLine = null;
   appendLine("system", "麦克风已启动，正在等待你说话。");
   subtitle.textContent = "麦克风已启动。";
   markConversationActivity();
-  setCaptureUi(true);
   restartProactiveSpeakLoop();
-
-  void startOpenLlmVad();
 }
 
 function stopCapture() {
@@ -2662,6 +3250,19 @@ function stopCapture() {
 }
 
 function stopCaptureInternal(announce: boolean) {
+  const activeMicStream = micStream;
+  micStream = null;
+  isCaptureStarting = false;
+  stopOpenLlmVad();
+  stopScreenVision();
+  activeMicStream?.getTracks().forEach((track) => {
+    try {
+      track.stop();
+    } catch (error) {
+      console.warn("Stopping a microphone track failed.", error);
+    }
+  });
+
   setCaptureUi(false);
   subtitle.textContent = "麦克风已停止。";
   pendingUserLine = null;
@@ -2671,11 +3272,6 @@ function stopCaptureInternal(announce: boolean) {
   if (announce) {
     appendLine("system", "麦克风已停止。");
   }
-
-  stopOpenLlmVad();
-  stopScreenVision();
-  micStream?.getTracks().forEach((track) => track.stop());
-  micStream = null;
   stopProactiveSpeakLoop();
   markConversationActivity();
   syncProactiveSpeakButton();
@@ -2688,6 +3284,7 @@ async function applyCurrentSettings() {
     return;
   }
   const wasCapturing = isCapturing;
+  if (!validateChatApiSettings()) return;
   if (!validateVoiceCloneSettings()) return;
   if (!validateScreenVisionSettings()) return;
   if (wasCapturing) {
@@ -2706,23 +3303,6 @@ async function applyCurrentSettings() {
   const devices = navigator.mediaDevices?.enumerateDevices ? await navigator.mediaDevices.enumerateDevices() : [];
   applyVoiceChatOutputDevice(devices);
 
-  if (voiceCloneToggle.checked && referenceAudioInput.files?.[0]) {
-    try {
-      await writeStoredReferenceAudio(referenceAudioInput.files[0]);
-      referenceAudioBlob = referenceAudioInput.files[0];
-      referenceAudioStoredName = referenceAudioInput.files[0].name;
-    } catch (error) {
-      appendLine("system", "参考音频保存失败，下次打开可能需要重新选择。");
-      console.warn(error);
-    }
-  } else if (!voiceCloneToggle.checked) {
-    try {
-      await deleteStoredReferenceAudio();
-    } catch (error) {
-      console.warn(error);
-    }
-  }
-
   saveSettings();
   connectWebSocket();
 
@@ -2733,18 +3313,33 @@ async function applyCurrentSettings() {
     console.warn(error);
   }
 
+  let apiConfigApplied = false;
+  let voiceCloneApplied = true;
   if (ws?.readyState === WebSocket.OPEN) {
     if (selectedCharacterConfigFile() !== lastAppliedCharacterConfigFile) {
       sendCharacterConfigSwitch();
     }
-    sendClientApiConfig();
-    await sendClientVoiceCloneConfig();
+    apiConfigApplied = await sendClientApiConfig();
+    voiceCloneApplied = await sendClientVoiceCloneConfig();
+  }
+
+  if (!apiConfigApplied) {
+    appendLine("system", "聊天 API 配置未能安全保存或应用，请检查后重试。");
+    syncCredentialUi();
+    return;
   }
 
   settingsPanel.hidden = true;
   settingsButton.setAttribute("aria-expanded", "false");
   syncSettingsPanelMode();
-  appendLine("system", wasCapturing ? "配置已应用，已按新设置重新启动麦克风。" : "配置已应用。");
+  appendLine(
+    "system",
+    voiceCloneApplied
+      ? wasCapturing
+        ? "配置已应用，已按新设置重新启动麦克风。"
+        : "配置已应用。"
+      : "其他配置已应用，但语音克隆未能启用，当前使用普通语音模式。",
+  );
   restartProactiveSpeakLoop();
 
   if (wasCapturing) {
@@ -2788,6 +3383,8 @@ toggleApiKey.addEventListener("click", () => syncSecretToggle(apiKeyInput, toggl
 toggleScreenVisionApiKey.addEventListener("click", () =>
   syncSecretToggle(screenVisionApiKeyInput, toggleScreenVisionApiKey),
 );
+clearApiKey.addEventListener("click", () => clearSavedCredential("chat"));
+clearScreenVisionApiKey.addEventListener("click", () => clearSavedCredential("screen_vision"));
 
 volumeRange.addEventListener("input", () => {
   syncVolume(volumeRange.value);
@@ -2839,6 +3436,12 @@ referenceAudioInput.addEventListener("change", () => {
     syncVoiceCloneControls();
     return;
   }
+  if (!validateVoiceCloneReference(file, file.name)) {
+    referenceAudioInput.value = "";
+    setReferenceAudioPreview(null);
+    syncVoiceCloneControls();
+    return;
+  }
 
   setReferenceAudioPreview(file, file.name);
   syncVoiceCloneControls();
@@ -2859,7 +3462,7 @@ proactiveSpeakButton.addEventListener("click", () => {
 
 savedSettings = normalizeStartupSettings(readSavedSettings());
 if (savedSettings) {
-  localStorage.setItem(settingsStorageKey, JSON.stringify(savedSettings));
+  persistSavedSettings();
   restoreStaticSettings(savedSettings);
 } else {
   renderCharacterOptions([]);
@@ -2881,7 +3484,7 @@ async function startup() {
   await setupBackgroundPicker();
   live2dModelOptions = await readLive2DModelOptions();
   renderLive2DModelOptions();
-  await restoreReferenceAudio();
+  await purgeLegacyReferenceAudioStorage();
   await refreshDevices();
   setCaptureUi(false);
   syncVolume(volumeNumber.value);

@@ -1,5 +1,6 @@
 import json
 import datetime
+import asyncio
 from loguru import logger
 from typing import (
     Dict,
@@ -13,9 +14,24 @@ from typing import (
 from .types import ToolCallObject
 from .mcp_client import MCPClient
 from .tool_manager import ToolManager
+from ..workspace_security import (
+    extract_workspace_action_grants,
+    harden_workspace_tool_result,
+    sanitize_untrusted_value,
+)
 
 
 CONTROL_TOOL_NAMES = {"send_workspace_action", "send_workspace_key"}
+WORKSPACE_STATE_TOOL_NAMES = {"read_workspace_state", *CONTROL_TOOL_NAMES}
+WORKSPACE_TAINT_ALLOWED_TOOLS = {
+    "read_workspace_state",
+    "send_workspace_action",
+}
+TOOL_EXECUTION_TIMEOUT_SECONDS = 30
+MAX_TOOL_ARGUMENT_CHARS = 256_000
+MAX_TOOL_RESULT_TEXT_CHARS = 64_000
+MAX_TOOL_CONTENT_ITEMS = 16
+MAX_TOOL_BINARY_CHARS = 12_000_000
 
 
 class ToolExecutor:
@@ -71,7 +87,7 @@ class ToolExecutor:
                 tool_input = {}
 
             if not tool_id or not tool_name:
-                logger.error(f"Invalid Dict tool call structure: {call}")
+                logger.error("Invalid dictionary tool-call structure")
                 result_content = "Error: Invalid tool call structure from LLM."
                 is_error = True
                 parse_error = True
@@ -132,17 +148,19 @@ class ToolExecutor:
     def harden_workspace_control_result(
         self, tool_name: str, is_error: bool, text_content: str
     ) -> tuple[bool, str]:
-        if tool_name not in CONTROL_TOOL_NAMES or not text_content:
-            return is_error, text_content
+        result_error, hardened_content = harden_workspace_tool_result(
+            tool_name, text_content
+        )
+        if tool_name not in CONTROL_TOOL_NAMES:
+            return is_error or result_error, hardened_content
+        if result_error:
+            return True, hardened_content
         try:
-            payload = json.loads(text_content)
+            payload = json.loads(hardened_content)
         except json.JSONDecodeError:
-            return True, (
-                f"CONTROL_RESULT_INVALID: {tool_name} did not return valid JSON. "
-                "Do not claim any workspace action happened."
-            )
+            return True, hardened_content
         if payload.get("confirmed") is True:
-            return is_error, text_content
+            return is_error, hardened_content
         payload["ok"] = False
         payload["confirmed"] = False
         payload["assistant_response_contract"] = (
@@ -150,7 +168,151 @@ class ToolExecutor:
             "claim the character clicked, moved, placed, chose, changed, scored, "
             "won, or completed the action. Say the workspace did not confirm it."
         )
-        return True, json.dumps(payload, ensure_ascii=False)
+        return True, json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    def apply_tool_policy(
+        self,
+        tool_name: str,
+        tool_input: Any,
+        tool_policy: Dict[str, Any] | None,
+        consume: bool = False,
+    ) -> tuple[Any, str | None]:
+        """Enforce event capabilities even if the model fabricates a hidden tool call."""
+        if tool_policy is None or tool_policy.get("enforce") is not True:
+            return tool_input, None
+        allowed = set(tool_policy.get("allowed_tool_names") or ())
+        if tool_name not in allowed:
+            return tool_input, (
+                f"TOOL_POLICY_DENIED: '{tool_name}' is not permitted for "
+                f"{tool_policy.get('source') or 'this turn'}."
+            )
+        if not isinstance(tool_input, dict):
+            return tool_input, "TOOL_POLICY_DENIED: tool arguments must be an object."
+        expected_persona = str(tool_policy.get("workspace_persona") or "")
+        supplied_persona = str(tool_input.get("persona") or "")
+        if not expected_persona or supplied_persona != expected_persona:
+            return tool_input, (
+                "TOOL_POLICY_DENIED: workspace events may only access their matching persona."
+            )
+        if tool_name == "read_workspace_state":
+            normalized_input = {"persona": expected_persona}
+            return normalized_input, self._consume_tool_policy_call(
+                tool_name, tool_policy, consume
+            )
+        if tool_name == "send_workspace_action":
+            action = str(tool_input.get("action") or "").strip()
+            if not action or len(action) > 120:
+                return tool_input, (
+                    "TOOL_POLICY_DENIED: workspace action must be 1-120 characters."
+                )
+            try:
+                wait_ms = max(100, min(int(tool_input.get("wait_ms") or 900), 1500))
+            except (TypeError, ValueError):
+                wait_ms = 900
+            raw_payload = tool_input.get("payload")
+            safe_payload = (
+                sanitize_untrusted_value(raw_payload)
+                if isinstance(raw_payload, dict)
+                else {}
+            )
+            normalized_input = {
+                "persona": expected_persona,
+                "action": action,
+                "payload": safe_payload,
+                "wait_ms": wait_ms,
+            }
+            grants = tool_policy.get("workspace_action_grants")
+            if isinstance(grants, list) and not any(
+                grant.get("action") == normalized_input["action"]
+                and grant.get("payload") == normalized_input["payload"]
+                for grant in grants
+                if isinstance(grant, dict)
+            ):
+                return tool_input, (
+                    "TOOL_POLICY_DENIED: action and payload must exactly match a "
+                    "page-advertised availableAction."
+                )
+            return normalized_input, self._consume_tool_policy_call(
+                tool_name, tool_policy, consume
+            )
+        if tool_name == "send_workspace_key":
+            key = str(tool_input.get("key") or "")[:32]
+            code = str(tool_input.get("code") or "")[:64]
+            if not key:
+                return tool_input, "TOOL_POLICY_DENIED: key must not be empty."
+            try:
+                duration_ms = max(
+                    20, min(int(tool_input.get("duration_ms") or 80), 500)
+                )
+                repeat = max(1, min(int(tool_input.get("repeat") or 1), 5))
+            except (TypeError, ValueError):
+                duration_ms = 80
+                repeat = 1
+            normalized_input = {
+                "persona": expected_persona,
+                "key": key,
+                "code": code,
+                "duration_ms": duration_ms,
+                "repeat": repeat,
+            }
+            return normalized_input, self._consume_tool_policy_call(
+                tool_name, tool_policy, consume
+            )
+        return tool_input, self._consume_tool_policy_call(
+            tool_name, tool_policy, consume
+        )
+
+    @staticmethod
+    def _consume_tool_policy_call(
+        tool_name: str, tool_policy: Dict[str, Any], consume: bool
+    ) -> str | None:
+        if not consume:
+            return None
+        remaining = tool_policy.get("remaining_tool_calls")
+        if not isinstance(remaining, dict):
+            return None
+        try:
+            available = int(remaining.get(tool_name, 0))
+        except (TypeError, ValueError):
+            available = 0
+        if available <= 0:
+            return (
+                f"TOOL_POLICY_DENIED: '{tool_name}' exceeded the per-event call limit."
+            )
+        remaining[tool_name] = available - 1
+        return None
+
+    @staticmethod
+    def _restrict_after_workspace_state(
+        tool_name: str,
+        tool_input: Any,
+        text_content: str,
+        tool_policy: Dict[str, Any] | None,
+    ) -> None:
+        """Prevent untrusted page state from authorizing unrelated follow-up tools."""
+        if tool_policy is None or tool_name not in WORKSPACE_STATE_TOOL_NAMES:
+            return
+        grants = extract_workspace_action_grants(text_content)
+        if tool_policy.get("source") in {
+            "workspace_event",
+            "workspace_aware_chat",
+        }:
+            tool_policy["workspace_action_grants"] = grants
+            return
+        if tool_policy.get("source") != "user_turn":
+            return
+        persona = ""
+        if isinstance(tool_input, dict):
+            persona = str(tool_input.get("persona") or "")
+        tool_policy.update(
+            {
+                "enforce": True,
+                "allowed_tool_names": frozenset(WORKSPACE_TAINT_ALLOWED_TOOLS),
+                "workspace_persona": persona,
+                "workspace_state_tainted": True,
+                "workspace_action_grants": grants,
+            }
+        )
 
     def process_tool_from_prompt_json(
         self, data: List[Dict[str, Any]]
@@ -178,7 +340,9 @@ class ToolExecutor:
                         "Failed to decode arguments JSON in prompt mode tool call"
                     )
                 except Exception as e:
-                    logger.error(f"Error processing prompt mode tool dict: {e}")
+                    logger.error(
+                        f"Error processing prompt-mode tool: {type(e).__name__}"
+                    )
             else:
                 logger.warning("Skipping invalid tool structure in prompt mode JSON")
         return parsed_tools
@@ -187,6 +351,7 @@ class ToolExecutor:
         self,
         tool_calls: Union[List[Dict[str, Any]], List[ToolCallObject]],
         caller_mode: Literal["Claude", "OpenAI", "Prompt"],
+        tool_policy: Dict[str, Any] | None = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Execute tools and yield status updates."""
         tool_results_for_llm = []
@@ -202,7 +367,7 @@ class ToolExecutor:
                 parse_error,
             ) = self.parse_tool_call(call)
 
-            logger.info(f"Executing tool: {call}")
+            logger.info(f"Executing tool request: {tool_name or 'unknown'}")
 
             if parse_error:
                 logger.warning(
@@ -234,8 +399,58 @@ class ToolExecutor:
                     tool_results_for_llm.append(formatted_result)
                 continue  # Skip execution logic for this call
 
+            tool_input, policy_error = self.apply_tool_policy(
+                tool_name, tool_input, tool_policy, consume=True
+            )
+            if policy_error:
+                logger.warning(policy_error)
+                yield {
+                    "type": "tool_call_status",
+                    "tool_id": tool_id,
+                    "tool_name": tool_name,
+                    "status": "error",
+                    "content": policy_error,
+                    "timestamp": datetime.datetime.now(
+                        datetime.timezone.utc
+                    ).isoformat()
+                    + "Z",
+                }
+                formatted_result = self.format_tool_result(
+                    caller_mode, tool_id, policy_error, True
+                )
+                if formatted_result:
+                    tool_results_for_llm.append(formatted_result)
+                continue
+
+            try:
+                serialized_input = json.dumps(tool_input, ensure_ascii=False)
+            except (TypeError, ValueError):
+                serialized_input = None
+            if serialized_input is None or len(serialized_input) > MAX_TOOL_ARGUMENT_CHARS:
+                policy_error = (
+                    "TOOL_POLICY_DENIED: tool arguments are invalid or exceed the size limit."
+                )
+                logger.warning(f"Oversized arguments rejected for tool '{tool_name}'")
+                yield {
+                    "type": "tool_call_status",
+                    "tool_id": tool_id,
+                    "tool_name": tool_name,
+                    "status": "error",
+                    "content": policy_error,
+                    "timestamp": datetime.datetime.now(
+                        datetime.timezone.utc
+                    ).isoformat()
+                    + "Z",
+                }
+                formatted_result = self.format_tool_result(
+                    caller_mode, tool_id, policy_error, True
+                )
+                if formatted_result:
+                    tool_results_for_llm.append(formatted_result)
+                continue
+
             # Yield 'running' status before execution
-            input_preview = json.dumps(tool_input, ensure_ascii=False)
+            input_preview = serialized_input
             if len(input_preview) > 1000:
                 input_preview = f"{input_preview[:1000]}... [truncated]"
 
@@ -255,7 +470,12 @@ class ToolExecutor:
                 text_content,
                 metadata,
                 content_items,
-            ) = await self.run_single_tool(tool_name, tool_id, tool_input)
+            ) = await self.run_single_tool(
+                tool_name, tool_id, tool_input, tool_policy=tool_policy
+            )
+            self._restrict_after_workspace_state(
+                tool_name, tool_input, text_content, tool_policy
+            )
 
             # Determine content for status update and LLM result format
             status_content = text_content  # Default to text content
@@ -323,9 +543,7 @@ class ToolExecutor:
             if tool_name == "stagehand_navigate" and not is_error:
                 live_view_data = metadata.get("liveViewData", {})
                 if live_view_data:
-                    logger.info(
-                        f"Found live view data for stagehand_navigate: {live_view_data}"
-                    )
+                    logger.info("Found live view data for stagehand_navigate")
                     status_update["browser_view"] = live_view_data
 
             yield status_update
@@ -343,7 +561,11 @@ class ToolExecutor:
         yield {"type": "final_tool_results", "results": tool_results_for_llm}
 
     async def run_single_tool(
-        self, tool_name: str, tool_id: str, tool_input: Any
+        self,
+        tool_name: str,
+        tool_id: str,
+        tool_input: Any,
+        tool_policy: Dict[str, Any] | None = None,
     ) -> tuple[bool, str, Dict[str, Any], List[Dict[str, Any]]]:
         """Run a single tool using MCPClient.
 
@@ -351,7 +573,6 @@ class ToolExecutor:
             tuple: (is_error, text_content, metadata, content_items)
         """
         logger.info(f"Executing tool: {tool_name} (ID: {tool_id})")
-        tool_info = self._tool_manager.get_tool(tool_name)
 
         is_error = False
         text_content = ""
@@ -361,6 +582,13 @@ class ToolExecutor:
         if tool_input is None:
             tool_input = {}
 
+        tool_input, policy_error = self.apply_tool_policy(
+            tool_name, tool_input, tool_policy
+        )
+        if policy_error:
+            return True, policy_error, {}, [{"type": "error", "text": policy_error}]
+
+        tool_info = self._tool_manager.get_tool(tool_name)
         if not tool_info:
             logger.error(f"Tool '{tool_name}' not found in ToolManager.")
             text_content = f"Error: Tool '{tool_name}' is not available."
@@ -373,14 +601,40 @@ class ToolExecutor:
             is_error = True
         else:
             try:
-                result_dict = await self._mcp_client.call_tool(
-                    server_name=tool_info.related_server,
-                    tool_name=tool_name,
-                    tool_args=tool_input,
+                result_dict = await asyncio.wait_for(
+                    self._mcp_client.call_tool(
+                        server_name=tool_info.related_server,
+                        tool_name=tool_name,
+                        tool_args=tool_input,
+                    ),
+                    timeout=TOOL_EXECUTION_TIMEOUT_SECONDS,
                 )
 
                 metadata = result_dict.get("metadata", {})
                 content_items = result_dict.get("content_items", [])
+                if not isinstance(content_items, list):
+                    content_items = []
+                content_items = content_items[:MAX_TOOL_CONTENT_ITEMS]
+                for item in content_items:
+                    if not isinstance(item, dict):
+                        continue
+                    text_value = item.get("text")
+                    if (
+                        isinstance(text_value, str)
+                        and len(text_value) > MAX_TOOL_RESULT_TEXT_CHARS
+                    ):
+                        item["text"] = (
+                            text_value[:MAX_TOOL_RESULT_TEXT_CHARS]
+                            + "\n[Tool result truncated by MeloMate]"
+                        )
+                    binary_value = item.get("data")
+                    if (
+                        isinstance(binary_value, str)
+                        and len(binary_value) > MAX_TOOL_BINARY_CHARS
+                    ):
+                        item.pop("data", None)
+                        item["type"] = "error"
+                        item["text"] = "Tool binary result exceeded the size limit."
 
                 # Check if the first content item is an error reported by MCPClient
                 if content_items and content_items[0].get("type") == "error":
@@ -395,29 +649,33 @@ class ToolExecutor:
                 if not is_error:
                     logger.info(f"Tool '{tool_name}' executed successfully.")
                     if content_items:
-                        logger.info(f"Content items from tool '{tool_name}':")
-                        for item in content_items:
-                            item_type = item.get("type", "unknown")
-                            logger.info(f"  Type: {item_type}")
-                            for key, value in item.items():
-                                if (
-                                    key != "type" and key != "data"
-                                ):  # Avoid logging large data
-                                    log_value = (
-                                        f"(length: {len(value)})"
-                                        if isinstance(value, str) and len(value) > 100
-                                        else value
-                                    )
-                                    logger.info(f"    {key}: {log_value}")
+                        item_types = [
+                            str(item.get("type", "unknown"))
+                            for item in content_items
+                            if isinstance(item, dict)
+                        ]
+                        logger.info(
+                            f"Tool '{tool_name}' returned {len(content_items)} "
+                            f"item(s), types={item_types}"
+                        )
 
+            except asyncio.TimeoutError:
+                logger.warning(f"Tool '{tool_name}' reached the execution time limit")
+                text_content = f"Error: Tool '{tool_name}' timed out."
+                content_items = [{"type": "error", "text": text_content}]
+                is_error = True
             except (ValueError, RuntimeError, ConnectionError) as e:
-                logger.exception(f"Error executing tool '{tool_name}': {e}")
-                text_content = f"Error executing tool '{tool_name}': {e}"
+                logger.error(
+                    f"Error executing tool '{tool_name}': {type(e).__name__}"
+                )
+                text_content = f"Error executing tool '{tool_name}'."
                 content_items = [{"type": "error", "text": text_content}]
                 is_error = True
             except Exception as e:
-                logger.exception(f"Unexpected error executing tool '{tool_name}': {e}")
-                text_content = f"Unexpected error executing tool '{tool_name}': {e}"
+                logger.error(
+                    f"Unexpected tool error for '{tool_name}': {type(e).__name__}"
+                )
+                text_content = f"Unexpected error executing tool '{tool_name}'."
                 content_items = [{"type": "error", "text": text_content}]
                 is_error = True
 

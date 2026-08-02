@@ -4,6 +4,7 @@ dist/
 
 # Python virtual environments and caches
 backend/.venv/
+backend/.voice_clone_ready
 **/__pycache__/
 *.py[cod]
 

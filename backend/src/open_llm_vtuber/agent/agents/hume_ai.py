@@ -9,7 +9,7 @@ from pathlib import Path
 from .agent_interface import AgentInterface
 from ..output_types import AudioOutput, Actions, DisplayText
 from ..input_types import BatchInput
-from ...chat_history_manager import get_metadata, update_metadate
+from ...chat_history_manager import get_metadata, update_metadata
 
 
 class HumeAIAgent(AgentInterface):
@@ -87,7 +87,7 @@ class HumeAIAgent(AgentInterface):
                 new_chat_group_id = data.get("chat_group_id")
 
                 if not resume_chat_group_id and self._current_history_uid:
-                    update_metadate(
+                    update_metadata(
                         self._current_conf_uid,
                         self._current_history_uid,
                         {"resume_id": new_chat_group_id, "agent_type": self.AGENT_TYPE},
@@ -185,7 +185,7 @@ class HumeAIAgent(AgentInterface):
 
             async for message in self._ws:
                 self._reset_idle_timer()
-                logger.debug(f"Received message: {message}")
+                logger.debug(f"Received Hume message (bytes={len(message)})")
                 try:
                     response_data = json.loads(message)
                     msg_type = response_data.get("type")
@@ -219,7 +219,7 @@ class HumeAIAgent(AgentInterface):
                         break
 
                     elif msg_type == "tool_error_message":
-                        logger.error(f"Tool error: {response_data.get('error')}")
+                        logger.error("Hume tool call returned an error")
 
                 except json.JSONDecodeError as e:
                     logger.error(f"Failed to parse response JSON: {e}")

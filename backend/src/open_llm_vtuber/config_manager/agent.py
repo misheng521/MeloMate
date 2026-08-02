@@ -3,10 +3,11 @@ This module contains the pydantic model for the configurations of
 different types of agents.
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import Dict, ClassVar, Optional, Literal, List
 from .i18n import I18nMixin, Description
 from .stateless_llm import StatelessLLMConfigs
+from .provider_dependencies import require_provider_dependencies
 
 # ======== Configurations for different Agents ========
 
@@ -55,67 +56,6 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
             zh="为智能体启用 MCP 服务器列表",
         ),
     }
-
-
-class Mem0VectorStoreConfig(I18nMixin, BaseModel):
-    """Configuration for Mem0 vector store."""
-
-    provider: str = Field(..., alias="provider")
-    config: Dict = Field(..., alias="config")
-
-    DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
-        "provider": Description(
-            en="Vector store provider (e.g., qdrant)", zh="向量存储提供者（如 qdrant）"
-        ),
-        "config": Description(
-            en="Provider-specific configuration", zh="提供者特定配置"
-        ),
-    }
-
-
-class Mem0LLMConfig(I18nMixin, BaseModel):
-    """Configuration for Mem0 LLM."""
-
-    provider: str = Field(..., alias="provider")
-    config: Dict = Field(..., alias="config")
-
-    DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
-        "provider": Description(en="LLM provider name", zh="语言模型提供者名称"),
-        "config": Description(
-            en="Provider-specific configuration", zh="提供者特定配置"
-        ),
-    }
-
-
-class Mem0EmbedderConfig(I18nMixin, BaseModel):
-    """Configuration for Mem0 embedder."""
-
-    provider: str = Field(..., alias="provider")
-    config: Dict = Field(..., alias="config")
-
-    DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
-        "provider": Description(en="Embedder provider name", zh="嵌入模型提供者名称"),
-        "config": Description(
-            en="Provider-specific configuration", zh="提供者特定配置"
-        ),
-    }
-
-
-class Mem0Config(I18nMixin, BaseModel):
-    """Configuration for Mem0."""
-
-    vector_store: Mem0VectorStoreConfig = Field(..., alias="vector_store")
-    llm: Mem0LLMConfig = Field(..., alias="llm")
-    embedder: Mem0EmbedderConfig = Field(..., alias="embedder")
-
-    DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
-        "vector_store": Description(en="Vector store configuration", zh="向量存储配置"),
-        "llm": Description(en="LLM configuration", zh="语言模型配置"),
-        "embedder": Description(en="Embedder configuration", zh="嵌入模型配置"),
-    }
-
-
-# =================================
 
 
 class HumeAIConfig(I18nMixin, BaseModel):
@@ -177,7 +117,6 @@ class AgentSettings(I18nMixin, BaseModel):
     basic_memory_agent: Optional[BasicMemoryAgentConfig] = Field(
         None, alias="basic_memory_agent"
     )
-    mem0_agent: Optional[Mem0Config] = Field(None, alias="mem0_agent")
     hume_ai_agent: Optional[HumeAIConfig] = Field(None, alias="hume_ai_agent")
     letta_agent: Optional[LettaConfig] = Field(None, alias="letta_agent")
 
@@ -185,7 +124,6 @@ class AgentSettings(I18nMixin, BaseModel):
         "basic_memory_agent": Description(
             en="Configuration for basic memory agent", zh="基础记忆代理配置"
         ),
-        "mem0_agent": Description(en="Configuration for Mem0 agent", zh="Mem0代理配置"),
         "hume_ai_agent": Description(
             en="Configuration for Hume AI agent", zh="Hume AI 代理配置"
         ),
@@ -199,7 +137,7 @@ class AgentConfig(I18nMixin, BaseModel):
     """This class contains all of the configurations related to agent."""
 
     conversation_agent_choice: Literal[
-        "basic_memory_agent", "mem0_agent", "hume_ai_agent", "letta_agent"
+        "basic_memory_agent", "hume_ai_agent", "letta_agent"
     ] = Field(..., alias="conversation_agent_choice")
     agent_settings: AgentSettings = Field(..., alias="agent_settings")
     llm_configs: StatelessLLMConfigs = Field(..., alias="llm_configs")
@@ -223,3 +161,23 @@ class AgentConfig(I18nMixin, BaseModel):
             zh="分割句子的方法：'regex' 或 'pysbd'（默认：'pysbd'）",
         ),
     }
+
+    @model_validator(mode="after")
+    def check_selected_agent(self) -> "AgentConfig":
+        selected = getattr(self.agent_settings, self.conversation_agent_choice, None)
+        if selected is None:
+            raise ValueError(
+                "Configuration section "
+                f"'agent_config.agent_settings.{self.conversation_agent_choice}' is required "
+                "when that conversation agent is selected"
+            )
+        require_provider_dependencies("agent", self.conversation_agent_choice)
+        if self.conversation_agent_choice == "basic_memory_agent":
+            provider = selected.llm_provider
+            if getattr(self.llm_configs, provider, None) is None:
+                raise ValueError(
+                    f"Configuration section 'agent_config.llm_configs.{provider}' is required "
+                    "when that LLM provider is selected"
+                )
+            require_provider_dependencies("llm", provider)
+        return self

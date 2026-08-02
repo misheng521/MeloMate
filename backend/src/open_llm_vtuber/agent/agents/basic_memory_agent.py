@@ -9,6 +9,8 @@ from typing import (
     Optional,
 )
 import datetime
+import json
+import asyncio
 from loguru import logger
 from .agent_interface import AgentInterface
 from ..output_types import SentenceOutput, DisplayText
@@ -24,11 +26,17 @@ from ..transformers import (
 )
 from ...config_manager import TTSPreprocessorConfig
 from ..input_types import BatchInput, TextSource
-from prompts import prompt_loader
 from ...mcpp.tool_manager import ToolManager
 from ...mcpp.json_detector import StreamJSONDetector
 from ...mcpp.types import ToolCallObject
 from ...mcpp.tool_executor import ToolExecutor
+from ...workspace_security import (
+    WORKSPACE_AWARE_CHAT_SYSTEM_GUARD,
+    WORKSPACE_EVENT_SYSTEM_GUARD,
+    WORKSPACE_STATE_RESULT_SYSTEM_GUARD,
+    workspace_awareness_tool_policy,
+    workspace_event_tool_policy,
+)
 
 
 WORKSPACE_TOOL_NAMES = {
@@ -38,7 +46,6 @@ WORKSPACE_TOOL_NAMES = {
     "write_workspace_project",
     "read_workspace_file",
     "list_workspace",
-    "schedule_reminder",
     "send_workspace_key",
     "send_workspace_action",
     "read_workspace_state",
@@ -50,6 +57,12 @@ SILENT_WORKSPACE_TOOL_NAMES = {
     "send_workspace_action",
     "send_workspace_key",
 }
+
+DEFAULT_MAX_TOOL_ROUNDS = 8
+MAX_TOOL_CALLS_PER_ROUND = 8
+MAX_TOOL_CALLS_PER_TURN = 16
+TOOL_TURN_TIMEOUT_SECONDS = 180
+TOOL_LIMIT_MESSAGE = "工具操作已安全停止：本次回复达到调用次数或时间限制。"
 
 
 class BasicMemoryAgent(AgentInterface):
@@ -140,7 +153,7 @@ class BasicMemoryAgent(AgentInterface):
 
     def set_system(self, system: str):
         """Set the system prompt."""
-        logger.debug(f"Memory Agent: Setting system prompt: '''{system}'''")
+        logger.debug(f"Memory Agent: setting system prompt (chars={len(system)})")
 
         if self.interrupt_method == "user":
             system = f"{system}\n\nIf you received `[interrupted by user]` signal, you were interrupted."
@@ -198,7 +211,7 @@ class BasicMemoryAgent(AgentInterface):
         messages = get_history(conf_uid, history_uid)
 
         self._memory = []
-        for msg in messages:
+        for index, msg in enumerate(messages):
             role = "user" if msg["role"] == "human" else "assistant"
             content = msg["content"]
             if isinstance(content, str) and content:
@@ -209,7 +222,7 @@ class BasicMemoryAgent(AgentInterface):
                     }
                 )
             else:
-                logger.warning(f"Skipping invalid message from history: {msg}")
+                logger.warning(f"Skipping invalid message from history at index {index}")
         logger.info(f"Loaded {len(self._memory)} messages from history.")
 
     def handle_interrupt(self, heard_response: str) -> None:
@@ -252,6 +265,41 @@ class BasicMemoryAgent(AgentInterface):
             return str(call.id or "")
         return str(call.get("id") or "")
 
+    @staticmethod
+    def _formatted_tool_name(tool: Dict[str, Any], mode: str) -> str:
+        if mode == "OpenAI":
+            return str(tool.get("function", {}).get("name") or "")
+        return str(tool.get("name") or "")
+
+    def _filter_tools_for_policy(
+        self,
+        tools: List[Dict[str, Any]],
+        mode: str,
+        tool_policy: Dict[str, Any] | None,
+    ) -> List[Dict[str, Any]]:
+        if tool_policy is None or tool_policy.get("enforce") is not True:
+            return tools
+        allowed = set(tool_policy.get("allowed_tool_names") or ())
+        return [
+            tool
+            for tool in tools
+            if self._formatted_tool_name(tool, mode) in allowed
+        ]
+
+    @staticmethod
+    def _secure_system_prompt_for_policy(
+        system_prompt: str, tool_policy: Dict[str, Any] | None
+    ) -> str:
+        if not tool_policy:
+            return system_prompt
+        if tool_policy.get("source") == "workspace_event":
+            return f"{system_prompt}\n\n{WORKSPACE_EVENT_SYSTEM_GUARD}"
+        if tool_policy.get("source") == "workspace_aware_chat":
+            return f"{system_prompt}\n\n{WORKSPACE_AWARE_CHAT_SYSTEM_GUARD}"
+        if tool_policy.get("workspace_state_tainted") is True:
+            return f"{system_prompt}\n\n{WORKSPACE_STATE_RESULT_SYSTEM_GUARD}"
+        return system_prompt
+
     def _contains_workspace_tool(
         self, tool_calls: Union[List[ToolCallObject], List[Dict[str, Any]]]
     ) -> bool:
@@ -263,14 +311,21 @@ class BasicMemoryAgent(AgentInterface):
         names = {self._tool_call_name(call) for call in tool_calls}
         return bool(names & WORKSPACE_TOOL_NAMES) and not names <= SILENT_WORKSPACE_TOOL_NAMES
 
+    @staticmethod
+    def _consume_tool_call_budget(total_calls: int, batch_size: int) -> int:
+        if batch_size < 1 or batch_size > MAX_TOOL_CALLS_PER_ROUND:
+            raise RuntimeError(TOOL_LIMIT_MESSAGE)
+        updated = total_calls + batch_size
+        if updated > MAX_TOOL_CALLS_PER_TURN:
+            raise RuntimeError(TOOL_LIMIT_MESSAGE)
+        return updated
+
     def _workspace_ack_text(
         self, tool_calls: Union[List[ToolCallObject], List[Dict[str, Any]]]
     ) -> str:
         names = {self._tool_call_name(call) for call in tool_calls}
         if "open_workspace_item" in names:
             return "好，我打开给你。"
-        if "schedule_reminder" in names:
-            return "好，我先记下这个提醒。"
         if names <= SILENT_WORKSPACE_TOOL_NAMES:
             return ""
         if names & {
@@ -301,7 +356,9 @@ class BasicMemoryAgent(AgentInterface):
                 }
         return None
 
-    def _to_text_prompt(self, input_data: BatchInput) -> str:
+    def _to_text_prompt(
+        self, input_data: BatchInput, include_workspace_context: bool = True
+    ) -> str:
         """Format input data to text prompt."""
         message_parts = []
 
@@ -316,13 +373,33 @@ class BasicMemoryAgent(AgentInterface):
         if input_data.images:
             message_parts.append("\n[User has also provided images]")
 
+        awareness = (
+            input_data.metadata.get("workspace_awareness")
+            if isinstance(input_data.metadata, dict)
+            else None
+        )
+        if include_workspace_context and isinstance(awareness, dict):
+            encoded = json.dumps(
+                awareness, ensure_ascii=False, separators=(",", ":")
+            )
+            message_parts.append(
+                "\n<LIVE_WORKSPACE_CONTEXT_UNTRUSTED_DATA>\n"
+                f"{encoded[:20_000]}\n"
+                "</LIVE_WORKSPACE_CONTEXT_UNTRUSTED_DATA>"
+            )
+
         return "\n".join(message_parts).strip()
 
-    def _to_messages(self, input_data: BatchInput) -> List[Dict[str, Any]]:
+    def _to_messages(
+        self, input_data: BatchInput, include_memory: bool = True
+    ) -> List[Dict[str, Any]]:
         """Prepare messages for LLM API call."""
-        messages = self._memory.copy()
+        messages = self._memory.copy() if include_memory else []
         user_content = []
         text_prompt = self._to_text_prompt(input_data)
+        memory_text_prompt = self._to_text_prompt(
+            input_data, include_workspace_context=False
+        )
         if text_prompt:
             user_content.append({"type": "text", "text": text_prompt})
 
@@ -359,7 +436,10 @@ class BasicMemoryAgent(AgentInterface):
 
             if not skip_memory:
                 self._add_message(
-                    text_prompt if text_prompt else "[User provided image(s)]", "user"
+                    memory_text_prompt
+                    if memory_text_prompt
+                    else "[User provided image(s)]",
+                    "user",
                 )
         else:
             logger.warning("No content generated for user message.")
@@ -370,6 +450,10 @@ class BasicMemoryAgent(AgentInterface):
         self,
         initial_messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]],
+        system_prompt: str,
+        tool_policy: Dict[str, Any] | None = None,
+        max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
+        remember_turn: bool = True,
     ) -> AsyncIterator[Union[str, Dict[str, Any]]]:
         """Handle Claude interaction loop with tool support."""
         messages = initial_messages.copy()
@@ -377,9 +461,20 @@ class BasicMemoryAgent(AgentInterface):
         pending_tool_calls = []
         current_assistant_message_content = []
         workspace_ack_sent = False
+        tool_rounds = 0
+        total_tool_calls = 0
+        workspace_context_isolated = False
 
         while True:
-            stream = self._llm.chat_completion(messages, self._system, tools=tools)
+            tools_for_api = self._filter_tools_for_policy(
+                tools, "Claude", tool_policy
+            )
+            active_system_prompt = self._secure_system_prompt_for_policy(
+                system_prompt, tool_policy
+            )
+            stream = self._llm.chat_completion(
+                messages, active_system_prompt, tools=tools_for_api
+            )
             pending_tool_calls.clear()
             current_assistant_message_content.clear()
             current_turn_text = ""
@@ -422,6 +517,17 @@ class BasicMemoryAgent(AgentInterface):
                     return
 
             if pending_tool_calls:
+                tool_rounds += 1
+                if tool_rounds > max_tool_rounds:
+                    yield TOOL_LIMIT_MESSAGE
+                    return
+                try:
+                    total_tool_calls = self._consume_tool_call_budget(
+                        total_tool_calls, len(pending_tool_calls)
+                    )
+                except RuntimeError:
+                    yield TOOL_LIMIT_MESSAGE
+                    return
                 if (
                     not workspace_ack_sent
                     and self._contains_workspace_tool(pending_tool_calls)
@@ -435,7 +541,8 @@ class BasicMemoryAgent(AgentInterface):
                         pending_tool_calls
                     )
                     yield ack_text
-                    self._add_message(ack_text, "assistant")
+                    if remember_turn:
+                        self._add_message(ack_text, "assistant")
 
                 filtered_assistant_content = [
                     block
@@ -457,7 +564,7 @@ class BasicMemoryAgent(AgentInterface):
                             if c["type"] == "text"
                         ]
                     ).strip()
-                    if assistant_text_for_memory:
+                    if assistant_text_for_memory and remember_turn:
                         self._add_message(assistant_text_for_memory, "assistant")
 
                 tool_results_for_llm = []
@@ -471,6 +578,7 @@ class BasicMemoryAgent(AgentInterface):
                 tool_executor_iterator = self._tool_executor.execute_tools(
                     tool_calls=pending_tool_calls,
                     caller_mode="Claude",
+                    tool_policy=tool_policy,
                 )
                 try:
                     while True:
@@ -487,40 +595,66 @@ class BasicMemoryAgent(AgentInterface):
 
                 if tool_results_for_llm:
                     messages.append({"role": "user", "content": tool_results_for_llm})
+                if (
+                    tool_policy
+                    and tool_policy.get("workspace_state_tainted") is True
+                    and not workspace_context_isolated
+                ):
+                    tool_exchange = messages[len(initial_messages) :]
+                    messages[:] = [*initial_messages[-1:], *tool_exchange]
+                    workspace_context_isolated = True
+                    remember_turn = False
 
                 # stop_reason = None
                 continue
             else:
                 if current_turn_text:
                     yield current_turn_text
-                    self._add_message(current_turn_text, "assistant")
+                    if remember_turn:
+                        self._add_message(current_turn_text, "assistant")
                 return
 
     async def _openai_tool_interaction_loop(
         self,
         initial_messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]],
+        system_prompt: str,
+        tool_policy: Dict[str, Any] | None = None,
+        max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
+        remember_turn: bool = True,
     ) -> AsyncIterator[Union[str, Dict[str, Any]]]:
         """Handle OpenAI interaction with tool support."""
         messages = initial_messages.copy()
         current_turn_text = ""
         pending_tool_calls: Union[List[ToolCallObject], List[Dict[str, Any]]] = []
-        current_system_prompt = self._system
+        current_system_prompt = system_prompt
         workspace_ack_sent = False
+        tool_rounds = 0
+        total_tool_calls = 0
+        workspace_context_isolated = False
 
         while True:
             if self.prompt_mode_flag:
                 if self._mcp_prompt_string:
                     current_system_prompt = (
-                        f"{self._system}\n\n{self._mcp_prompt_string}"
+                        f"{system_prompt}\n\n{self._mcp_prompt_string}"
+                    )
+                    current_system_prompt = self._secure_system_prompt_for_policy(
+                        current_system_prompt, tool_policy
                     )
                 else:
                     logger.warning("Prompt mode active but mcp_prompt_string is empty!")
-                    current_system_prompt = self._system
+                    current_system_prompt = self._secure_system_prompt_for_policy(
+                        system_prompt, tool_policy
+                    )
                 tools_for_api = None
             else:
-                current_system_prompt = self._system
-                tools_for_api = tools
+                current_system_prompt = self._secure_system_prompt_for_policy(
+                    system_prompt, tool_policy
+                )
+                tools_for_api = self._filter_tools_for_policy(
+                    tools, "OpenAI", tool_policy
+                )
 
             stream = self._llm.chat_completion(
                 messages, current_system_prompt, tools=tools_for_api
@@ -592,12 +726,24 @@ class BasicMemoryAgent(AgentInterface):
 
             if detected_prompt_json:
                 logger.info("Processing tools detected via prompt mode JSON.")
-                self._add_message(current_turn_text, "assistant")
+                if remember_turn:
+                    self._add_message(current_turn_text, "assistant")
 
                 parsed_tools = self._tool_executor.process_tool_from_prompt_json(
                     detected_prompt_json
                 )
                 if parsed_tools:
+                    tool_rounds += 1
+                    if tool_rounds > max_tool_rounds:
+                        yield TOOL_LIMIT_MESSAGE
+                        return
+                    try:
+                        total_tool_calls = self._consume_tool_call_budget(
+                            total_tool_calls, len(parsed_tools)
+                        )
+                    except RuntimeError:
+                        yield TOOL_LIMIT_MESSAGE
+                        return
                     tool_results_for_llm = []
                     if not self._tool_executor:
                         logger.error(
@@ -609,6 +755,7 @@ class BasicMemoryAgent(AgentInterface):
                     tool_executor_iterator = self._tool_executor.execute_tools(
                         tool_calls=parsed_tools,
                         caller_mode="Prompt",
+                        tool_policy=tool_policy,
                     )
                     try:
                         while True:
@@ -632,9 +779,29 @@ class BasicMemoryAgent(AgentInterface):
                         messages.append(
                             {"role": "user", "content": combined_results_str}
                         )
+                    if (
+                        tool_policy
+                        and tool_policy.get("workspace_state_tainted") is True
+                        and not workspace_context_isolated
+                    ):
+                        tool_exchange = messages[len(initial_messages) :]
+                        messages[:] = [*initial_messages[-1:], *tool_exchange]
+                        workspace_context_isolated = True
+                        remember_turn = False
                 continue
 
             elif pending_tool_calls and assistant_message_for_api:
+                tool_rounds += 1
+                if tool_rounds > max_tool_rounds:
+                    yield TOOL_LIMIT_MESSAGE
+                    return
+                try:
+                    total_tool_calls = self._consume_tool_call_budget(
+                        total_tool_calls, len(pending_tool_calls)
+                    )
+                except RuntimeError:
+                    yield TOOL_LIMIT_MESSAGE
+                    return
                 if (
                     not workspace_ack_sent
                     and self._contains_workspace_tool(pending_tool_calls)
@@ -648,10 +815,11 @@ class BasicMemoryAgent(AgentInterface):
                         pending_tool_calls
                     )
                     yield ack_text
-                    self._add_message(ack_text, "assistant")
+                    if remember_turn:
+                        self._add_message(ack_text, "assistant")
 
                 messages.append(assistant_message_for_api)
-                if current_turn_text:
+                if current_turn_text and remember_turn:
                     self._add_message(current_turn_text, "assistant")
 
                 tool_results_for_llm = []
@@ -665,6 +833,7 @@ class BasicMemoryAgent(AgentInterface):
                 tool_executor_iterator = self._tool_executor.execute_tools(
                     tool_calls=pending_tool_calls,
                     caller_mode="OpenAI",
+                    tool_policy=tool_policy,
                 )
                 try:
                     while True:
@@ -681,12 +850,22 @@ class BasicMemoryAgent(AgentInterface):
 
                 if tool_results_for_llm:
                     messages.extend(tool_results_for_llm)
+                if (
+                    tool_policy
+                    and tool_policy.get("workspace_state_tainted") is True
+                    and not workspace_context_isolated
+                ):
+                    tool_exchange = messages[len(initial_messages) :]
+                    messages[:] = [*initial_messages[-1:], *tool_exchange]
+                    workspace_context_isolated = True
+                    remember_turn = False
                 continue
 
             else:
                 if current_turn_text:
                     yield current_turn_text
-                    self._add_message(current_turn_text, "assistant")
+                    if remember_turn:
+                        self._add_message(current_turn_text, "assistant")
                 return
 
     def _chat_function_factory(
@@ -709,20 +888,60 @@ class BasicMemoryAgent(AgentInterface):
             self.reset_interrupt()
             self.prompt_mode_flag = False
 
-            messages = self._to_messages(input_data)
+            event_tool_policy = workspace_event_tool_policy(input_data.metadata)
+            is_workspace_event = event_tool_policy is not None
+            awareness_tool_policy = workspace_awareness_tool_policy(
+                input_data.metadata
+            )
+            is_workspace_aware = awareness_tool_policy is not None
+            tool_policy = event_tool_policy or awareness_tool_policy or {
+                "source": "user_turn",
+                "enforce": False,
+            }
+            messages = self._to_messages(
+                input_data,
+                include_memory=not (is_workspace_event or is_workspace_aware),
+            )
             tools = None
             tool_mode = None
             llm_supports_native_tools = False
+            remember_turn = not bool(
+                input_data.metadata and input_data.metadata.get("skip_memory", False)
+            )
+            system_prompt = self._system
+            max_tool_rounds = DEFAULT_MAX_TOOL_ROUNDS
+            if is_workspace_event:
+                persona = str(tool_policy.get("workspace_persona") or "assistant")
+                system_prompt = (
+                    f"You are the workspace participant named {persona}. "
+                    "Analyze only the current isolated page event, keep any spoken "
+                    "response brief and natural, and do not disclose or infer private "
+                    "conversation context."
+                )
+                max_tool_rounds = 3
+            elif is_workspace_aware:
+                persona = str(tool_policy.get("workspace_persona") or "assistant")
+                system_prompt = (
+                    f"You are the workspace participant named {persona}. "
+                    "Answer only the user's actual current message naturally. You may "
+                    "discuss the supplied live page/file state, but no private chat "
+                    "history or long-term memory is available in this isolated turn."
+                )
+                max_tool_rounds = 3
 
             if self._use_mcpp and self._tool_manager:
                 tools = None
                 if isinstance(self._llm, ClaudeAsyncLLM):
                     tool_mode = "Claude"
-                    tools = self._formatted_tools_claude
+                    tools = self._filter_tools_for_policy(
+                        self._formatted_tools_claude, "Claude", tool_policy
+                    )
                     llm_supports_native_tools = True
                 elif isinstance(self._llm, OpenAICompatibleAsyncLLM):
                     tool_mode = "OpenAI"
-                    tools = self._formatted_tools_openai
+                    tools = self._filter_tools_for_policy(
+                        self._formatted_tools_openai, "OpenAI", tool_policy
+                    )
                     llm_supports_native_tools = True
                 else:
                     logger.warning(
@@ -738,23 +957,48 @@ class BasicMemoryAgent(AgentInterface):
                 logger.debug(
                     f"Starting Claude tool interaction loop with {len(tools)} tools."
                 )
-                async for output in self._claude_tool_interaction_loop(
-                    messages, tools if tools else []
-                ):
-                    yield output
+                try:
+                    async with asyncio.timeout(TOOL_TURN_TIMEOUT_SECONDS):
+                        async for output in self._claude_tool_interaction_loop(
+                            messages,
+                            tools if tools else [],
+                            system_prompt,
+                            tool_policy=tool_policy,
+                            max_tool_rounds=max_tool_rounds,
+                            remember_turn=remember_turn,
+                        ):
+                            yield output
+                except TimeoutError:
+                    logger.warning("Claude tool turn reached its time limit")
+                    yield TOOL_LIMIT_MESSAGE
                 return
             elif self._use_mcpp and tool_mode == "OpenAI":
                 logger.debug(
                     f"Starting OpenAI tool interaction loop with {len(tools)} tools."
                 )
-                async for output in self._openai_tool_interaction_loop(
-                    messages, tools if tools else []
-                ):
-                    yield output
+                try:
+                    async with asyncio.timeout(TOOL_TURN_TIMEOUT_SECONDS):
+                        async for output in self._openai_tool_interaction_loop(
+                            messages,
+                            tools if tools else [],
+                            system_prompt,
+                            tool_policy=tool_policy,
+                            max_tool_rounds=max_tool_rounds,
+                            remember_turn=remember_turn,
+                        ):
+                            yield output
+                except TimeoutError:
+                    logger.warning("OpenAI tool turn reached its time limit")
+                    yield TOOL_LIMIT_MESSAGE
                 return
             else:
                 logger.info("Starting simple chat completion.")
-                token_stream = self._llm.chat_completion(messages, self._system)
+                token_stream = self._llm.chat_completion(
+                    messages,
+                    self._secure_system_prompt_for_policy(
+                        system_prompt, tool_policy
+                    ),
+                )
                 complete_response = ""
                 async for event in token_stream:
                     text_chunk = ""
@@ -767,7 +1011,7 @@ class BasicMemoryAgent(AgentInterface):
                     if text_chunk:
                         yield text_chunk
                         complete_response += text_chunk
-                if complete_response:
+                if complete_response and remember_turn:
                     self._add_message(complete_response, "assistant")
 
         return chat_with_memory
@@ -784,30 +1028,3 @@ class BasicMemoryAgent(AgentInterface):
     def reset_interrupt(self) -> None:
         """Reset interrupt flag."""
         self._interrupt_handled = False
-
-    def start_group_conversation(
-        self, human_name: str, ai_participants: List[str]
-    ) -> None:
-        """Start a group conversation."""
-        if not self._tool_prompts:
-            logger.warning("Tool prompts dictionary is not set.")
-            return
-
-        other_ais = ", ".join(name for name in ai_participants)
-        prompt_name = self._tool_prompts.get("group_conversation_prompt", "")
-
-        if not prompt_name:
-            logger.warning("No group conversation prompt name found.")
-            return
-
-        try:
-            group_context = prompt_loader.load_util(prompt_name).format(
-                human_name=human_name, other_ais=other_ais
-            )
-            self._memory.append({"role": "user", "content": group_context})
-        except FileNotFoundError:
-            logger.error(f"Group conversation prompt file not found: {prompt_name}")
-        except KeyError as e:
-            logger.error(f"Missing formatting key in group conversation prompt: {e}")
-        except Exception as e:
-            logger.error(f"Failed to load group conversation prompt: {e}")

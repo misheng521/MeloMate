@@ -4,6 +4,7 @@ import json
 from typing import Callable
 from loguru import logger
 import numpy as np
+import workspace_core
 
 from .conversation_utils import (
     create_batch_input,
@@ -19,9 +20,131 @@ from .types import WebSocketSend
 from .tts_manager import TTSTaskManager
 from ..chat_history_manager import store_message
 from ..service_context import ServiceContext
+from ..workspace_security import (
+    extract_workspace_action_grants,
+    sanitize_untrusted_value,
+)
 
 # Import necessary types from agent outputs
 from ..agent.output_types import SentenceOutput, AudioOutput
+
+
+WORKSPACE_AWARENESS_KEYWORDS = (
+    "这一步",
+    "下一步",
+    "上一步",
+    "棋",
+    "局面",
+    "轮到",
+    "回合",
+    "比分",
+    "当前状态",
+    "现在状态",
+    "页面状态",
+    "游戏状态",
+    "你看到了",
+    "看得到",
+    "这个游戏",
+    "这个应用",
+    "当前页面",
+    "这个文件",
+    "这份文件",
+    "文件内容",
+    "这个目录",
+    "这份内容",
+    "你觉得",
+    "刚才",
+    "这里",
+    "current state",
+    "this move",
+    "next move",
+    "your turn",
+    "the board",
+    "this game",
+    "current page",
+)
+WORKSPACE_FILE_CHANGE_KEYWORDS = (
+    "创建",
+    "生成",
+    "保存",
+    "写入",
+    "修改文件",
+    "修改页面",
+    "重写",
+    "删除文件",
+    "添加功能",
+    "改代码",
+    "create file",
+    "write file",
+    "modify file",
+    "rewrite",
+    "delete file",
+    "change the code",
+)
+
+
+def _wants_live_workspace_context(text: str) -> bool:
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return False
+    if any(keyword in normalized for keyword in WORKSPACE_FILE_CHANGE_KEYWORDS):
+        return False
+    return any(keyword in normalized for keyword in WORKSPACE_AWARENESS_KEYWORDS)
+
+
+def _attach_live_workspace_context(
+    context: ServiceContext,
+    input_text: str,
+    metadata: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    next_metadata = dict(metadata or {})
+    next_metadata.pop("workspace_awareness", None)
+    snapshots = getattr(context, "workspace_awareness", None)
+    if not isinstance(snapshots, dict) or not _wants_live_workspace_context(input_text):
+        return next_metadata or None
+    character = context.character_config
+    persona = character.character_name or character.conf_name
+    try:
+        current = json.loads(workspace_core.read_workspace_state(persona))
+        state_file = current.get("state") if isinstance(current, dict) else None
+        report = state_file.get("state") if isinstance(state_file, dict) else None
+        page = report.get("page") if isinstance(report, dict) else None
+        if (
+            isinstance(current, dict)
+            and current.get("available") is True
+            and isinstance(page, dict)
+            and page.get("id")
+        ):
+            page_id = str(page.get("id"))[:128]
+            snapshots[page_id] = {
+                "page": sanitize_untrusted_value(page),
+                "state_version": max(0, int(report.get("state_version") or 0)),
+                "appState": sanitize_untrusted_value(report.get("appState")),
+                "actionGrants": extract_workspace_action_grants(
+                    report.get("appState")
+                ),
+                "updated_ms": int(state_file.get("updated_ms") or 0),
+            }
+        else:
+            for key, item in list(snapshots.items()):
+                if isinstance(item, dict) and "appState" in item:
+                    snapshots.pop(key, None)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    recent = sorted(
+        (item for item in snapshots.values() if isinstance(item, dict)),
+        key=lambda item: int(item.get("updated_ms") or 0),
+        reverse=True,
+    )[:4]
+    if not recent:
+        return next_metadata or None
+    next_metadata["workspace_awareness"] = {
+        "persona": persona,
+        "snapshots": recent,
+    }
+    next_metadata["skip_memory"] = True
+    next_metadata["skip_history"] = True
+    return next_metadata
 
 
 def with_turn_id(websocket_send: WebSocketSend, turn_id: Optional[str]) -> WebSocketSend:
@@ -115,6 +238,10 @@ async def process_single_conversation(
                 f"{augmented_input_text}"
             )
 
+        metadata = _attach_live_workspace_context(
+            context, input_text, metadata
+        )
+
         # Create batch input
         batch_input = create_batch_input(
             input_text=augmented_input_text,
@@ -148,7 +275,7 @@ async def process_single_conversation(
             context.agent_engine.set_system(refreshed_prompt)
             context.system_prompt = refreshed_prompt
 
-        logger.info(f"User input: {input_text}")
+        logger.info(f"User input received (chars={len(input_text)})")
         if images:
             logger.info(f"With {len(images)} images")
 
@@ -169,7 +296,11 @@ async def process_single_conversation(
 
                     # Handle tool status event: send WebSocket message
                     output_item["name"] = context.character_config.character_name
-                    logger.debug(f"Sending tool status update: {output_item}")
+                    logger.debug(
+                        "Sending tool status update "
+                        f"(tool={output_item.get('tool_name')}, "
+                        f"status={output_item.get('status')})"
+                    )
 
                     await websocket_send_with_turn(json.dumps(output_item))
 
@@ -196,7 +327,6 @@ async def process_single_conversation(
                     logger.warning(
                         f"Received unexpected item type from agent chat stream: {type(output_item)}"
                     )
-                    logger.debug(f"Unexpected item content: {output_item}")
 
         except Exception as e:
             logger.exception(
@@ -213,18 +343,13 @@ async def process_single_conversation(
             # full_response will contain partial response before error
         # --- End processing agent response ---
 
-        # Wait for any pending TTS tasks
-        if tts_manager.task_list:
-            await asyncio.gather(*tts_manager.task_list)
-            await websocket_send_with_turn(json.dumps({"type": "backend-synth-complete"}))
-
         await finalize_conversation_turn(
             tts_manager=tts_manager,
             websocket_send=websocket_send_with_turn,
             client_uid=client_uid,
         )
 
-        if context.history_uid and full_response:  # Check full_response before storing
+        if context.history_uid and full_response and not skip_history:
             store_message(
                 conf_uid=context.character_config.conf_uid,
                 history_uid=context.history_uid,
@@ -232,7 +357,7 @@ async def process_single_conversation(
                 content=full_response,
                 name=context.character_config.character_name,
             )
-            logger.info(f"AI response: {full_response}")
+            logger.info(f"AI response completed (chars={len(full_response)})")
 
         return full_response  # Return accumulated full_response
 
@@ -246,7 +371,7 @@ async def process_single_conversation(
         )
         raise
     finally:
-        cleanup_conversation(tts_manager, session_emoji)
+        await cleanup_conversation(tts_manager, session_emoji)
 
 
 async def process_queued_user_inputs(
@@ -403,7 +528,6 @@ def is_workspace_tool_status(output_item: Dict[str, Any]) -> bool:
         "write_workspace_project",
         "read_workspace_file",
         "list_workspace",
-        "schedule_reminder",
         "send_workspace_key",
         "send_workspace_action",
         "read_workspace_state",

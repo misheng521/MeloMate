@@ -15,8 +15,6 @@ system_config:
     # 启用 think_tag_prompt 可让不具备思考输出的 LLM 也能展示内心想法、心理活动和动作（以括号形式呈现），但不会进行语音合成。更多详情请参考 think_tag_prompt。
     # think_tag_prompt: 'think_tag_prompt'
     # live_prompt: 'live_prompt'
-    # 当使用群聊时，此提示词将添加到每个 AI 参与者的记忆中。
-    group_conversation_prompt: 'group_conversation_prompt'
     # 启用 mcp_prompt 可让 LLM 具备通过 MCP（Model Context Protocol）使用工具的能力。
     # 请注意：mcp_prompt 由 Agent 决定是否使用。
     mcp_prompt: 'mcp_prompt'
@@ -32,9 +30,9 @@ character_config:
   conf_name: '小可' # 角色配置文件的名称
   conf_uid: 'avatar_xiaoke_001' # 角色配置的唯一标识符
   live2d_model_name: 'epsilon_free' # Live2D 模型名称
-  character_name: '小可' # 将在群聊中使用，并显示为 AI 的名称。
+  character_name: '小可' # AI 的显示名称。
   avatar: 'mao.png' # 建议使用正方形图像作为头像。将其保存到 avatars 文件夹中。留空则使用角色名称的首字母作为头像。
-  human_name: 'Human' # 将在群聊中使用，并显示为人类的名称。
+  human_name: 'Human' # 用户的显示名称。
   #  =================== LLM 后端设置 ===================
 
   agent_config:
@@ -253,7 +251,7 @@ character_config:
   tts_config:
     tts_model: 'edge_tts' # 使用的文本转语音模型
     # 文本转语音模型选项：
-    #   'azure_tts', 'pyttsx3_tts', 'edge_tts', 'bark_tts',
+    #   'azure_tts', 'edge_tts', 'bark_tts',
     #   'cosyvoice_tts', 'melo_tts', 'coqui_tts', 'piper_tts',
     #   'fish_api_tts', 'x_tts', 'gpt_sovits_tts', 'sherpa_onnx_tts'
     #   'minimax_tts', 'elevenlabs_tts', 'cartesia_tts'
@@ -284,7 +282,6 @@ character_config:
       # 使用 `edge-tts --list-voices` 列出所有可用语音
       voice: zh-CN-XiaoxiaoNeural # 'en-US-AvaMultilingualNeural' #'zh-CN-XiaoxiaoNeural' # 'ja-JP-NanamiNeural'
 
-    # pyttsx3_tts 没有任何配置。
 
     piper_tts:
       model_path: '../models/backend/piper/zh_CN-huayan-medium.onnx' # 模型文件路径（.onnx 文件）

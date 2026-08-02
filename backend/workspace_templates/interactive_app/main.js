@@ -41,7 +41,7 @@ window.MeloMateGameState = () => ({
   step: state.step,
   currentTurn: state.currentTurn,
   log: state.log,
-  availableActions: state.currentTurn === "melomate" ? [{ action: "take-step", payload: {} }] : [],
+  availableActions: state.currentTurn === "melomate" ? [{ id: "take-step", action: "take-step", payload: {} }] : [],
 });
 
 window.MeloMateGameAction = (action) => {

@@ -1,5 +1,7 @@
-torchaudio==2.10.0
-transformers>=5.3.0
-accelerate
-librosa
-omnivoice
+# PyTorch and TorchAudio are installed by setup-windows.bat from the matching
+# CPU or CUDA wheel index before this common voice-cloning dependency set.
+transformers>=5.3.0,<6
+accelerate>=0.30
+librosa>=0.10
+omnivoice==0.2.1
+huggingface_hub>=0.24

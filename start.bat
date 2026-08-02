@@ -41,6 +41,14 @@ if errorlevel 1 (
   exit /b 1
 )
 
+"%ROOT%backend\.venv\Scripts\python.exe" "%ROOT%backend\check_runtime_dependencies.py"
+if errorlevel 1 (
+  echo [ERROR] MeloMate backend dependency versions are incompatible.
+  echo Run setup-windows.bat again to install the supported versions.
+  pause
+  exit /b 1
+)
+
 if not exist "%ROOT%models\backend\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17\model.int8.onnx" (
   echo [WARN] Default local ASR model was not found.
   echo [WARN] Voice recognition may fail unless backend\conf.yaml is changed to another ASR provider.
@@ -54,6 +62,7 @@ if errorlevel 1 (
 )
 
 echo Starting MeloMate...
+echo Backend Python: %ROOT%backend\.venv\Scripts\python.exe
 "%ROOT%backend\.venv\Scripts\python.exe" "%ROOT%backend\launch_melomate.py"
 set "START_RESULT=%ERRORLEVEL%"
 if not "%START_RESULT%"=="0" (

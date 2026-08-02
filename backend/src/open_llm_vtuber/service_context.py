@@ -783,9 +783,14 @@ General workspace judgment rules:
                 }
                 new_config = validate_config(new_config)
                 await self.load_from_config(new_config)  # Await the async load
-                logger.debug(f"New config: {self}")
                 logger.debug(
-                    f"New character config: {self.character_config.model_dump()}"
+                    "Character configuration loaded: conf_name={!r}, conf_uid={!r}, "
+                    "agent={!r}, asr={!r}, tts={!r}",
+                    self.character_config.conf_name,
+                    self.character_config.conf_uid,
+                    self.character_config.agent_config.conversation_agent_choice,
+                    self.character_config.asr_config.asr_model,
+                    self.character_config.tts_config.tts_model,
                 )
 
                 # Send responses to client

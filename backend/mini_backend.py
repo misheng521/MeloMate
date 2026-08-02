@@ -29,13 +29,19 @@ def init_logger() -> None:
         format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}",
         colorize=True,
     )
-    logger.add(
-        "logs/mini_backend_{time:YYYY-MM-DD}.log",
-        rotation="10 MB",
-        retention="14 days",
-        level="DEBUG",
-        encoding="utf-8",
-    )
+    try:
+        logger.add(
+            "logs/mini_backend_{time:YYYY-MM-DD}.log",
+            rotation="10 MB",
+            retention="14 days",
+            level="DEBUG",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        logger.warning(
+            "File logging is unavailable ({}); continuing with console logging.",
+            type(exc).__name__,
+        )
 
 
 def main() -> None:

@@ -56,9 +56,22 @@ def send_workspace_key(persona: str, key: str, code: str = "", duration_ms: int 
 
 
 @mcp.tool()
-def send_workspace_action(persona: str, action: str, payload: dict | None = None, wait_ms: int = 900) -> str:
-    """Send a semantic action to an open workspace HTML app for this persona. Prefer this for interactive tools, board games, turn-based apps, and any app that exposes app-specific actions, for example action="place-piece" with payload={"row": 7, "col": 7} or action="choose" with payload={"id":"card-2"}. This waits briefly for the page to confirm the action and return updated state. If confirmed=false, do not claim the action happened."""
-    return safe_call(workspace_core.send_workspace_action, persona, action, payload, wait_ms)
+def send_workspace_action(
+    persona: str,
+    action: str = "",
+    payload: dict | None = None,
+    wait_ms: int = 900,
+    action_id: str = "",
+) -> str:
+    """Send a semantic action to an open workspace HTML app for this persona. After reading state, prefer action_id from an exact page-advertised availableActions item; the server resolves its action and payload against the current state. Use action/payload only when no action_id is available. This waits briefly for page confirmation. If confirmed=false, do not claim the action happened."""
+    return safe_call(
+        workspace_core.send_workspace_action,
+        persona,
+        action,
+        payload,
+        wait_ms,
+        action_id=action_id,
+    )
 
 
 @mcp.tool()

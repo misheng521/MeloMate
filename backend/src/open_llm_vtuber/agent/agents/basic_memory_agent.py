@@ -37,6 +37,7 @@ from ...workspace_security import (
     workspace_awareness_tool_policy,
     workspace_event_tool_policy,
 )
+from ...workspace_intent import workspace_fast_ack_text
 
 
 WORKSPACE_TOOL_NAMES = {
@@ -56,6 +57,13 @@ SILENT_WORKSPACE_TOOL_NAMES = {
     "read_workspace_state",
     "send_workspace_action",
     "send_workspace_key",
+}
+
+WORKSPACE_WRITE_TOOL_NAMES = {
+    "create_workspace_folder",
+    "write_workspace_file",
+    "append_workspace_file",
+    "write_workspace_project",
 }
 
 DEFAULT_MAX_TOOL_ROUNDS = 8
@@ -292,13 +300,39 @@ class BasicMemoryAgent(AgentInterface):
     ) -> str:
         if not tool_policy:
             return system_prompt
+        secured_prompt = system_prompt
+        if tool_policy.get("workspace_fast_ack_sent") is True:
+            secured_prompt += (
+                "\n\nThe application has already given the user a short spoken "
+                "acknowledgement for this workspace task. Start the required tool "
+                "work immediately. Do not repeat a promise to start, and do not say "
+                "the work is complete until the tools confirm it."
+            )
         if tool_policy.get("source") == "workspace_event":
-            return f"{system_prompt}\n\n{WORKSPACE_EVENT_SYSTEM_GUARD}"
+            return f"{secured_prompt}\n\n{WORKSPACE_EVENT_SYSTEM_GUARD}"
         if tool_policy.get("source") == "workspace_aware_chat":
-            return f"{system_prompt}\n\n{WORKSPACE_AWARE_CHAT_SYSTEM_GUARD}"
+            return f"{secured_prompt}\n\n{WORKSPACE_AWARE_CHAT_SYSTEM_GUARD}"
         if tool_policy.get("workspace_state_tainted") is True:
-            return f"{system_prompt}\n\n{WORKSPACE_STATE_RESULT_SYSTEM_GUARD}"
-        return system_prompt
+            return f"{secured_prompt}\n\n{WORKSPACE_STATE_RESULT_SYSTEM_GUARD}"
+        return secured_prompt
+
+    @staticmethod
+    def _user_input_text(input_data: BatchInput) -> str:
+        return "\n".join(
+            text.content
+            for text in input_data.texts
+            if text.source == TextSource.INPUT and text.content
+        )
+
+    def _workspace_write_tools_available(
+        self, tools: List[Dict[str, Any]] | None, mode: str | None
+    ) -> bool:
+        if not tools or mode not in {"OpenAI", "Claude"}:
+            return False
+        return any(
+            self._formatted_tool_name(tool, mode) in WORKSPACE_WRITE_TOOL_NAMES
+            for tool in tools
+        )
 
     def _contains_workspace_tool(
         self, tool_calls: Union[List[ToolCallObject], List[Dict[str, Any]]]
@@ -460,7 +494,9 @@ class BasicMemoryAgent(AgentInterface):
         current_turn_text = ""
         pending_tool_calls = []
         current_assistant_message_content = []
-        workspace_ack_sent = False
+        workspace_ack_sent = bool(
+            tool_policy and tool_policy.get("workspace_fast_ack_sent") is True
+        )
         tool_rounds = 0
         total_tool_calls = 0
         workspace_context_isolated = False
@@ -628,7 +664,9 @@ class BasicMemoryAgent(AgentInterface):
         current_turn_text = ""
         pending_tool_calls: Union[List[ToolCallObject], List[Dict[str, Any]]] = []
         current_system_prompt = system_prompt
-        workspace_ack_sent = False
+        workspace_ack_sent = bool(
+            tool_policy and tool_policy.get("workspace_fast_ack_sent") is True
+        )
         tool_rounds = 0
         total_tool_calls = 0
         workspace_context_isolated = False
@@ -952,6 +990,18 @@ class BasicMemoryAgent(AgentInterface):
                     logger.warning(
                         f"No tools available/formatted for '{tool_mode}' mode, despite MCP being enabled."
                     )
+
+            if (
+                not is_workspace_event
+                and not is_workspace_aware
+                and remember_turn
+                and self._workspace_write_tools_available(tools, tool_mode)
+            ):
+                fast_ack = workspace_fast_ack_text(self._user_input_text(input_data))
+                if fast_ack:
+                    tool_policy["workspace_fast_ack_sent"] = True
+                    yield fast_ack
+                    self._add_message(fast_ack, "assistant")
 
             if self._use_mcpp and tool_mode == "Claude":
                 logger.debug(

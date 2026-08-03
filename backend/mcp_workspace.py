@@ -33,7 +33,7 @@ def append_workspace_file(persona: str, folder: str, filename: str, content: str
 
 @mcp.tool()
 def write_workspace_project(persona: str, folder: str, files: list[dict]) -> str:
-    """Write a multi-file project under workspace/{persona}/{folder}. files must be a list of objects like {"path":"index.html","content":"..."}. Prefer this for games, tools, and mini apps, split into index.html, style.css, and main.js. For anything the user expects you to operate, join, play, test, or react to, expose continuous MeloMateGameState/app state and handle MeloMateGameAction/melomate-action so you can truly control it through tools instead of using built-in fake AI."""
+    """Write a multi-file project under workspace/{persona}/{folder}. files must be a list of objects like {"path":"index.html","content":"..."}. Prefer this for games, tools, and mini apps, split into index.html, style.css, and main.js. For anything the user expects the character to operate, expose continuous MeloMateGameState with agentShouldAct and exact availableActions, and handle MeloMateGameAction/melomate-action. The independent workspace Agent then controls it instead of a fake built-in AI."""
     return safe_call(workspace_core.write_workspace_project, persona, folder, files)
 
 
@@ -50,34 +50,57 @@ def list_workspace(persona: str, folder: str = "") -> str:
 
 
 @mcp.tool()
-def send_workspace_key(persona: str, key: str, code: str = "", duration_ms: int = 80, repeat: int = 1) -> str:
-    """Send keyboard input to an open workspace HTML game or mini app for this persona. Use keys such as ArrowLeft, ArrowRight, ArrowUp, ArrowDown, Space, Enter, w, a, s, or d. Use repeat for repeated taps and duration_ms for how long each key is held."""
-    return safe_call(workspace_core.send_workspace_key, persona, key, code, duration_ms, repeat)
-
-
-@mcp.tool()
-def send_workspace_action(
+def replace_workspace_text(
     persona: str,
-    action: str = "",
-    payload: dict | None = None,
-    wait_ms: int = 900,
-    action_id: str = "",
+    path: str,
+    old_text: str,
+    new_text: str,
+    replace_all: bool = False,
 ) -> str:
-    """Send a semantic action to an open workspace HTML app for this persona. After reading state, prefer action_id from an exact page-advertised availableActions item; the server resolves its action and payload against the current state. Use action/payload only when no action_id is available. This waits briefly for page confirmation. If confirmed=false, do not claim the action happened."""
+    """Edit an existing UTF-8 workspace file by replacing exact text. Read the file first and provide enough surrounding text for a unique match. Use replace_all only when every exact occurrence should change."""
     return safe_call(
-        workspace_core.send_workspace_action,
+        workspace_core.replace_workspace_text,
         persona,
-        action,
-        payload,
-        wait_ms,
-        action_id=action_id,
+        path,
+        old_text,
+        new_text,
+        replace_all,
     )
 
 
 @mcp.tool()
-def read_workspace_state(persona: str) -> str:
-    """Read the latest state reported by an open workspace HTML app for this persona. Use this before controlling, playing, testing, or reacting to interactive workspace apps. If available=false, you cannot see the app state and must not invent moves, choices, coordinates, score, winner, or current UI state."""
-    return safe_call(workspace_core.read_workspace_state, persona)
+def move_workspace_item(persona: str, source: str, destination: str) -> str:
+    """Move or rename one file or folder inside workspace/{persona}. The destination must not already exist."""
+    return safe_call(workspace_core.move_workspace_item, persona, source, destination)
+
+
+@mcp.tool()
+def delete_workspace_item(persona: str, path: str, recursive: bool = False) -> str:
+    """Delete one item inside workspace/{persona}. Set recursive=true only when the user explicitly authorized deleting a non-empty folder. The persona root and runtime control data cannot be deleted."""
+    return safe_call(workspace_core.delete_workspace_item, persona, path, recursive)
+
+
+@mcp.tool()
+def search_workspace(
+    persona: str,
+    query: str,
+    folder: str = "",
+    max_results: int = 50,
+) -> str:
+    """Search UTF-8 workspace files for text and return bounded path, line, and snippet matches."""
+    return safe_call(
+        workspace_core.search_workspace,
+        persona,
+        query,
+        folder,
+        max_results,
+    )
+
+
+@mcp.tool()
+def read_workspace_state(persona: str, page_id: str = "") -> str:
+    """Read verified state reported by an open workspace HTML app for this persona. page_id may select one exact open page; otherwise the most recently reporting page is returned. This is read-only: the independent workspace Agent owns semantic actions. If available=false, do not invent app state."""
+    return safe_call(workspace_core.read_workspace_state, persona, page_id)
 
 
 @mcp.tool()

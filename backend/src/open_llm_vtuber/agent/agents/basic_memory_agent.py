@@ -32,10 +32,8 @@ from ...mcpp.types import ToolCallObject
 from ...mcpp.tool_executor import ToolExecutor
 from ...workspace_security import (
     WORKSPACE_AWARE_CHAT_SYSTEM_GUARD,
-    WORKSPACE_EVENT_SYSTEM_GUARD,
     WORKSPACE_STATE_RESULT_SYSTEM_GUARD,
     workspace_awareness_tool_policy,
-    workspace_event_tool_policy,
 )
 from ...workspace_intent import workspace_fast_ack_text
 
@@ -47,16 +45,16 @@ WORKSPACE_TOOL_NAMES = {
     "write_workspace_project",
     "read_workspace_file",
     "list_workspace",
-    "send_workspace_key",
-    "send_workspace_action",
+    "replace_workspace_text",
+    "move_workspace_item",
+    "delete_workspace_item",
+    "search_workspace",
     "read_workspace_state",
     "open_workspace_item",
 }
 
 SILENT_WORKSPACE_TOOL_NAMES = {
     "read_workspace_state",
-    "send_workspace_action",
-    "send_workspace_key",
 }
 
 WORKSPACE_WRITE_TOOL_NAMES = {
@@ -64,12 +62,17 @@ WORKSPACE_WRITE_TOOL_NAMES = {
     "write_workspace_file",
     "append_workspace_file",
     "write_workspace_project",
+    "replace_workspace_text",
+    "move_workspace_item",
+    "delete_workspace_item",
 }
 
 DEFAULT_MAX_TOOL_ROUNDS = 8
+WORKSPACE_MAX_TOOL_ROUNDS = 16
 MAX_TOOL_CALLS_PER_ROUND = 8
 MAX_TOOL_CALLS_PER_TURN = 16
-TOOL_TURN_TIMEOUT_SECONDS = 180
+MAX_WORKSPACE_TOOL_CALLS_PER_TURN = 32
+TOOL_TURN_TIMEOUT_SECONDS = 300
 TOOL_LIMIT_MESSAGE = "工具操作已安全停止：本次回复达到调用次数或时间限制。"
 
 
@@ -214,6 +217,10 @@ class BasicMemoryAgent(AgentInterface):
 
         self._memory.append(message_data)
 
+    def add_external_assistant_message(self, message: str) -> None:
+        """Record a verified workspace Agent utterance in the shared chat memory."""
+        self._add_message(str(message or "").strip(), "assistant")
+
     def set_memory_from_history(self, conf_uid: str, history_uid: str) -> None:
         """Load memory from chat history."""
         messages = get_history(conf_uid, history_uid)
@@ -308,8 +315,6 @@ class BasicMemoryAgent(AgentInterface):
                 "work immediately. Do not repeat a promise to start, and do not say "
                 "the work is complete until the tools confirm it."
             )
-        if tool_policy.get("source") == "workspace_event":
-            return f"{secured_prompt}\n\n{WORKSPACE_EVENT_SYSTEM_GUARD}"
         if tool_policy.get("source") == "workspace_aware_chat":
             return f"{secured_prompt}\n\n{WORKSPACE_AWARE_CHAT_SYSTEM_GUARD}"
         if tool_policy.get("workspace_state_tainted") is True:
@@ -346,11 +351,15 @@ class BasicMemoryAgent(AgentInterface):
         return bool(names & WORKSPACE_TOOL_NAMES) and not names <= SILENT_WORKSPACE_TOOL_NAMES
 
     @staticmethod
-    def _consume_tool_call_budget(total_calls: int, batch_size: int) -> int:
+    def _consume_tool_call_budget(
+        total_calls: int,
+        batch_size: int,
+        maximum_calls: int = MAX_TOOL_CALLS_PER_TURN,
+    ) -> int:
         if batch_size < 1 or batch_size > MAX_TOOL_CALLS_PER_ROUND:
             raise RuntimeError(TOOL_LIMIT_MESSAGE)
         updated = total_calls + batch_size
-        if updated > MAX_TOOL_CALLS_PER_TURN:
+        if updated > maximum_calls:
             raise RuntimeError(TOOL_LIMIT_MESSAGE)
         return updated
 
@@ -487,6 +496,7 @@ class BasicMemoryAgent(AgentInterface):
         system_prompt: str,
         tool_policy: Dict[str, Any] | None = None,
         max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
+        max_tool_calls: int = MAX_TOOL_CALLS_PER_TURN,
         remember_turn: bool = True,
     ) -> AsyncIterator[Union[str, Dict[str, Any]]]:
         """Handle Claude interaction loop with tool support."""
@@ -559,7 +569,7 @@ class BasicMemoryAgent(AgentInterface):
                     return
                 try:
                     total_tool_calls = self._consume_tool_call_budget(
-                        total_tool_calls, len(pending_tool_calls)
+                        total_tool_calls, len(pending_tool_calls), max_tool_calls
                     )
                 except RuntimeError:
                     yield TOOL_LIMIT_MESSAGE
@@ -657,6 +667,7 @@ class BasicMemoryAgent(AgentInterface):
         system_prompt: str,
         tool_policy: Dict[str, Any] | None = None,
         max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
+        max_tool_calls: int = MAX_TOOL_CALLS_PER_TURN,
         remember_turn: bool = True,
     ) -> AsyncIterator[Union[str, Dict[str, Any]]]:
         """Handle OpenAI interaction with tool support."""
@@ -777,7 +788,7 @@ class BasicMemoryAgent(AgentInterface):
                         return
                     try:
                         total_tool_calls = self._consume_tool_call_budget(
-                            total_tool_calls, len(parsed_tools)
+                            total_tool_calls, len(parsed_tools), max_tool_calls
                         )
                     except RuntimeError:
                         yield TOOL_LIMIT_MESSAGE
@@ -835,7 +846,7 @@ class BasicMemoryAgent(AgentInterface):
                     return
                 try:
                     total_tool_calls = self._consume_tool_call_budget(
-                        total_tool_calls, len(pending_tool_calls)
+                        total_tool_calls, len(pending_tool_calls), max_tool_calls
                     )
                 except RuntimeError:
                     yield TOOL_LIMIT_MESSAGE
@@ -926,19 +937,19 @@ class BasicMemoryAgent(AgentInterface):
             self.reset_interrupt()
             self.prompt_mode_flag = False
 
-            event_tool_policy = workspace_event_tool_policy(input_data.metadata)
-            is_workspace_event = event_tool_policy is not None
             awareness_tool_policy = workspace_awareness_tool_policy(
                 input_data.metadata
             )
             is_workspace_aware = awareness_tool_policy is not None
-            tool_policy = event_tool_policy or awareness_tool_policy or {
+            metadata = input_data.metadata if isinstance(input_data.metadata, dict) else {}
+            tool_policy = awareness_tool_policy or {
                 "source": "user_turn",
                 "enforce": False,
+                "workspace_persona": str(metadata.get("workspace_persona") or ""),
             }
             messages = self._to_messages(
                 input_data,
-                include_memory=not (is_workspace_event or is_workspace_aware),
+                include_memory=not is_workspace_aware,
             )
             tools = None
             tool_mode = None
@@ -948,16 +959,8 @@ class BasicMemoryAgent(AgentInterface):
             )
             system_prompt = self._system
             max_tool_rounds = DEFAULT_MAX_TOOL_ROUNDS
-            if is_workspace_event:
-                persona = str(tool_policy.get("workspace_persona") or "assistant")
-                system_prompt = (
-                    f"You are the workspace participant named {persona}. "
-                    "Analyze only the current isolated page event, keep any spoken "
-                    "response brief and natural, and do not disclose or infer private "
-                    "conversation context."
-                )
-                max_tool_rounds = 3
-            elif is_workspace_aware:
+            max_tool_calls = MAX_TOOL_CALLS_PER_TURN
+            if is_workspace_aware:
                 persona = str(tool_policy.get("workspace_persona") or "assistant")
                 system_prompt = (
                     f"You are the workspace participant named {persona}. "
@@ -992,14 +995,15 @@ class BasicMemoryAgent(AgentInterface):
                     )
 
             if (
-                not is_workspace_event
-                and not is_workspace_aware
+                not is_workspace_aware
                 and remember_turn
                 and self._workspace_write_tools_available(tools, tool_mode)
             ):
                 fast_ack = workspace_fast_ack_text(self._user_input_text(input_data))
                 if fast_ack:
                     tool_policy["workspace_fast_ack_sent"] = True
+                    max_tool_rounds = WORKSPACE_MAX_TOOL_ROUNDS
+                    max_tool_calls = MAX_WORKSPACE_TOOL_CALLS_PER_TURN
                     yield fast_ack
                     self._add_message(fast_ack, "assistant")
 
@@ -1015,6 +1019,7 @@ class BasicMemoryAgent(AgentInterface):
                             system_prompt,
                             tool_policy=tool_policy,
                             max_tool_rounds=max_tool_rounds,
+                            max_tool_calls=max_tool_calls,
                             remember_turn=remember_turn,
                         ):
                             yield output
@@ -1034,6 +1039,7 @@ class BasicMemoryAgent(AgentInterface):
                             system_prompt,
                             tool_policy=tool_policy,
                             max_tool_rounds=max_tool_rounds,
+                            max_tool_calls=max_tool_calls,
                             remember_turn=remember_turn,
                         ):
                             yield output

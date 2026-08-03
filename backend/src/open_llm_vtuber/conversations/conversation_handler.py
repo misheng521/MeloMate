@@ -94,35 +94,7 @@ async def handle_conversation_trigger(
         logger.debug("Ignoring empty input with no pending conversation content.")
         return
 
-    active_is_workspace_event = any(
-        _is_workspace_event_item(item)
-        for item in in_flight_conversation_inputs.get(client_uid, [])
-    )
-    if (
-        active_task
-        and not active_task.done()
-        and active_is_workspace_event
-        and not _is_workspace_event_item(queued_input)
-        and has_content
-    ):
-        await handle_individual_interrupt(
-            client_uid=client_uid,
-            current_conversation_tasks=current_conversation_tasks,
-            context=context,
-            heard_response="",
-        )
-        await websocket.send_text(json.dumps({"type": "interrupt-signal", "text": ""}))
-        active_task = current_conversation_tasks.get(client_uid)
-
     if active_task and not active_task.done():
-        if _is_workspace_event_item(queued_input):
-            if has_content:
-                _queue_input_by_priority(pending_queue, queued_input)
-            logger.info(
-                f"Queued isolated workspace event for {client_uid}; a conversation is active."
-            )
-            return
-
         if workspace_work_flags.get(client_uid):
             if has_content:
                 if _looks_like_workspace_revision(queued_input):
@@ -130,7 +102,7 @@ async def handle_conversation_trigger(
                         **(queued_input.get("metadata") or {}),
                         "workspace_revision": True,
                     }
-                _queue_input_by_priority(pending_queue, queued_input)
+                pending_queue.append(queued_input)
             logger.info(
                 f"Queued user input for {client_uid}; workspace work is active."
             )
@@ -155,22 +127,15 @@ async def handle_conversation_trigger(
             await websocket.send_text(
                 json.dumps({"type": "interrupt-signal", "text": ""})
             )
-            _queue_input_by_priority(pending_queue, queued_input)
+            pending_queue.append(queued_input)
         else:
             if has_content:
-                deferred_events = [
-                    item for item in pending_queue if _is_workspace_event_item(item)
-                ]
                 merged_inputs = [
                     *in_flight_conversation_inputs.get(client_uid, []),
-                    *[
-                        item
-                        for item in pending_queue
-                        if not _is_workspace_event_item(item)
-                    ],
+                    *pending_queue,
                     queued_input,
                 ]
-                pending_queue[:] = [*merged_inputs, *deferred_events]
+                pending_queue[:] = merged_inputs
                 in_flight_conversation_inputs.pop(client_uid, None)
                 await _cancel_conversation_task(
                     client_uid,
@@ -186,7 +151,7 @@ async def handle_conversation_trigger(
                     )
                 return
     elif has_content:
-        _queue_input_by_priority(pending_queue, queued_input)
+        pending_queue.append(queued_input)
 
     if not pending_queue:
         return
@@ -222,38 +187,6 @@ def _queued_input_has_content(item: Dict[str, Any]) -> bool:
     if isinstance(user_input, np.ndarray):
         return user_input.size > 0
     return user_input is not None
-
-
-def _is_workspace_event_item(item: Dict[str, Any]) -> bool:
-    metadata = item.get("metadata")
-    return isinstance(metadata, dict) and metadata.get("workspace_event") is True
-
-
-def _queue_input_by_priority(
-    pending_queue: List[Dict[str, Any]], item: Dict[str, Any]
-) -> None:
-    """Keep real user input ahead of passive workspace telemetry."""
-    if _is_workspace_event_item(item):
-        pending_queue.append(item)
-        return
-    for index, pending in enumerate(pending_queue):
-        if _is_workspace_event_item(pending):
-            pending_queue.insert(index, item)
-            return
-    pending_queue.append(item)
-
-
-def _pop_compatible_input_batch(
-    pending_queue: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Never merge untrusted telemetry into a user-authored conversation turn."""
-    first = pending_queue.pop(0)
-    batch = [first]
-    if _is_workspace_event_item(first):
-        return batch
-    while pending_queue and not _is_workspace_event_item(pending_queue[0]):
-        batch.append(pending_queue.pop(0))
-    return batch
 
 
 def _looks_like_workspace_revision(item: Dict[str, Any]) -> bool:
@@ -354,7 +287,8 @@ async def _drain_single_conversation_queue(
             if not pending_queue:
                 return
 
-            batch = _pop_compatible_input_batch(pending_queue)
+            batch = list(pending_queue)
+            pending_queue.clear()
             in_flight_conversation_inputs[client_uid] = batch
             reply_started_flags[client_uid] = False
             workspace_work_flags[client_uid] = False

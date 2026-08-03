@@ -297,7 +297,6 @@ let pendingPlaybackCompletion: { requestId: string; turnId?: string; queueVersio
 const acknowledgedPlaybackRequestIds = new Set<string>();
 let lastAssistantText = "";
 let heardAssistantText = "";
-const pendingWorkspaceDialogues: string[] = [];
 let audioQueueVersion = 0;
 let isAssistantResponding = false;
 let isUserSpeaking = false;
@@ -1374,34 +1373,6 @@ function appendAssistantLine(text: string, speakerName?: string) {
   markConversationActivity();
 }
 
-function renderWorkspaceDialogue(text: string) {
-  const cleanText = sanitizeAssistantReply(text);
-  if (!cleanText) return;
-  appendLine("assistant", cleanText);
-  subtitle.textContent = cleanText;
-  markConversationActivity();
-}
-
-function flushWorkspaceDialogues() {
-  if (isAssistantResponding || isUserSpeaking || isUserInputPriorityActive) return;
-  while (pendingWorkspaceDialogues.length) {
-    renderWorkspaceDialogue(pendingWorkspaceDialogues.shift() || "");
-  }
-}
-
-function appendWorkspaceDialogue(text: string) {
-  const cleanText = sanitizeAssistantReply(text);
-  if (!cleanText) return;
-  if (isAssistantResponding || isUserSpeaking || isUserInputPriorityActive) {
-    if (pendingWorkspaceDialogues[pendingWorkspaceDialogues.length - 1] !== cleanText) {
-      pendingWorkspaceDialogues.push(cleanText);
-      while (pendingWorkspaceDialogues.length > 8) pendingWorkspaceDialogues.shift();
-    }
-    return;
-  }
-  renderWorkspaceDialogue(cleanText);
-}
-
 function setCaptureUi(active: boolean) {
   isCapturing = active;
   startButton.disabled = active || isCaptureStarting;
@@ -2455,7 +2426,6 @@ function connectWebSocket() {
 
   ws.onclose = () => {
     isWsReady = false;
-    pendingWorkspaceDialogues.length = 0;
     cancelPendingVoiceCloneRequests();
     cancelPendingCredentialRequests();
     credentialStatusInitialized = false;
@@ -2597,9 +2567,6 @@ function handleWsMessage(message: WsMessage) {
     if (activeAssetPanelTab === "workspace" && workspaceEntriesCache.has("")) {
       renderWorkspaceEntries(workspaceEntriesCache.get("") || []);
     }
-    if (message.status === "acted" && message.message) {
-      appendWorkspaceDialogue(message.message);
-    }
     return;
   }
 
@@ -2693,7 +2660,6 @@ function handleWsMessage(message: WsMessage) {
   }
 
   if (message.type === "config-switched") {
-    pendingWorkspaceDialogues.length = 0;
     stopWorkspaceEventLoop();
     lastWorkspaceEventMs = Date.now();
     handledWorkspaceEventIds.clear();
@@ -2974,7 +2940,6 @@ async function finishBackendAudio() {
   isAssistantResponding = false;
   markConversationActivity();
   syncProactiveSpeakButton();
-  flushWorkspaceDialogues();
 }
 
 function stopCurrentResponsePlayback(force = false) {

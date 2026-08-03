@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { dirname, resolve } from "node:path";
@@ -33,10 +33,20 @@ test("workspace bridge dispatches each control exactly once", () => {
   );
   assert.doesNotMatch(bridgeSource, /window\.dispatchEvent\(windowEvent\)/);
   assert.doesNotMatch(bridgeSource, /window\.dispatchEvent\(event\)/);
+  assert.doesNotMatch(bridgeSource, /runCommand|command\.type === "key"|KeyboardEvent/);
   assert.match(
     bridgeSource,
     /nextResult\.confirmed === false \|\| nextResult\.ok === false/,
   );
+});
+
+test("Vite is build-only and cannot expose a second workspace runtime", () => {
+  const viteSource = readFileSync(resolve(projectRoot, "vite.config.ts"), "utf8");
+  const packageData = JSON.parse(readFileSync(resolve(projectRoot, "package.json"), "utf8"));
+
+  assert.doesNotMatch(viteSource, /configureServer|workspaceControlScript|createServer/);
+  assert.equal(packageData.scripts.dev, undefined);
+  assert.equal(packageData.scripts.preview, undefined);
 });
 
 async function freePort() {
@@ -187,6 +197,9 @@ test("local services enforce origin, host and per-launch authentication boundari
   const workspaceHtmlResponse = await fetch(openedPayload.url);
   assert.equal(workspaceHtmlResponse.status, 200);
   assert.match(workspaceHtmlResponse.headers.get("content-security-policy") || "", /^sandbox /);
+  assert.match(workspaceHtmlResponse.headers.get("content-security-policy") || "", /connect-src 'self'/);
+  assert.match(workspaceHtmlResponse.headers.get("content-security-policy") || "", /object-src 'none'/);
+  assert.doesNotMatch(workspaceHtmlResponse.headers.get("content-security-policy") || "", /allow-top-navigation|allow-popups/);
   assert.match(workspaceHtmlResponse.headers.get("permissions-policy") || "", /microphone=\(\)/);
   assert.equal(workspaceHtmlResponse.headers.get("x-content-type-options"), "nosniff");
   assert.match(await workspaceHtmlResponse.text(), /X-MeloMate-Workspace-Access/);
@@ -197,11 +210,42 @@ test("local services enforce origin, host and per-launch authentication boundari
     await status(`${workspaceOrigin}/workspace-files/security-test-persona/index.html`),
     404,
   );
+  assert.equal(
+    await status(`${frontendOrigin}/api/workspace-open-url?persona=security-test-persona&path=.control/state.json`, {
+      Origin: frontendOrigin,
+      "X-MeloMate-Session": sessionToken,
+    }),
+    404,
+  );
+  assert.equal(
+    (await fetch(`${frontendOrigin}/api/workspace-state`, {
+      method: "POST",
+      headers: {
+        Origin: frontendOrigin,
+        "Content-Type": "application/json",
+        "X-MeloMate-Session": sessionToken,
+      },
+      body: JSON.stringify({ persona: "security-test-persona", state: {} }),
+    })).status,
+    405,
+  );
+  assert.equal(
+    await status(`${frontendOrigin}/api/workspace-control?persona=security-test-persona`, {
+      Origin: frontendOrigin,
+      "X-MeloMate-Session": sessionToken,
+    }),
+    404,
+  );
   const reportedState = {
     protocolAvailable: true,
     state_version: 1,
     page: { id: "test-page", path: "index.html" },
-    appState: { availableActions: [] },
+    appState: {
+      agentShouldAct: false,
+      availableActions: [],
+      oversized: "x".repeat(10_000),
+      ["__proto__"]: { polluted: true },
+    },
   };
   const matchingStateResponse = await fetch(`${workspaceOrigin}/api/workspace-state`, {
     method: "POST",
@@ -217,9 +261,12 @@ test("local services enforce origin, host and per-launch authentication boundari
     ...reportedState,
     state_version: 2,
     appState: {
+      agentShouldAct: true,
       availableActions: [
         { id: "move-7-8", action: "place-piece", payload: { row: 7, col: 8 } },
       ],
+      oversized: "x".repeat(10_000),
+      ["__proto__"]: { polluted: true },
     },
   };
   const updatedStateResponse = await fetch(`${workspaceOrigin}/api/workspace-state`, {
@@ -236,6 +283,50 @@ test("local services enforce origin, host and per-launch authentication boundari
     readFileSync(resolve(fixtureRoot, ".control", "state.json"), "utf8"),
   );
   assert.equal(persistedState.state.state_version, 2);
+  assert.equal(persistedState.state.appState.oversized.length, 2000);
+  assert.equal(Object.hasOwn(persistedState.state.appState, "__proto__"), false);
+  const firstPageKey = createHash("sha256").update("test-page", "utf8").digest("hex");
+  assert.equal(
+    JSON.parse(readFileSync(resolve(fixtureRoot, ".control", "pages", `${firstPageKey}.json`), "utf8")).state.page.id,
+    "test-page",
+  );
+
+  const secondPageState = {
+    protocolAvailable: true,
+    state_version: 1,
+    page: { id: "second-page", path: "index.html" },
+    appState: { agentShouldAct: false, marker: "second", availableActions: [] },
+  };
+  const secondPageResponse = await fetch(`${workspaceOrigin}/api/workspace-state`, {
+    method: "POST",
+    headers: {
+      Origin: workspaceOrigin,
+      "Content-Type": "application/json",
+      "X-MeloMate-Workspace-Access": fixtureWorkspaceToken,
+    },
+    body: JSON.stringify({ persona: "security-test-persona", state: secondPageState }),
+  });
+  assert.equal(secondPageResponse.status, 200);
+  const firstPageRead = await fetch(
+    `${frontendOrigin}/api/workspace-state?persona=security-test-persona&page_id=test-page`,
+    {
+      headers: {
+        Origin: frontendOrigin,
+        "X-MeloMate-Session": sessionToken,
+      },
+    },
+  );
+  assert.equal((await firstPageRead.json()).state.state.page.id, "test-page");
+  const secondPageRead = await fetch(
+    `${frontendOrigin}/api/workspace-state?persona=security-test-persona&page_id=second-page`,
+    {
+      headers: {
+        Origin: frontendOrigin,
+        "X-MeloMate-Session": sessionToken,
+      },
+    },
+  );
+  assert.equal((await secondPageRead.json()).state.state.appState.marker, "second");
   const eventLines = readFileSync(
     resolve(fixtureRoot, ".control", "events.jsonl"),
     "utf8",
@@ -243,7 +334,10 @@ test("local services enforce origin, host and per-launch authentication boundari
     .trim()
     .split(/\r?\n/)
     .map((line) => JSON.parse(line));
-  assert.equal(eventLines.at(-1).state_version, 2);
+  assert.equal(
+    eventLines.findLast((event) => event.page?.id === "test-page")?.state_version,
+    2,
+  );
   const crossPersonaStateResponse = await fetch(`${workspaceOrigin}/api/workspace-state`, {
     method: "POST",
     headers: {

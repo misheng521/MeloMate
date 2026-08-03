@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { basename, dirname, extname, join, normalize, relative, resolve, sep } from "node:path";
@@ -43,6 +43,7 @@ const voicemeeterPath = "C:\\Program Files (x86)\\VB\\Voicemeeter\\voicemeeterpr
 const voicemeeterProcessName = "voicemeeterpro";
 const workspaceEventLimit = 200;
 const workspaceEventWaiters = new Map();
+const workspaceStateWindows = new Map();
 const mainOrigins = new Set([
   `http://127.0.0.1:${preferredPort}`,
   `http://localhost:${preferredPort}`,
@@ -157,10 +158,22 @@ function mainSecurityHeaders(extra = {}) {
 function workspaceSecurityHeaders(extra = {}) {
   return {
     "Cache-Control": "no-store",
-    "Content-Security-Policy":
-      "sandbox allow-scripts allow-same-origin allow-forms allow-modals allow-popups " +
-      "allow-popups-to-escape-sandbox allow-downloads allow-top-navigation-by-user-activation " +
-      "allow-pointer-lock allow-presentation; frame-ancestors 'self'",
+    "Content-Security-Policy": [
+      "sandbox allow-scripts allow-same-origin allow-modals allow-downloads allow-pointer-lock allow-presentation",
+      "default-src 'self' data: blob:",
+      "base-uri 'none'",
+      "object-src 'none'",
+      "form-action 'none'",
+      "frame-ancestors 'self'",
+      "frame-src 'none'",
+      "script-src 'self' 'unsafe-inline' blob:",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data: blob:",
+      "font-src 'self' data:",
+      "media-src 'self' data: blob:",
+      "worker-src 'self' blob:",
+      "connect-src 'self'",
+    ].join("; "),
     "Cross-Origin-Opener-Policy": "same-origin",
     "Cross-Origin-Resource-Policy": "same-origin",
     "Permissions-Policy": "camera=(), display-capture=(), geolocation=(), microphone=(), payment=(), serial=(), usb=()",
@@ -279,19 +292,66 @@ function safeName(value, fallback = "default") {
   return cleaned || fallback;
 }
 
+function personaWorkspaceRoot(persona, create = false) {
+  const safePersona = safeName(persona, "");
+  if (!safePersona) return null;
+  const candidate = resolve(workspaceRoot, safePersona);
+  try {
+    if (create) mkdirSync(candidate, { recursive: true });
+    const realWorkspaceRoot = realpathSync(workspaceRoot);
+    const realPersonaRoot = realpathSync(candidate);
+    if (!statSync(realPersonaRoot).isDirectory()) return null;
+    return isInside(realWorkspaceRoot, realPersonaRoot) ? realPersonaRoot : null;
+  } catch {
+    return null;
+  }
+}
+
+function workspaceControlDirectory(persona) {
+  const personaRoot = personaWorkspaceRoot(persona, true);
+  if (!personaRoot) return null;
+  const candidate = resolve(personaRoot, ".control");
+  try {
+    mkdirSync(candidate, { recursive: true });
+    const realControl = realpathSync(candidate);
+    return isInside(personaRoot, realControl) ? realControl : null;
+  } catch {
+    return null;
+  }
+}
+
+function workspaceInternalFile(controlDir, filename) {
+  const target = safeResolve(controlDir, filename);
+  if (!target) return null;
+  if (!existsSync(target)) return target;
+  try {
+    return isInside(controlDir, realpathSync(target)) ? target : null;
+  } catch {
+    return null;
+  }
+}
+
 function safeWorkspaceFolder(value) {
-  return String(value || "")
-    .split(/[\\/]+/)
-    .filter((part) => part && part !== "." && part !== "..")
-    .map((part) => safeName(part, ""))
-    .filter(Boolean)
-    .join("/");
+  const rawParts = String(value || "").split(/[\\/]+/);
+  if (rawParts.some((part) => part === ".." || part.toLowerCase() === ".control")) return "";
+  const result = [];
+  for (const part of rawParts) {
+    if (!part || part === ".") continue;
+    const cleaned = safeName(part, "");
+    if (!cleaned || cleaned !== part) return "";
+    result.push(cleaned);
+  }
+  return result.join("/");
 }
 
 function listWorkspace(persona, folder) {
   const safePersona = safeName(persona);
   const safeFolder = safeWorkspaceFolder(folder);
-  const personaRoot = resolve(workspaceRoot, safePersona);
+  if (String(folder || "").trim() && !safeFolder) {
+    return { persona: safePersona, folder: "", entries: [] };
+  }
+  const personaRoot = personaWorkspaceRoot(safePersona, true);
+  if (!personaRoot) return { persona: safePersona, folder: "", entries: [] };
   const target = resolve(personaRoot, safeFolder);
 
   if (!isInside(personaRoot, target)) {
@@ -299,8 +359,26 @@ function listWorkspace(persona, folder) {
   }
 
   mkdirSync(target, { recursive: true });
+  let realPersonaRoot;
+  let realTarget;
+  try {
+    realPersonaRoot = personaRoot;
+    realTarget = realpathSync(target);
+  } catch {
+    return { persona: safePersona, folder: safeFolder, entries: [] };
+  }
+  if (!isInside(realPersonaRoot, realTarget)) {
+    return { persona: safePersona, folder: "", entries: [] };
+  }
   const entries = readdirSync(target, { withFileTypes: true })
-    .filter((entry) => !entry.name.startsWith("."))
+    .filter((entry) => {
+      if (entry.name.startsWith(".") || entry.isSymbolicLink()) return false;
+      try {
+        return isInside(realPersonaRoot, realpathSync(join(target, entry.name)));
+      } catch {
+        return false;
+      }
+    })
     .sort((a, b) => Number(a.isFile()) - Number(b.isFile()) || a.name.localeCompare(b.name, "zh-CN"))
     .map((entry) => {
       const entryPath = relative(personaRoot, join(target, entry.name)).replace(/\\/g, "/");
@@ -328,7 +406,8 @@ function resolveWorkspaceFile(pathname) {
   const accessToken = parts.shift() || "";
   if (!persona || !constantTimeEqual(accessToken, workspaceAccessToken(persona)) || !parts.length) return null;
 
-  const personaRoot = resolve(workspaceRoot, persona);
+  const personaRoot = personaWorkspaceRoot(persona);
+  if (!personaRoot) return null;
   const filePath = resolve(personaRoot, safeWorkspaceFolder(parts.join("/")));
   return isInside(personaRoot, filePath) ? existingFileInside(personaRoot, filePath) : null;
 }
@@ -337,7 +416,8 @@ function workspaceFileUrl(persona, requestedPath) {
   const safePersona = safeName(persona, "");
   const safePath = safeWorkspaceFolder(requestedPath);
   if (!safePersona || !safePath) return "";
-  const personaRoot = resolve(workspaceRoot, safePersona);
+  const personaRoot = personaWorkspaceRoot(safePersona);
+  if (!personaRoot) return "";
   const filePath = resolve(personaRoot, safePath);
   if (!isInside(personaRoot, filePath) || !existingFileInside(personaRoot, filePath)) return "";
   const encodedPath = safePath.split("/").map(encodeURIComponent).join("/");
@@ -345,8 +425,14 @@ function workspaceFileUrl(persona, requestedPath) {
 }
 
 function workspacePersonaFromFile(filePath) {
-  if (!isInside(workspaceRoot, filePath)) return "";
-  const relativePath = relative(workspaceRoot, filePath).replace(/\\/g, "/");
+  let realWorkspaceRoot;
+  try {
+    realWorkspaceRoot = realpathSync(workspaceRoot);
+  } catch {
+    return "";
+  }
+  if (!isInside(realWorkspaceRoot, filePath)) return "";
+  const relativePath = relative(realWorkspaceRoot, filePath).replace(/\\/g, "/");
   return relativePath.split("/").filter(Boolean)[0] || "";
 }
 
@@ -354,7 +440,10 @@ function readWorkspaceCommands(persona, sinceMs) {
   const safePersona = safeName(persona);
   if (!safePersona) return [];
 
-  const commandFile = safeResolve(workspaceRoot, `${safePersona}/.control/commands.jsonl`);
+  const controlDir = workspaceControlDirectory(safePersona);
+  const commandFile = controlDir
+    ? workspaceInternalFile(controlDir, "commands.jsonl")
+    : null;
   if (!commandFile || !existsSync(commandFile) || !statSync(commandFile).isFile()) return [];
 
   const minCreatedMs = Number.isFinite(sinceMs) ? sinceMs : 0;
@@ -369,27 +458,54 @@ function readWorkspaceCommands(persona, sinceMs) {
         return null;
       }
     })
-    .filter((command) => command && Number(command.created_ms || 0) > minCreatedMs);
+    .filter(
+      (command) =>
+        command
+        && command.type === "action"
+        && typeof command.id === "string"
+        && typeof command.action === "string"
+        && command.action.length > 0
+        && command.action.length <= 120
+        && Number(command.created_ms || 0) > minCreatedMs,
+    );
 }
 
 function workspaceStatePath(persona) {
   const safePersona = safeName(persona);
   if (!safePersona) return null;
-  const personaRoot = resolve(workspaceRoot, safePersona);
-  const controlDir = safeResolve(workspaceRoot, `${safePersona}/.control`);
-  if (!controlDir || !isInside(personaRoot, controlDir)) return null;
-  mkdirSync(controlDir, { recursive: true });
-  return safeResolve(controlDir, "state.json");
+  const controlDir = workspaceControlDirectory(safePersona);
+  if (!controlDir) return null;
+  return workspaceInternalFile(controlDir, "state.json");
+}
+
+function workspacePageStatePath(persona, pageId) {
+  const cleanPageId = String(pageId || "").trim().slice(0, 128);
+  if (!cleanPageId) return null;
+  const safePersona = safeName(persona);
+  if (!safePersona) return null;
+  const personaRoot = personaWorkspaceRoot(safePersona, true);
+  const controlDir = workspaceControlDirectory(safePersona);
+  if (!personaRoot || !controlDir) return null;
+  const pagesDir = safeResolve(controlDir, "pages");
+  if (!pagesDir) return null;
+  mkdirSync(pagesDir, { recursive: true });
+  let realPagesDir;
+  try {
+    realPagesDir = realpathSync(pagesDir);
+  } catch {
+    return null;
+  }
+  if (!isInside(controlDir, realPagesDir)) return null;
+  const pageKey = createHash("sha256").update(cleanPageId, "utf8").digest("hex");
+  return workspaceInternalFile(realPagesDir, `${pageKey}.json`);
 }
 
 function workspaceEventsPath(persona) {
   const safePersona = safeName(persona);
   if (!safePersona) return null;
-  const personaRoot = resolve(workspaceRoot, safePersona);
-  const controlDir = safeResolve(workspaceRoot, `${safePersona}/.control`);
-  if (!controlDir || !isInside(personaRoot, controlDir)) return null;
-  mkdirSync(controlDir, { recursive: true });
-  return safeResolve(controlDir, "events.jsonl");
+  const controlDir = workspaceControlDirectory(safePersona);
+  if (!controlDir) return null;
+  return workspaceInternalFile(controlDir, "events.jsonl");
 }
 
 function stableEventState(state) {
@@ -470,47 +586,61 @@ async function waitForWorkspaceEvents(persona, sinceMs, waitMs) {
   return readWorkspaceEvents(safePersona, sinceMs);
 }
 
+function writeStateFile(target, payload) {
+  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporary, JSON.stringify(payload, null, 2), "utf8");
+    renameSync(temporary, target);
+  } finally {
+    if (existsSync(temporary)) unlinkSync(temporary);
+  }
+}
+
 function writeWorkspaceState(persona, state) {
   const target = workspaceStatePath(persona);
-  if (!target) return false;
-  const previous = readWorkspaceState(persona);
+  const pageTarget = workspacePageStatePath(persona, state?.page?.id || "");
+  if (!target || !pageTarget) return false;
+  const previous = readWorkspaceState(persona, state.page.id);
   if (state?.closed) {
-    if (existsSync(target) && previous?.state?.page?.id === state.page?.id) {
+    if (existsSync(pageTarget)) unlinkSync(pageTarget);
+    const current = readWorkspaceState(persona);
+    if (existsSync(target) && current?.state?.page?.id === state.page?.id) {
       unlinkSync(target);
     }
     appendWorkspaceEvent(persona, previous, state);
     return true;
   }
-  const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    writeFileSync(
-      temporary,
-      JSON.stringify(
-        {
-          updated_ms: Date.now(),
-          state,
-        },
-        null,
-        2,
-      ),
-      "utf8",
-    );
-    renameSync(temporary, target);
-  } finally {
-    if (existsSync(temporary)) unlinkSync(temporary);
-  }
+  const payload = { updated_ms: Date.now(), state };
+  writeStateFile(pageTarget, payload);
+  writeStateFile(target, payload);
   appendWorkspaceEvent(persona, previous, state);
   return true;
 }
 
-function readWorkspaceState(persona) {
-  const target = workspaceStatePath(persona);
+function readWorkspaceState(persona, pageId = "") {
+  const target = pageId
+    ? workspacePageStatePath(persona, pageId)
+    : workspaceStatePath(persona);
   if (!target || !existsSync(target) || !statSync(target).isFile()) return null;
   try {
     return JSON.parse(readFileSync(target, "utf8"));
   } catch {
     return null;
   }
+}
+
+function allowWorkspaceStateReport(persona) {
+  const key = safeName(persona, "");
+  if (!key) return false;
+  const now = Date.now();
+  const recent = (workspaceStateWindows.get(key) || []).filter((item) => now - item < 10_000);
+  if (recent.length >= 60) {
+    workspaceStateWindows.set(key, recent);
+    return false;
+  }
+  recent.push(now);
+  workspaceStateWindows.set(key, recent);
+  return true;
 }
 
 function readWorkspaceEvents(persona, sinceMs) {
@@ -547,6 +677,61 @@ function readRequestBody(request) {
   });
 }
 
+function sanitizeWorkspaceValue(value, budget = { characters: 64_000, nodes: 4096 }, depth = 0) {
+  if (budget.characters <= 0 || budget.nodes <= 0 || depth > 8) return "[truncated]";
+  budget.nodes -= 1;
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string") {
+    const allowed = Math.max(0, Math.min(2000, budget.characters));
+    const result = value.slice(0, allowed);
+    budget.characters -= result.length;
+    return result;
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, 256).map((item) => sanitizeWorkspaceValue(item, budget, depth + 1));
+  }
+  if (typeof value === "object") {
+    const result = {};
+    for (const [rawKey, item] of Object.entries(value).slice(0, 128)) {
+      const key = String(rawKey).slice(0, 80);
+      if (!key || ["__proto__", "prototype", "constructor"].includes(key.toLowerCase())) continue;
+      result[key] = sanitizeWorkspaceValue(item, budget, depth + 1);
+      if (budget.characters <= 0 || budget.nodes <= 0) break;
+    }
+    return result;
+  }
+  return String(value).slice(0, 2000);
+}
+
+function normalizeWorkspaceReport(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const rawPage = value.page && typeof value.page === "object" ? value.page : {};
+  const pageId = String(rawPage.id || "").trim().slice(0, 128);
+  if (!pageId) return null;
+  const stateVersion = Number(value.state_version || 0);
+  const reportedMs = Number(value.reported_ms || Date.now());
+  const openedAtMs = Number(rawPage.opened_at_ms || 0);
+  const budget = { characters: 64_000, nodes: 4096 };
+  return {
+    protocolAvailable: Boolean(value.protocolAvailable),
+    appState: sanitizeWorkspaceValue(value.appState ?? null, budget),
+    lastAction: sanitizeWorkspaceValue(value.lastAction ?? null, budget),
+    actions: sanitizeWorkspaceValue(value.actions ?? [], budget),
+    state_version: Number.isSafeInteger(stateVersion) ? Math.max(0, stateVersion) : 0,
+    page: {
+      id: pageId,
+      title: String(rawPage.title || "").slice(0, 200),
+      path: String(rawPage.path || "").slice(0, 500),
+      href: String(rawPage.href || "").slice(0, 500),
+      opened_at_ms: Number.isFinite(openedAtMs) ? Math.max(0, openedAtMs) : 0,
+      closed: Boolean(rawPage.closed),
+    },
+    closed: Boolean(value.closed),
+    reported_ms: Number.isFinite(reportedMs) ? Math.max(0, reportedMs) : Date.now(),
+  };
+}
+
 function workspaceControlScript(persona, pageId, accessToken, logicalPath) {
   return `<script>
 (() => {
@@ -561,42 +746,8 @@ function workspaceControlScript(persona, pageId, accessToken, logicalPath) {
   const seen = new Set();
   let lastStateSignature = "";
   let stateVersion = 0;
+  let pollInFlight = false;
   const actions = [];
-  const codeByKey = {
-    " ": "Space",
-    Space: "Space",
-    Enter: "Enter",
-    ArrowLeft: "ArrowLeft",
-    ArrowRight: "ArrowRight",
-    ArrowUp: "ArrowUp",
-    ArrowDown: "ArrowDown",
-    Escape: "Escape"
-  };
-
-  function dispatchKey(type, command) {
-    const key = command.key === "Space" ? " " : command.key;
-    const code = command.code || codeByKey[command.key] || (/^[a-z]$/i.test(command.key) ? "Key" + command.key.toUpperCase() : command.key);
-    const event = new KeyboardEvent(type, {
-      key,
-      code,
-      bubbles: true,
-      cancelable: true
-    });
-    const target = document.activeElement && document.activeElement !== document.body ? document.activeElement : document;
-    target.dispatchEvent(event);
-  }
-
-  function runCommand(command) {
-    const repeat = Math.max(1, Math.min(Number(command.repeat || 1), 20));
-    const duration = Math.max(20, Math.min(Number(command.duration_ms || 80), 2000));
-    for (let index = 0; index < repeat; index += 1) {
-      window.setTimeout(() => {
-        dispatchKey("keydown", command);
-        window.setTimeout(() => dispatchKey("keyup", command), duration);
-      }, index * (duration + 35));
-    }
-  }
-
   function safeJson(value) {
     if (value === undefined) return null;
     try {
@@ -658,11 +809,15 @@ function workspaceControlScript(persona, pageId, accessToken, logicalPath) {
   }
 
   function currentState() {
-    if (typeof window.MeloMateGameState === "function") {
-      return window.MeloMateGameState();
-    }
-    if (window.MeloMateGameState && typeof window.MeloMateGameState === "object") {
-      return window.MeloMateGameState;
+    try {
+      if (typeof window.MeloMateGameState === "function") {
+        return window.MeloMateGameState();
+      }
+      if (window.MeloMateGameState && typeof window.MeloMateGameState === "object") {
+        return window.MeloMateGameState;
+      }
+    } catch {
+      return null;
     }
     return null;
   }
@@ -697,11 +852,15 @@ function workspaceControlScript(persona, pageId, accessToken, logicalPath) {
       },
       reported_ms: Date.now()
     };
-    await bridgeFetch("/api/workspace-state", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...accessHeaders },
-      body: JSON.stringify({ persona, state: report })
-    });
+    try {
+      await bridgeFetch("/api/workspace-state", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...accessHeaders },
+        body: JSON.stringify({ persona, state: report })
+      });
+    } catch {
+      // The isolated app remains usable while MeloMate reconnects.
+    }
   }
 
   function publishClosed() {
@@ -727,10 +886,12 @@ function workspaceControlScript(persona, pageId, accessToken, logicalPath) {
       headers: { "Content-Type": "application/json", ...accessHeaders },
       body: JSON.stringify({ persona, state: report }),
       keepalive: true
-    });
+    }).catch(() => undefined);
   }
 
   async function poll() {
+    if (pollInFlight) return;
+    pollInFlight = true;
     try {
       const params = new URLSearchParams({ persona, since: String(since), page_id: pageId });
       const response = await bridgeFetch("/api/workspace-control?" + params.toString(), {
@@ -744,27 +905,27 @@ function workspaceControlScript(persona, pageId, accessToken, logicalPath) {
         if (command.page_id && command.page_id !== pageId) continue;
         seen.add(command.id);
         since = Math.max(since, Number(command.created_ms || since));
-        if (command.type === "key") runCommand(command);
         if (command.type === "action") await runAction(command);
       }
       await publishState(currentState());
     } catch {
       // Workspace control is optional; games still run normally without it.
+    } finally {
+      pollInFlight = false;
     }
   }
 
   window.MeloMateWorkspaceControl = {
     pageId,
-    runCommand,
     runAction,
     setState: publishState,
     updateState: publishState
   };
   window.setInterval(poll, 180);
-  window.setInterval(() => publishState(currentState(), true), 1000);
+  window.setInterval(() => void publishState(currentState(), true).catch(() => undefined), 1000);
   window.addEventListener("pagehide", publishClosed);
   window.addEventListener("beforeunload", publishClosed);
-  publishState(currentState(), true);
+  void publishState(currentState(), true).catch(() => undefined);
 })();
 </script>`;
 }
@@ -777,7 +938,11 @@ function sendWorkspaceHtml(filePath, response, headOnly = false) {
   }
   const persona = workspacePersonaFromFile(filePath);
   const html = readFileSync(filePath, "utf8");
-  const personaRoot = resolve(workspaceRoot, persona);
+  const personaRoot = personaWorkspaceRoot(persona);
+  if (!personaRoot) {
+    reject(response, 404, "Workspace persona was not found", workspaceSecurityHeaders);
+    return;
+  }
   const logicalPath = relative(personaRoot, filePath).replace(/\\/g, "/");
   const script = workspaceControlScript(
     persona,
@@ -838,7 +1003,16 @@ async function handleWorkspaceStateRequest(request, response, requireWorkspaceAc
       reject(response);
       return true;
     }
-    const ok = writeWorkspaceState(payload.persona || "", payload.state ?? null);
+    const state = normalizeWorkspaceReport(payload.state);
+    if (!state) {
+      jsonResponse(response, 400, { ok: false, message: "Invalid workspace state." });
+      return true;
+    }
+    if (!state.closed && !allowWorkspaceStateReport(payload.persona || "")) {
+      jsonResponse(response, 429, { ok: false, message: "Workspace state rate limit reached." });
+      return true;
+    }
+    const ok = writeWorkspaceState(payload.persona || "", state);
     jsonResponse(response, ok ? 200 : 400, { ok });
   } catch (error) {
     jsonResponse(response, 400, { ok: false, message: error instanceof Error ? error.message : "Invalid state payload." });
@@ -867,6 +1041,7 @@ async function handleContentApiRequest(request, response, requireWorkspaceAccess
   }
 
   if (pathname === "/api/workspace-control") {
+    if (!requireWorkspaceAccess) return false;
     const persona = url.searchParams.get("persona") || "";
     if (requireWorkspaceAccess && !hasWorkspaceAccess(request, persona)) {
       reject(response);
@@ -901,7 +1076,10 @@ async function handleContentApiRequest(request, response, requireWorkspaceAccess
   }
 
   if (pathname === "/api/workspace-state") {
-    const state = readWorkspaceState(url.searchParams.get("persona") || "");
+    const state = readWorkspaceState(
+      url.searchParams.get("persona") || "",
+      url.searchParams.get("page_id") || "",
+    );
     jsonResponse(response, 200, { ok: true, state });
     return true;
   }
@@ -1119,7 +1297,6 @@ function listen(mainPort, isolatedWorkspacePort) {
       reject(response);
       return;
     }
-    if (await handleWorkspaceStateRequest(request, response)) return;
     if (await handleContentApiRequest(request, response)) return;
     if (handleVoicemeeterRequest(request, response)) return;
 

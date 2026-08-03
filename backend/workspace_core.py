@@ -4,8 +4,10 @@ import hmac
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import threading
 import time
 import webbrowser
 from datetime import datetime
@@ -18,9 +20,15 @@ from uuid import uuid4
 ROOT = Path(__file__).resolve().parent.parent
 WORKSPACE_ROOT = ROOT / "workspace"
 MAX_FILE_BYTES = 1024 * 1024
-MAX_PROJECT_FILES = 20
+MAX_PROJECT_FILES = 64
+MAX_PROJECT_BYTES = 4 * 1024 * 1024
+MAX_SEARCH_FILES = 1000
+MAX_SEARCH_RESULTS = 100
+MAX_ACTION_PAYLOAD_BYTES = 32 * 1024
 FRESH_STATE_MS = 5000
 MAX_CONTROL_LINES = 200
+RESERVED_WORKSPACE_PARTS = frozenset({".control"})
+_COMMAND_LOCK = threading.Lock()
 
 
 def safe_name(value: str, fallback: str = "default") -> str:
@@ -61,20 +69,78 @@ def persona_root(persona: str) -> Path:
 
 
 def clean_workspace_parts(persona: str, relative_path: str = "") -> list[str]:
+    raw_path = str(relative_path or "").strip().replace("\\", "/")
+    if "\x00" in raw_path or raw_path.startswith("/") or re.match(r"^[A-Za-z]:", raw_path):
+        raise ValueError("Workspace paths must be relative paths.")
     persona_name = safe_name(persona)
-    clean_parts = [
-        safe_name(part, "")
-        for part in Path(str(relative_path or "")).parts
-        if part not in {"", ".", ".."}
-    ]
+    clean_parts: list[str] = []
+    for raw_part in raw_path.split("/"):
+        part = raw_part.strip()
+        if not part or part == ".":
+            continue
+        if part == "..":
+            raise ValueError("Parent path segments are not allowed in the workspace.")
+        cleaned = safe_name(part, "")
+        if not cleaned or cleaned != part:
+            raise ValueError(f"Invalid workspace path segment: {part!r}.")
+        if cleaned.casefold() in RESERVED_WORKSPACE_PARTS:
+            raise ValueError("The workspace runtime control directory is not user-editable.")
+        clean_parts.append(cleaned)
     while clean_parts and clean_parts[0] == persona_name:
         clean_parts.pop(0)
     return clean_parts
 
 
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except FileNotFoundError:
+        return False
+    reparse_attribute = getattr(__import__("stat"), "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return path.is_symlink() or bool(attributes & reparse_attribute)
+
+
+def _reject_reparse_components(root: Path, target: Path) -> None:
+    current = root
+    if current.exists() and _is_reparse_point(current):
+        raise ValueError("Reparse points are not allowed in the workspace path.")
+    try:
+        parts = target.relative_to(root).parts
+    except ValueError as exc:
+        raise ValueError("Path is outside the persona workspace.") from exc
+    for part in parts:
+        current = current / part
+        if current.exists() and _is_reparse_point(current):
+            raise ValueError("Reparse points are not allowed in the workspace path.")
+
+
 def workspace_path(persona: str, relative_path: str = "") -> Path:
     clean_parts = clean_workspace_parts(persona, relative_path)
-    return ensure_inside(persona_root(persona), persona_root(persona).joinpath(*clean_parts))
+    root = persona_root(persona)
+    lexical_target = root.joinpath(*clean_parts)
+    _reject_reparse_components(root, lexical_target)
+    return ensure_inside(root, lexical_target)
+
+
+def _atomic_write_text(target: Path, text: str) -> None:
+    temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_text(text, encoding="utf-8")
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _validated_filename(filename: str) -> str:
+    raw = str(filename or "").strip()
+    cleaned = safe_name(raw, "")
+    if not cleaned or cleaned != raw or cleaned.casefold() in RESERVED_WORKSPACE_PARTS:
+        raise ValueError("Invalid workspace filename.")
+    if "." not in cleaned:
+        raise ValueError(
+            "filename must include an extension such as .txt, .svg, .html, .css, .js, or .json."
+        )
+    return cleaned
 
 
 def response(payload: dict[str, Any]) -> str:
@@ -94,9 +160,7 @@ def create_workspace_folder(persona: str, folder: str) -> str:
 
 
 def write_workspace_file(persona: str, folder: str, filename: str, content: str) -> str:
-    safe_filename = safe_name(filename)
-    if "." not in safe_filename:
-        raise ValueError("filename must include an extension such as .txt, .svg, .html, .css, .js, or .json.")
+    safe_filename = _validated_filename(filename)
 
     text = str(content or "")
     if len(text.encode("utf-8")) > MAX_FILE_BYTES:
@@ -105,7 +169,7 @@ def write_workspace_file(persona: str, folder: str, filename: str, content: str)
     directory = workspace_path(persona, folder)
     directory.mkdir(parents=True, exist_ok=True)
     target = ensure_inside(persona_root(persona), directory / safe_filename)
-    target.write_text(text, encoding="utf-8")
+    _atomic_write_text(target, text)
     return response(
         {
             "ok": True,
@@ -122,9 +186,7 @@ def append_workspace_file(
     content: str,
     reset: bool = False,
 ) -> str:
-    safe_filename = safe_name(filename)
-    if "." not in safe_filename:
-        raise ValueError("filename must include an extension such as .txt, .svg, .html, .css, .js, or .json.")
+    safe_filename = _validated_filename(filename)
 
     text = str(content or "")
     directory = workspace_path(persona, folder)
@@ -135,9 +197,8 @@ def append_workspace_file(
     if existing_size + len(text.encode("utf-8")) > MAX_FILE_BYTES:
         raise ValueError("file content is too large.")
 
-    mode = "w" if reset else "a"
-    with target.open(mode, encoding="utf-8") as file:
-        file.write(text)
+    existing = "" if reset or not target.exists() else target.read_text(encoding="utf-8")
+    _atomic_write_text(target, existing + text)
 
     return response(
         {
@@ -156,8 +217,8 @@ def write_workspace_project(persona: str, folder: str, files: list[dict[str, Any
         raise ValueError(f"too many files. maximum is {MAX_PROJECT_FILES}.")
 
     project_dir = workspace_path(persona, folder)
-    project_dir.mkdir(parents=True, exist_ok=True)
-    written = []
+    prepared: list[tuple[Path, str]] = []
+    total_bytes = 0
 
     for item in files:
         if not isinstance(item, dict):
@@ -167,16 +228,26 @@ def write_workspace_project(persona: str, folder: str, files: list[dict[str, Any
         content = str(item.get("content") or "")
         if not relative_file:
             raise ValueError("each project file requires path.")
-        if len(content.encode("utf-8")) > MAX_FILE_BYTES:
+        content_bytes = len(content.encode("utf-8"))
+        if content_bytes > MAX_FILE_BYTES:
             raise ValueError(f"{relative_file} is too large.")
+        total_bytes += content_bytes
+        if total_bytes > MAX_PROJECT_BYTES:
+            raise ValueError("project content is too large.")
 
         safe_parts = clean_workspace_parts(persona, relative_file)
         if not safe_parts or "." not in safe_parts[-1]:
             raise ValueError("each project file path must include a filename with an extension.")
 
         target = ensure_inside(persona_root(persona), project_dir.joinpath(*safe_parts))
+        _reject_reparse_components(persona_root(persona), target)
+        prepared.append((target, content))
+
+    project_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for target, content in prepared:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        _atomic_write_text(target, content)
         written.append(target.relative_to(WORKSPACE_ROOT).as_posix())
 
     return response(
@@ -211,7 +282,7 @@ def list_workspace(persona: str, folder: str = "") -> str:
     target.mkdir(parents=True, exist_ok=True)
     entries = []
     for child in sorted(target.iterdir(), key=lambda item: (item.is_file(), item.name.lower())):
-        if child.name.startswith("."):
+        if child.name.casefold() in RESERVED_WORKSPACE_PARTS or _is_reparse_point(child):
             continue
         entries.append(
             {
@@ -223,53 +294,150 @@ def list_workspace(persona: str, folder: str = "") -> str:
     return response({"ok": True, "persona": safe_name(persona), "entries": entries})
 
 
-def send_workspace_key(
+def replace_workspace_text(
     persona: str,
-    key: str,
-    code: str = "",
-    duration_ms: int = 80,
-    repeat: int = 1,
+    path: str,
+    old_text: str,
+    new_text: str,
+    replace_all: bool = False,
 ) -> str:
-    clean_key = str(key or "").strip()
-    if not clean_key:
-        raise ValueError("key is required, for example ArrowLeft, ArrowRight, ArrowUp, ArrowDown, Space, Enter, w, a, s, or d.")
-
-    clean_code = str(code or "").strip()
-    safe_duration = max(20, min(int(duration_ms or 80), 2000))
-    safe_repeat = max(1, min(int(repeat or 1), 20))
-    current_state = read_workspace_state_file(persona)
-    page_id = state_page_id(current_state)
-    now = datetime.now().astimezone()
-    command = {
-        "id": uuid4().hex,
-        "type": "key",
-        "page_id": page_id,
-        "key": clean_key,
-        "code": clean_code,
-        "duration_ms": safe_duration,
-        "repeat": safe_repeat,
-        "created_ms": int(now.timestamp() * 1000),
-        "created_at": now.isoformat(timespec="milliseconds"),
-    }
-
-    append_workspace_command(persona, command)
-
+    target = workspace_path(persona, path)
+    if not target.is_file():
+        raise FileNotFoundError("workspace file was not found.")
+    if target.stat().st_size > MAX_FILE_BYTES:
+        raise ValueError("workspace file is too large to edit.")
+    needle = str(old_text or "")
+    if not needle:
+        raise ValueError("old_text must not be empty.")
+    existing = target.read_text(encoding="utf-8")
+    matches = existing.count(needle)
+    if matches == 0:
+        raise ValueError("old_text was not found; read the file again before editing.")
+    if matches > 1 and not replace_all:
+        raise ValueError(
+            "old_text is not unique; provide more surrounding text or set replace_all=true."
+        )
+    updated = existing.replace(needle, str(new_text or ""), -1 if replace_all else 1)
+    if len(updated.encode("utf-8")) > MAX_FILE_BYTES:
+        raise ValueError("edited file would exceed the size limit.")
+    _atomic_write_text(target, updated)
     return response(
         {
             "ok": True,
             "persona": safe_name(persona),
-            "sent": True,
-            "confirmed": False,
-            "message": "KEY_SENT_EFFECT_NOT_CONFIRMED: Keyboard events were sent to the page, but their game/app effect is unknown. Do not claim a move, click, score, selection, or UI change unless a later read_workspace_state confirms it.",
-            "command": {
-                "id": command["id"],
-                "type": command["type"],
-                "page_id": command["page_id"],
-                "key": command["key"],
-                "code": command["code"],
-                "duration_ms": command["duration_ms"],
-                "repeat": command["repeat"],
-            },
+            "path": target.relative_to(WORKSPACE_ROOT).as_posix(),
+            "replacements": matches if replace_all else 1,
+        }
+    )
+
+
+def move_workspace_item(
+    persona: str,
+    source: str,
+    destination: str,
+) -> str:
+    source_target = workspace_path(persona, source)
+    destination_target = workspace_path(persona, destination)
+    root = persona_root(persona)
+    if source_target == root:
+        raise ValueError("The persona workspace root cannot be moved.")
+    if not source_target.exists():
+        raise FileNotFoundError("workspace source item was not found.")
+    if destination_target.exists():
+        raise FileExistsError("workspace destination already exists.")
+    if source_target.is_dir() and source_target in destination_target.parents:
+        raise ValueError("A folder cannot be moved inside itself.")
+    destination_target.parent.mkdir(parents=True, exist_ok=True)
+    _reject_reparse_components(root, destination_target.parent)
+    source_target.rename(destination_target)
+    return response(
+        {
+            "ok": True,
+            "persona": safe_name(persona),
+            "source": source_target.relative_to(WORKSPACE_ROOT).as_posix(),
+            "destination": destination_target.relative_to(WORKSPACE_ROOT).as_posix(),
+        }
+    )
+
+
+def delete_workspace_item(
+    persona: str,
+    path: str,
+    recursive: bool = False,
+) -> str:
+    target = workspace_path(persona, path)
+    root = persona_root(persona)
+    if target == root:
+        raise ValueError("The persona workspace root cannot be deleted.")
+    if not target.exists():
+        raise FileNotFoundError("workspace item was not found.")
+    item_type = "directory" if target.is_dir() else "file"
+    if target.is_dir():
+        if any(target.iterdir()) and not recursive:
+            raise ValueError("The folder is not empty; set recursive=true to delete it.")
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+    return response(
+        {
+            "ok": True,
+            "persona": safe_name(persona),
+            "path": target.relative_to(WORKSPACE_ROOT).as_posix(),
+            "type": item_type,
+            "deleted": True,
+        }
+    )
+
+
+def search_workspace(
+    persona: str,
+    query: str,
+    folder: str = "",
+    max_results: int = 50,
+) -> str:
+    needle = str(query or "").strip()
+    if not needle or len(needle) > 200:
+        raise ValueError("query must contain 1-200 characters.")
+    target = workspace_path(persona, folder)
+    if not target.exists() or not target.is_dir():
+        raise FileNotFoundError("workspace folder was not found.")
+    limit = max(1, min(int(max_results or 50), MAX_SEARCH_RESULTS))
+    matches: list[dict[str, Any]] = []
+    files_checked = 0
+    for candidate in sorted(target.rglob("*")):
+        if files_checked >= MAX_SEARCH_FILES or len(matches) >= limit:
+            break
+        if not candidate.is_file() or _is_reparse_point(candidate):
+            continue
+        if any(part.casefold() in RESERVED_WORKSPACE_PARTS for part in candidate.parts):
+            continue
+        files_checked += 1
+        if candidate.stat().st_size > MAX_FILE_BYTES:
+            continue
+        try:
+            lines = candidate.read_text(encoding="utf-8").splitlines()
+        except (UnicodeDecodeError, OSError):
+            continue
+        for line_number, line in enumerate(lines, start=1):
+            if needle.casefold() not in line.casefold():
+                continue
+            matches.append(
+                {
+                    "path": candidate.relative_to(WORKSPACE_ROOT).as_posix(),
+                    "line": line_number,
+                    "text": line.strip()[:300],
+                }
+            )
+            if len(matches) >= limit:
+                break
+    return response(
+        {
+            "ok": True,
+            "persona": safe_name(persona),
+            "query": needle,
+            "matches": matches,
+            "files_checked": files_checked,
+            "truncated": files_checked >= MAX_SEARCH_FILES or len(matches) >= limit,
         }
     )
 
@@ -280,15 +448,56 @@ def workspace_control_dir(persona: str) -> Path:
     return target
 
 
+def workspace_page_state_path(persona: str, page_id: str) -> Path:
+    """Return an internal per-page state file without exposing page ids as paths."""
+    clean_page_id = str(page_id or "").strip()
+    if not clean_page_id or len(clean_page_id) > 128:
+        raise ValueError("page_id must contain 1-128 characters.")
+    pages_dir = ensure_inside(
+        persona_root(persona), workspace_control_dir(persona) / "pages"
+    )
+    pages_dir.mkdir(parents=True, exist_ok=True)
+    page_key = hashlib.sha256(clean_page_id.encode("utf-8")).hexdigest()
+    return ensure_inside(persona_root(persona), pages_dir / f"{page_key}.json")
+
+
 def append_workspace_command(persona: str, command: dict[str, Any]) -> None:
-    target = ensure_inside(persona_root(persona), workspace_control_dir(persona) / "commands.jsonl")
-    lines = target.read_text(encoding="utf-8").splitlines() if target.is_file() else []
-    lines = [*lines[-MAX_CONTROL_LINES + 1 :], json.dumps(command, ensure_ascii=False)]
-    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    target = ensure_inside(
+        persona_root(persona), workspace_control_dir(persona) / "commands.jsonl"
+    )
+    with _COMMAND_LOCK:
+        lines = (
+            target.read_text(encoding="utf-8").splitlines()
+            if target.is_file()
+            else []
+        )
+        previous_created_ms = 0
+        if lines:
+            try:
+                previous_created_ms = int(json.loads(lines[-1]).get("created_ms") or 0)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                previous_created_ms = 0
+        bounded_command = dict(command)
+        bounded_command["created_ms"] = max(
+            int(bounded_command.get("created_ms") or 0), previous_created_ms + 1
+        )
+        lines = [
+            *lines[-MAX_CONTROL_LINES + 1 :],
+            json.dumps(bounded_command, ensure_ascii=False),
+        ]
+        _atomic_write_text(target, "\n".join(lines) + "\n")
 
 
-def read_workspace_state_file(persona: str) -> dict[str, Any] | None:
-    target = ensure_inside(persona_root(persona), workspace_control_dir(persona) / "state.json")
+def read_workspace_state_file(
+    persona: str, page_id: str = ""
+) -> dict[str, Any] | None:
+    target = (
+        workspace_page_state_path(persona, page_id)
+        if page_id
+        else ensure_inside(
+            persona_root(persona), workspace_control_dir(persona) / "state.json"
+        )
+    )
     if not target.is_file():
         return None
     if target.stat().st_size > MAX_FILE_BYTES:
@@ -404,9 +613,10 @@ def wait_for_action_result(
     command_id: str,
     previous_updated_ms: int | None,
     wait_ms: int,
+    page_id: str = "",
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     deadline = time.monotonic() + max(0, min(int(wait_ms or 0), 5000)) / 1000
-    latest_state = read_workspace_state_file(persona)
+    latest_state = read_workspace_state_file(persona, page_id)
     latest_result = find_action_result(latest_state, command_id)
     while not latest_result and time.monotonic() < deadline:
         updated_ms = state_updated_ms(latest_state)
@@ -415,7 +625,7 @@ def wait_for_action_result(
             if latest_result:
                 break
         time.sleep(0.05)
-        latest_state = read_workspace_state_file(persona)
+        latest_state = read_workspace_state_file(persona, page_id)
         latest_result = find_action_result(latest_state, command_id)
     return latest_result, latest_state
 
@@ -429,7 +639,7 @@ def send_workspace_action(
     expected_state_version: int | None = None,
     action_id: str = "",
 ) -> str:
-    previous_state = read_workspace_state_file(persona)
+    previous_state = read_workspace_state_file(persona, expected_page_id)
     selected_action_id = str(action_id or "").strip()[:128]
     if selected_action_id:
         selected = next(
@@ -453,8 +663,18 @@ def send_workspace_action(
         raise ValueError(
             "action or a current page-advertised action_id is required."
         )
+    if len(clean_action) > 120:
+        raise ValueError("workspace action must be at most 120 characters.")
     if payload is not None and not isinstance(payload, dict):
         raise ValueError("payload must be an object.")
+    try:
+        encoded_payload = json.dumps(
+            payload or {}, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("payload must contain valid finite JSON values.") from exc
+    if len(encoded_payload) > MAX_ACTION_PAYLOAD_BYTES:
+        raise ValueError("workspace action payload is too large.")
 
     current_page_id = state_page_id(previous_state)
     current_version = state_version(previous_state)
@@ -498,6 +718,7 @@ def send_workspace_action(
         command["id"],
         previous_updated_ms,
         wait_ms,
+        page_id,
     )
     confirmed = action_result_confirmed(latest_state, action_result, command["id"], page_id)
 
@@ -527,8 +748,8 @@ def send_workspace_action(
     )
 
 
-def read_workspace_state(persona: str) -> str:
-    state = read_workspace_state_file(persona)
+def read_workspace_state(persona: str, page_id: str = "") -> str:
+    state = read_workspace_state_file(persona, page_id)
     if state is None:
         return response(
             {

@@ -17,6 +17,7 @@ from .tool_manager import ToolManager
 from ..workspace_security import (
     harden_workspace_tool_result,
 )
+from ..workspace_intent import WORKSPACE_SIDE_EFFECT_TOOLS
 
 
 WORKSPACE_TOOL_NAMES = {
@@ -177,6 +178,16 @@ class ToolExecutor:
                     "TOOL_POLICY_DENIED: workspace tools may only access the current "
                     "client persona."
                 )
+            if (
+                tool_policy.get("source") == "user_turn"
+                and tool_name in WORKSPACE_SIDE_EFFECT_TOOLS
+                and tool_name
+                not in set(tool_policy.get("user_authorized_workspace_tools") or ())
+            ):
+                return tool_input, (
+                    "TOOL_POLICY_DENIED: this workspace side effect was not "
+                    "authorized by the user's message for this turn."
+                )
         if tool_policy is None or tool_policy.get("enforce") is not True:
             return tool_input, None
         allowed = set(tool_policy.get("allowed_tool_names") or ())
@@ -242,15 +253,19 @@ class ToolExecutor:
         persona = ""
         if isinstance(tool_input, dict):
             persona = str(tool_input.get("persona") or "")
+        preauthorized = frozenset(
+            str(name)
+            for name in tool_policy.get("user_authorized_workspace_tools") or ()
+            if str(name) in WORKSPACE_TOOL_NAMES
+        )
+        allowed = frozenset({"read_workspace_state", *preauthorized})
         tool_policy.update(
             {
                 "enforce": True,
-                "allowed_tool_names": frozenset({"read_workspace_state"}),
+                "allowed_tool_names": allowed,
                 "workspace_persona": persona,
                 "workspace_state_tainted": True,
-                "remaining_tool_calls": {
-                    "read_workspace_state": 1,
-                },
+                "remaining_tool_calls": {name: 32 for name in allowed},
             }
         )
 

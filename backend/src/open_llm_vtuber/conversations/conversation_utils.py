@@ -22,9 +22,28 @@ PLAYBACK_COMPLETION_TIMEOUT_SECONDS = 180.0
 MAX_TRANSLATION_CALLS_PER_RESPONSE = 32
 MAX_TRANSLATION_CHARS_PER_RESPONSE = 32_000
 
+# Face-style emoji are visually out of character for the avatar and are also
+# spoken inconsistently by different TTS providers.  Keep non-face symbols
+# available (for example, chess pieces) while removing the yellow-face ranges.
+_FACE_EMOJI_RE = re.compile(
+    "[\u2639\u263a"
+    "\U0001f600-\U0001f64f"
+    "\U0001f910-\U0001f92f"
+    "\U0001f970-\U0001f978"
+    "\U0001f97a\U0001f9d0"
+    "\U0001fae0-\U0001fae8]"
+    "[\ufe0e\ufe0f]?"
+)
+
+
+def remove_face_emojis(text: str) -> str:
+    """Remove face/yellow-bean emoji without deleting useful symbols."""
+    return _FACE_EMOJI_RE.sub("", str(text or ""))
+
 
 def clean_response_fragment(text: str) -> str:
     """Remove UI/TTS-unfriendly artifacts from streamed response fragments."""
+    text = remove_face_emojis(text)
     return re.sub(r"\s+", " ", text.replace("$", "")).strip()
 
 
@@ -365,6 +384,9 @@ async def handle_sentence_output(
         else:
             logger.debug("No translation engine available. Skipping translation.")
 
+        # A translation provider is also untrusted output and may introduce emoji.
+        tts_text = clean_response_fragment(tts_text)
+
         full_response += display_text.text
         await tts_manager.speak(
             tts_text=tts_text,
@@ -384,6 +406,10 @@ async def handle_audio_output(
     """Process and send AudioOutput directly to the client"""
     full_response = ""
     async for audio_path, display_text, transcript, actions in output:
+        transcript = clean_response_fragment(remove_stage_directions(transcript))
+        display_text.text = clean_response_fragment(
+            remove_stage_directions(display_text.text)
+        )
         full_response += transcript
         audio_payload = prepare_audio_payload(
             audio_path=audio_path,

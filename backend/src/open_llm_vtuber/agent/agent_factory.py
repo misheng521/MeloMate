@@ -75,9 +75,9 @@ class AgentFactory:
                 live2d_model=live2d_model,
                 tts_preprocessor_config=tts_preprocessor_config,
                 faster_first_response=basic_memory_settings.get(
-                    "faster_first_response", True
+                    "faster_first_response", False
                 ),
-                segment_method=basic_memory_settings.get("segment_method", "pysbd"),
+                segment_method=basic_memory_settings.get("segment_method", "regex"),
                 use_mcpp=basic_memory_settings.get("use_mcpp", False),
                 interrupt_method=interrupt_method,
                 tool_prompts=tool_prompts,

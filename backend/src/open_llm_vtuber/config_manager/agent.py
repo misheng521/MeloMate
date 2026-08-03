@@ -29,8 +29,8 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
         "mistral_llm",
     ] = Field(..., alias="llm_provider")
 
-    faster_first_response: Optional[bool] = Field(True, alias="faster_first_response")
-    segment_method: Literal["regex", "pysbd"] = Field("pysbd", alias="segment_method")
+    faster_first_response: Optional[bool] = Field(False, alias="faster_first_response")
+    segment_method: Literal["regex", "pysbd"] = Field("regex", alias="segment_method")
     use_mcpp: Optional[bool] = Field(False, alias="use_mcpp")
     mcp_enabled_servers: Optional[List[str]] = Field([], alias="mcp_enabled_servers")
 
@@ -40,12 +40,12 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
             zh="Basic Memory Agent 智能体使用的大语言模型选项",
         ),
         "faster_first_response": Description(
-            en="Whether to respond as soon as encountering a comma in the first sentence to reduce latency (default: True)",
-            zh="是否在第一句回应时遇上逗号就直接生成音频以减少首句延迟（默认：True）",
+            en="Legacy compatibility option. Commas no longer split subtitles (default: False)",
+            zh="兼容旧配置的选项；逗号不再切分字幕（默认：False）",
         ),
         "segment_method": Description(
-            en="Method for segmenting sentences: 'regex' or 'pysbd' (default: 'pysbd')",
-            zh="分割句子的方法：'regex' 或 'pysbd'（默认：'pysbd'）",
+            en="Method for segmenting sentences: 'regex' or 'pysbd' (default: 'regex')",
+            zh="分割句子的方法：'regex' 或 'pysbd'（默认：'regex'）",
         ),
         "use_mcpp": Description(
             en="Whether to use MCP (Model Context Protocol) for the agent (default: True)",
@@ -93,8 +93,8 @@ class LettaConfig(I18nMixin, BaseModel):
     host: str = Field("localhost", alias="host")
     port: int = Field(8283, alias="port")
     id: str = Field(..., alias="id")
-    faster_first_response: Optional[bool] = Field(True, alias="faster_first_response")
-    segment_method: Literal["regex", "pysbd"] = Field("pysbd", alias="segment_method")
+    faster_first_response: Optional[bool] = Field(False, alias="faster_first_response")
+    segment_method: Literal["regex", "pysbd"] = Field("regex", alias="segment_method")
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "host": Description(
@@ -153,12 +153,12 @@ class AgentConfig(I18nMixin, BaseModel):
             en="Pool of LLM provider configurations", zh="语言模型提供者配置池"
         ),
         "faster_first_response": Description(
-            en="Whether to respond as soon as encountering a comma in the first sentence to reduce latency (default: True)",
-            zh="是否在第一句回应时遇上逗号就直接生成音频以减少首句延迟（默认：True）",
+            en="Legacy compatibility option. Commas no longer split subtitles (default: False)",
+            zh="兼容旧配置的选项；逗号不再切分字幕（默认：False）",
         ),
         "segment_method": Description(
-            en="Method for segmenting sentences: 'regex' or 'pysbd' (default: 'pysbd')",
-            zh="分割句子的方法：'regex' 或 'pysbd'（默认：'pysbd'）",
+            en="Method for segmenting sentences: 'regex' or 'pysbd' (default: 'regex')",
+            zh="分割句子的方法：'regex' 或 'pysbd'（默认：'regex'）",
         ),
     }
 

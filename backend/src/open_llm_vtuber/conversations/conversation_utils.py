@@ -10,7 +10,7 @@ from loguru import logger
 from ..message_handler import message_handler
 from .types import WebSocketSend
 from .tts_manager import TTSTaskManager
-from ..agent.output_types import SentenceOutput, AudioOutput
+from ..agent.output_types import SentenceOutput, AudioOutput, DisplayText, Actions
 from ..agent.input_types import BatchInput, TextData, ImageData, TextSource, ImageSource
 from ..asr.asr_interface import ASRInterface
 from ..live2d_model import Live2dModel
@@ -26,6 +26,26 @@ MAX_TRANSLATION_CHARS_PER_RESPONSE = 32_000
 def clean_response_fragment(text: str) -> str:
     """Remove UI/TTS-unfriendly artifacts from streamed response fragments."""
     return re.sub(r"\s+", " ", text.replace("$", "")).strip()
+
+
+def with_turn_id(websocket_send: WebSocketSend, turn_id: Optional[str]) -> WebSocketSend:
+    """Attach one server-owned turn id to every structured response payload."""
+    if not turn_id:
+        return websocket_send
+
+    async def send(message: str) -> None:
+        try:
+            payload = json.loads(message)
+        except Exception:
+            await websocket_send(message)
+            return
+        if isinstance(payload, dict):
+            payload.setdefault("turn_id", turn_id)
+            await websocket_send(json.dumps(payload, ensure_ascii=False))
+            return
+        await websocket_send(message)
+
+    return send
 
 
 GAME_CONTROL_NARRATION_PATTERNS = (
@@ -385,6 +405,46 @@ async def send_conversation_start_signals(websocket_send: WebSocketSend) -> None
         )
     )
     await websocket_send(json.dumps({"type": "full-text", "text": "Thinking..."}))
+
+
+async def speak_text_response(
+    context: Any,
+    websocket_send: WebSocketSend,
+    client_uid: str,
+    text: str,
+    turn_id: str,
+) -> str:
+    """Deliver a server-owned text through the normal subtitle, TTS and completion protocol."""
+    clean_text = remove_game_control_narration(
+        clean_response_fragment(remove_stage_directions(str(text or "")))
+    )
+    if not clean_text:
+        return ""
+    send = with_turn_id(websocket_send, turn_id)
+    manager = TTSTaskManager()
+    try:
+        await send_conversation_start_signals(send)
+        output = SentenceOutput(
+            display_text=DisplayText(
+                text=clean_text,
+                name=context.character_config.character_name,
+            ),
+            tts_text=clean_text,
+            actions=Actions(),
+        )
+        response = await process_agent_output(
+            output=output,
+            character_config=context.character_config,
+            live2d_model=context.live2d_model,
+            tts_engine=context.get_current_tts_engine(),
+            websocket_send=send,
+            tts_manager=manager,
+            translate_engine=context.translate_engine,
+        )
+        await finalize_conversation_turn(manager, send, client_uid)
+        return response
+    finally:
+        await cleanup_conversation(manager, f"workspace-{turn_id}")
 
 
 async def process_user_input(

@@ -15,17 +15,23 @@ from .types import ToolCallObject
 from .mcp_client import MCPClient
 from .tool_manager import ToolManager
 from ..workspace_security import (
-    extract_workspace_action_grants,
     harden_workspace_tool_result,
-    sanitize_untrusted_value,
 )
 
 
-CONTROL_TOOL_NAMES = {"send_workspace_action", "send_workspace_key"}
-WORKSPACE_STATE_TOOL_NAMES = {"read_workspace_state", *CONTROL_TOOL_NAMES}
-WORKSPACE_TAINT_ALLOWED_TOOLS = {
+WORKSPACE_TOOL_NAMES = {
+    "create_workspace_folder",
+    "write_workspace_file",
+    "append_workspace_file",
+    "write_workspace_project",
+    "read_workspace_file",
+    "list_workspace",
+    "replace_workspace_text",
+    "move_workspace_item",
+    "delete_workspace_item",
+    "search_workspace",
     "read_workspace_state",
-    "send_workspace_action",
+    "open_workspace_item",
 }
 TOOL_EXECUTION_TIMEOUT_SECONDS = 30
 MAX_TOOL_ARGUMENT_CHARS = 256_000
@@ -145,30 +151,13 @@ class ToolExecutor:
             }
         return None
 
-    def harden_workspace_control_result(
+    def harden_workspace_result(
         self, tool_name: str, is_error: bool, text_content: str
     ) -> tuple[bool, str]:
         result_error, hardened_content = harden_workspace_tool_result(
             tool_name, text_content
         )
-        if tool_name not in CONTROL_TOOL_NAMES:
-            return is_error or result_error, hardened_content
-        if result_error:
-            return True, hardened_content
-        try:
-            payload = json.loads(hardened_content)
-        except json.JSONDecodeError:
-            return True, hardened_content
-        if payload.get("confirmed") is True:
-            return is_error, hardened_content
-        payload["ok"] = False
-        payload["confirmed"] = False
-        payload["assistant_response_contract"] = (
-            "The workspace action is not confirmed. The next spoken reply must not "
-            "claim the character clicked, moved, placed, chose, changed, scored, "
-            "won, or completed the action. Say the workspace did not confirm it."
-        )
-        return True, json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        return is_error or result_error, hardened_content
 
     def apply_tool_policy(
         self,
@@ -177,7 +166,17 @@ class ToolExecutor:
         tool_policy: Dict[str, Any] | None,
         consume: bool = False,
     ) -> tuple[Any, str | None]:
-        """Enforce event capabilities even if the model fabricates a hidden tool call."""
+        """Enforce the current turn's server-owned workspace capability policy."""
+        if tool_name in WORKSPACE_TOOL_NAMES and tool_policy is not None:
+            if not isinstance(tool_input, dict):
+                return tool_input, "TOOL_POLICY_DENIED: tool arguments must be an object."
+            expected_persona = str(tool_policy.get("workspace_persona") or "")
+            supplied_persona = str(tool_input.get("persona") or "")
+            if expected_persona and supplied_persona != expected_persona:
+                return tool_input, (
+                    "TOOL_POLICY_DENIED: workspace tools may only access the current "
+                    "client persona."
+                )
         if tool_policy is None or tool_policy.get("enforce") is not True:
             return tool_input, None
         allowed = set(tool_policy.get("allowed_tool_names") or ())
@@ -196,92 +195,9 @@ class ToolExecutor:
             )
         if tool_name == "read_workspace_state":
             normalized_input = {"persona": expected_persona}
-            return normalized_input, self._consume_tool_policy_call(
-                tool_name, tool_policy, consume
-            )
-        if tool_name == "send_workspace_action":
-            grants = tool_policy.get("workspace_action_grants")
-            action_id = str(tool_input.get("action_id") or "").strip()[:128]
-            selected_grant = None
-            if action_id and isinstance(grants, list):
-                selected_grant = next(
-                    (
-                        grant
-                        for grant in grants
-                        if isinstance(grant, dict)
-                        and str(grant.get("id") or "") == action_id
-                    ),
-                    None,
-                )
-                if selected_grant is None:
-                    return tool_input, (
-                        "TOOL_POLICY_DENIED: action_id must exactly match a "
-                        "page-advertised availableAction id."
-                    )
-            action = str(
-                (selected_grant or {}).get("action")
-                or tool_input.get("action")
-                or ""
-            ).strip()
-            if not action or len(action) > 120:
-                return tool_input, (
-                    "TOOL_POLICY_DENIED: workspace action must be 1-120 characters."
-                )
-            try:
-                wait_ms = max(100, min(int(tool_input.get("wait_ms") or 900), 1500))
-            except (TypeError, ValueError):
-                wait_ms = 900
-            raw_payload = (
-                selected_grant.get("payload")
-                if selected_grant is not None
-                else tool_input.get("payload")
-            )
-            safe_payload = (
-                sanitize_untrusted_value(raw_payload)
-                if isinstance(raw_payload, dict)
-                else {}
-            )
-            normalized_input = {
-                "persona": expected_persona,
-                "action": action,
-                "payload": safe_payload,
-                "wait_ms": wait_ms,
-            }
-            if selected_grant is not None:
-                normalized_input["action_id"] = action_id
-            if isinstance(grants, list) and not any(
-                grant.get("action") == normalized_input["action"]
-                and grant.get("payload") == normalized_input["payload"]
-                for grant in grants
-                if isinstance(grant, dict)
-            ):
-                return tool_input, (
-                    "TOOL_POLICY_DENIED: action and payload must exactly match a "
-                    "page-advertised availableAction."
-                )
-            return normalized_input, self._consume_tool_policy_call(
-                tool_name, tool_policy, consume
-            )
-        if tool_name == "send_workspace_key":
-            key = str(tool_input.get("key") or "")[:32]
-            code = str(tool_input.get("code") or "")[:64]
-            if not key:
-                return tool_input, "TOOL_POLICY_DENIED: key must not be empty."
-            try:
-                duration_ms = max(
-                    20, min(int(tool_input.get("duration_ms") or 80), 500)
-                )
-                repeat = max(1, min(int(tool_input.get("repeat") or 1), 5))
-            except (TypeError, ValueError):
-                duration_ms = 80
-                repeat = 1
-            normalized_input = {
-                "persona": expected_persona,
-                "key": key,
-                "code": code,
-                "duration_ms": duration_ms,
-                "repeat": repeat,
-            }
+            page_id = str(tool_input.get("page_id") or "").strip()[:128]
+            if page_id:
+                normalized_input["page_id"] = page_id
             return normalized_input, self._consume_tool_policy_call(
                 tool_name, tool_policy, consume
             )
@@ -304,7 +220,7 @@ class ToolExecutor:
             available = 0
         if available <= 0:
             return (
-                f"TOOL_POLICY_DENIED: '{tool_name}' exceeded the per-event call limit."
+                f"TOOL_POLICY_DENIED: '{tool_name}' exceeded the per-turn call limit."
             )
         remaining[tool_name] = available - 1
         return None
@@ -317,14 +233,9 @@ class ToolExecutor:
         tool_policy: Dict[str, Any] | None,
     ) -> None:
         """Prevent untrusted page state from authorizing unrelated follow-up tools."""
-        if tool_policy is None or tool_name not in WORKSPACE_STATE_TOOL_NAMES:
+        if tool_policy is None or tool_name != "read_workspace_state":
             return
-        grants = extract_workspace_action_grants(text_content)
-        if tool_policy.get("source") in {
-            "workspace_event",
-            "workspace_aware_chat",
-        }:
-            tool_policy["workspace_action_grants"] = grants
+        if tool_policy.get("source") == "workspace_aware_chat":
             return
         if tool_policy.get("source") != "user_turn":
             return
@@ -334,10 +245,12 @@ class ToolExecutor:
         tool_policy.update(
             {
                 "enforce": True,
-                "allowed_tool_names": frozenset(WORKSPACE_TAINT_ALLOWED_TOOLS),
+                "allowed_tool_names": frozenset({"read_workspace_state"}),
                 "workspace_persona": persona,
                 "workspace_state_tainted": True,
-                "workspace_action_grants": grants,
+                "remaining_tool_calls": {
+                    "read_workspace_state": 1,
+                },
             }
         )
 
@@ -546,7 +459,7 @@ class ToolExecutor:
                     elif caller_mode in ["OpenAI", "Prompt"]:
                         llm_formatted_content = status_content
 
-            is_error, llm_formatted_content = self.harden_workspace_control_result(
+            is_error, llm_formatted_content = self.harden_workspace_result(
                 tool_name, is_error, str(llm_formatted_content)
             )
             if llm_formatted_content != text_content:

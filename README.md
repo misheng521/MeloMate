@@ -130,25 +130,10 @@ npm run build
 Manual commands above install only the common application. Use the unified
 installer for validated voice-cloning installation and model download.
 
-## Development
+## Validation
 
-Frontend development server:
-
-```bash
-npm run dev
-```
-
-The Vite development server is a developer tool, not the production runtime.
-Its custom middleware is implemented separately from `server.mjs`; production-
-only APIs such as Voicemeeter control and the complete workspace event behavior
-may therefore be unavailable or behave differently under `npm run dev`. Use
-`start.bat` for end-to-end acceptance testing and normal use.
-
-Backend development server:
-
-```bash
-backend\.venv\Scripts\python backend\mini_backend.py
-```
+Vite is build-only in this project. There is no second development runtime with
+different APIs. Use `start.bat` for normal use and end-to-end testing.
 
 Frontend type check:
 

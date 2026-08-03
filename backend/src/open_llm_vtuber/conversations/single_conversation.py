@@ -1,6 +1,7 @@
 from typing import Union, List, Dict, Any, Optional
 import asyncio
 import json
+import time
 from typing import Callable
 from loguru import logger
 import numpy as np
@@ -14,6 +15,7 @@ from .conversation_utils import (
     finalize_conversation_turn,
     cleanup_conversation,
     augment_text_with_screen_context,
+    with_turn_id,
     EMOJI_LIST,
 )
 from .types import WebSocketSend
@@ -21,7 +23,6 @@ from .tts_manager import TTSTaskManager
 from ..chat_history_manager import store_message
 from ..service_context import ServiceContext
 from ..workspace_security import (
-    extract_workspace_action_grants,
     sanitize_untrusted_value,
 )
 
@@ -52,6 +53,14 @@ WORKSPACE_AWARENESS_KEYWORDS = (
     "文件内容",
     "这个目录",
     "这份内容",
+    "你下",
+    "你走",
+    "你来操作",
+    "帮我点",
+    "点这个",
+    "下在",
+    "落子",
+    "该你了",
     "你觉得",
     "刚才",
     "这里",
@@ -59,6 +68,8 @@ WORKSPACE_AWARENESS_KEYWORDS = (
     "this move",
     "next move",
     "your turn",
+    "make a move",
+    "click this",
     "the board",
     "this game",
     "current page",
@@ -120,9 +131,6 @@ def _attach_live_workspace_context(
                 "page": sanitize_untrusted_value(page),
                 "state_version": max(0, int(report.get("state_version") or 0)),
                 "appState": sanitize_untrusted_value(report.get("appState")),
-                "actionGrants": extract_workspace_action_grants(
-                    report.get("appState")
-                ),
                 "updated_ms": int(state_file.get("updated_ms") or 0),
             }
         else:
@@ -143,29 +151,18 @@ def _attach_live_workspace_context(
         "snapshots": recent,
     }
     next_metadata["skip_memory"] = True
-    next_metadata["skip_history"] = True
+    guidance = getattr(context, "workspace_user_guidance", None)
+    if not isinstance(guidance, list):
+        guidance = []
+        context.workspace_user_guidance = guidance
+    guidance.append(
+        {
+            "text": str(input_text or "").strip()[:600],
+            "created_ms": int(time.time() * 1000),
+        }
+    )
+    del guidance[:-8]
     return next_metadata
-
-
-def with_turn_id(websocket_send: WebSocketSend, turn_id: Optional[str]) -> WebSocketSend:
-    if not turn_id:
-        return websocket_send
-
-    async def send(message: str) -> None:
-        try:
-            payload = json.loads(message)
-        except Exception:
-            await websocket_send(message)
-            return
-
-        if isinstance(payload, dict):
-            payload.setdefault("turn_id", turn_id)
-            await websocket_send(json.dumps(payload, ensure_ascii=False))
-            return
-
-        await websocket_send(message)
-
-    return send
 
 
 async def process_single_conversation(
@@ -224,12 +221,21 @@ async def process_single_conversation(
         augmented_input_text = await augment_text_with_screen_context(
             input_text, images, screen_vision
         )
-        if metadata and metadata.get("workspace_revision_candidate"):
+        metadata = dict(metadata or {})
+        metadata.pop("workspace_event", None)
+        metadata.pop("workspace_event_data", None)
+        metadata["workspace_persona"] = str(
+            context.character_config.character_name
+            or context.character_config.conf_name
+            or ""
+        )
+
+        if metadata.get("workspace_revision_candidate"):
             metadata["workspace_revision"] = looks_like_workspace_revision_text(
                 input_text
             )
 
-        if metadata and metadata.get("workspace_revision"):
+        if metadata.get("workspace_revision"):
             augmented_input_text = (
                 "The user is giving a modification or guidance for the workspace item "
                 "you just created or are creating. Treat this as a revision request for "
@@ -528,8 +534,10 @@ def is_workspace_tool_status(output_item: Dict[str, Any]) -> bool:
         "write_workspace_project",
         "read_workspace_file",
         "list_workspace",
-        "send_workspace_key",
-        "send_workspace_action",
+        "replace_workspace_text",
+        "move_workspace_item",
+        "delete_workspace_item",
+        "search_workspace",
         "read_workspace_state",
         "open_workspace_item",
     }

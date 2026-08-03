@@ -40,7 +40,7 @@ window.MeloMateGameAction = (action, payload) => {
 - Give every `availableActions` entry a stable, unique `id`. MeloMate chooses an id and the backend revalidates its exact action and payload against the same open page and state revision.
 - Return `handled: true` only when the app recognized the action.
 - Return `accepted: true` only after the app actually applied the action.
-- Do not use a built-in AI opponent when the user asked to play with the character. The independent workspace Agent is the only character-side operator.
+- Do not use a built-in AI opponent when the user asked to play with the character. MeloMate runtime control is the only character-side operator; this internal detail must not appear in character replies.
 - Do not synthesize keyboard input. Use semantic actions so the page can validate the operation and report whether it actually happened.
 - After a confirmed action, the Agent's natural response is delivered through the same chat subtitle and TTS completion protocol as ordinary conversation. A user message interrupts that speech normally.
 - When the page is closed, the injected script reports a close event and clears the current page state. MeloMate should treat the app as disconnected until a new HTML page reports state.

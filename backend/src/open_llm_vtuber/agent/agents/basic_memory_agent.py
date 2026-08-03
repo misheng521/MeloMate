@@ -35,7 +35,10 @@ from ...workspace_security import (
     WORKSPACE_STATE_RESULT_SYSTEM_GUARD,
     workspace_awareness_tool_policy,
 )
-from ...workspace_intent import workspace_fast_ack_text
+from ...workspace_intent import (
+    workspace_fast_ack_text,
+    workspace_user_authorized_tools,
+)
 
 
 WORKSPACE_TOOL_NAMES = {
@@ -87,8 +90,8 @@ class BasicMemoryAgent(AgentInterface):
         system: str,
         live2d_model,
         tts_preprocessor_config: TTSPreprocessorConfig = None,
-        faster_first_response: bool = True,
-        segment_method: str = "pysbd",
+        faster_first_response: bool = False,
+        segment_method: str = "regex",
         use_mcpp: bool = False,
         interrupt_method: Literal["system", "user"] = "user",
         tool_prompts: Dict[str, str] = None,
@@ -942,10 +945,14 @@ class BasicMemoryAgent(AgentInterface):
             )
             is_workspace_aware = awareness_tool_policy is not None
             metadata = input_data.metadata if isinstance(input_data.metadata, dict) else {}
+            user_text = self._user_input_text(input_data)
             tool_policy = awareness_tool_policy or {
                 "source": "user_turn",
                 "enforce": False,
                 "workspace_persona": str(metadata.get("workspace_persona") or ""),
+                "user_authorized_workspace_tools": workspace_user_authorized_tools(
+                    user_text
+                ),
             }
             messages = self._to_messages(
                 input_data,
@@ -999,7 +1006,7 @@ class BasicMemoryAgent(AgentInterface):
                 and remember_turn
                 and self._workspace_write_tools_available(tools, tool_mode)
             ):
-                fast_ack = workspace_fast_ack_text(self._user_input_text(input_data))
+                fast_ack = workspace_fast_ack_text(user_text)
                 if fast_ack:
                     tool_policy["workspace_fast_ack_sent"] = True
                     max_tool_rounds = WORKSPACE_MAX_TOOL_ROUNDS

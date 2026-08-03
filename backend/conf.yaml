@@ -49,9 +49,9 @@ character_config:
         # 'mistral_llm', 'lmstudio_llm' 之类的
         llm_provider: 'deepseek_llm' # 使用的 LLM 提供商
         # 是否在第一句回应时遇上逗号就直接生成音频以减少首句延迟（默认：True）
-        faster_first_response: True
+        faster_first_response: False
         # 句子分割方法：'regex' 或 'pysbd'
-        segment_method: 'pysbd'
+        segment_method: 'regex'
         # 是否使用 MCP（Model Context Protocol） Plus 以使 LLM 获得使用工具的能力（默认：False）
         # 'Plus' 意味着它包含了通过 OpenAI API 调用工具的能力。
         use_mcpp: False
@@ -70,9 +70,9 @@ character_config:
         host: 'localhost' #主机地址
         port: 8283 # 端口号
         id: xxx #letta server运行的Agent的id编号
-        faster_first_response: True
+        faster_first_response: False
         # 句子分割方法：'regex' 或 'pysbd'
-        segment_method: 'pysbd'
+        segment_method: 'regex'
         # 一旦选择letta作为agent，那么实际运行时候的llm是在letta上配置的，因此用户需要自己运行letta server
         # 有关更多详细信息，请查看他们的文档
 

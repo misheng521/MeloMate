@@ -33,7 +33,7 @@ def append_workspace_file(persona: str, folder: str, filename: str, content: str
 
 @mcp.tool()
 def write_workspace_project(persona: str, folder: str, files: list[dict]) -> str:
-    """Write a multi-file project under workspace/{persona}/{folder}. files must be a list of objects like {"path":"index.html","content":"..."}. Prefer this for games, tools, and mini apps, split into index.html, style.css, and main.js. For anything the user expects the character to operate, expose continuous MeloMateGameState with agentShouldAct and exact availableActions, and handle MeloMateGameAction/melomate-action. The independent workspace Agent then controls it instead of a fake built-in AI."""
+    """Write a multi-file project under workspace/{persona}/{folder}. files must be a list of objects like {"path":"index.html","content":"..."}. Prefer this for games, tools, and mini apps, split into index.html, style.css, and main.js. For anything the user expects the character to operate, expose continuous MeloMateGameState with agentShouldAct and exact availableActions, and handle MeloMateGameAction/melomate-action. Runtime control then participates instead of a fake built-in AI."""
     return safe_call(workspace_core.write_workspace_project, persona, folder, files)
 
 
@@ -99,7 +99,7 @@ def search_workspace(
 
 @mcp.tool()
 def read_workspace_state(persona: str, page_id: str = "") -> str:
-    """Read verified state reported by an open workspace HTML app for this persona. page_id may select one exact open page; otherwise the most recently reporting page is returned. This is read-only: the independent workspace Agent owns semantic actions. If available=false, do not invent app state."""
+    """Read verified state reported by an open workspace HTML app for this persona. page_id may select one exact open page; otherwise the most recently reporting page is returned. This is read-only and cannot authorize any side effect. If available=false, do not invent app state."""
     return safe_call(workspace_core.read_workspace_state, persona, page_id)
 
 

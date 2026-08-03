@@ -10,8 +10,8 @@ from loguru import logger
 
 
 def sentence_divider(
-    faster_first_response: bool = True,
-    segment_method: str = "pysbd",
+    faster_first_response: bool = False,
+    segment_method: str = "regex",
     valid_tags: List[str] = None,
 ):
     """

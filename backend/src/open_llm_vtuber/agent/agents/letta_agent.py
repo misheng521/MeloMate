@@ -22,8 +22,8 @@ class LettaAgent(AgentInterface):
         live2d_model,
         id,
         tts_preprocessor_config: TTSPreprocessorConfig = None,
-        faster_first_response: bool = True,
-        segment_method: str = "pysbd",
+        faster_first_response: bool = False,
+        segment_method: str = "regex",
         host: str = "localhost",
         port: int = 8283,
     ):

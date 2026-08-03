@@ -6,28 +6,7 @@ from langdetect import detect
 from enum import Enum
 from dataclasses import dataclass
 
-# Constants for additional checks
-COMMAS = [
-    ",",
-    "،",
-    "，",
-    "、",
-    "፣",
-    "၊",
-    ";",
-    "΄",
-    "‛",
-    "।",
-    "﹐",
-    "꓾",
-    "⹁",
-    "︐",
-    "﹑",
-    "､",
-    "،",
-]
-
-END_PUNCTUATIONS = [".", "!", "?", "。", "！", "？", "...", "。。。"]
+END_PUNCTUATIONS = ["...", "。。。", "……", ".", "!", "?", "。", "！", "？"]
 ABBREVIATIONS = [
     "Mr.",
     "Mrs.",
@@ -106,57 +85,6 @@ def is_complete_sentence(text: str) -> bool:
     return any(text.endswith(punct) for punct in END_PUNCTUATIONS)
 
 
-def contains_comma(text: str) -> bool:
-    """
-    Check if text contains any comma.
-
-    Args:
-        text: Text to check
-
-    Returns:
-        bool: Whether the text contains a comma
-    """
-    return any(comma in text for comma in COMMAS)
-
-
-def comma_splitter(text: str) -> Tuple[str, str]:
-    """
-    Process text and split it at the first comma.
-    Returns the split text (including the comma) and the remaining text.
-
-    Args:
-        text: Text to split
-
-    Returns:
-        Tuple[str, str]: (split text with comma, remaining text)
-    """
-    if not text:
-        return [], ""
-
-    for comma in COMMAS:
-        if comma in text:
-            split_text = text.split(comma, 1)
-            # Return first part with the comma
-            return split_text[0].strip() + comma, split_text[1].strip()
-    return text, ""
-
-
-def has_punctuation(text: str) -> bool:
-    """
-    Check if the text is a punctuation mark.
-
-    Args:
-        text: Text to check
-
-    Returns:
-        bool: Whether the text is a punctuation mark
-    """
-    for punct in COMMAS + END_PUNCTUATIONS:
-        if punct in text:
-            return True
-    return False
-
-
 def contains_end_punctuation(text: str) -> bool:
     """
     Check if text contains any sentence-ending punctuation.
@@ -168,6 +96,30 @@ def contains_end_punctuation(text: str) -> bool:
         bool: Whether the text contains ending punctuation
     """
     return any(punct in text for punct in END_PUNCTUATIONS)
+
+
+_END_PATTERN = re.compile(
+    "|".join(
+        re.escape(punctuation)
+        for punctuation in sorted(set(END_PUNCTUATIONS), key=len, reverse=True)
+    )
+)
+_SENTENCE_CLOSERS = frozenset('"\'”’」』）》】')
+
+
+def _is_non_terminal_period(text: str, start: int, end: int) -> bool:
+    """Return True for decimal points and numbered-list markers."""
+    if text[start:end] != ".":
+        return False
+    if start > 0 and end < len(text):
+        if text[start - 1].isdigit() and text[end].isdigit():
+            return True
+    prefix = text[:end]
+    suffix = text[end:]
+    return bool(
+        suffix.strip()
+        and re.search(r"(?:^|[\s:：;；])\d{1,3}\.$", prefix)
+    )
 
 
 def segment_text_by_regex(text: str) -> Tuple[List[str], str]:
@@ -184,28 +136,34 @@ def segment_text_by_regex(text: str) -> Tuple[List[str], str]:
     if not text:
         return [], ""
 
-    complete_sentences = []
+    complete_sentences: List[str] = []
     remaining_text = text.strip()
-
-    # Create pattern for matching sentences ending with any end punctuation
-    escaped_punctuations = [re.escape(p) for p in END_PUNCTUATIONS]
-    pattern = r"(.*?(?:[" + "|".join(escaped_punctuations) + r"]))"
+    search_from = 0
 
     while remaining_text:
-        match = re.search(pattern, remaining_text)
+        match = _END_PATTERN.search(remaining_text, search_from)
         if not match:
             break
 
-        end_pos = match.end(1)
+        end_pos = match.end()
         potential_sentence = remaining_text[:end_pos].strip()
 
-        # Skip if sentence ends with abbreviation
-        if any(potential_sentence.endswith(abbrev) for abbrev in ABBREVIATIONS):
-            remaining_text = remaining_text[end_pos:].lstrip()
+        if _is_non_terminal_period(remaining_text, match.start(), match.end()) or any(
+            potential_sentence.lower().endswith(abbrev.lower())
+            for abbrev in ABBREVIATIONS
+        ):
+            search_from = match.end()
             continue
 
+        while (
+            end_pos < len(remaining_text)
+            and remaining_text[end_pos] in _SENTENCE_CLOSERS
+        ):
+            end_pos += 1
+        potential_sentence = remaining_text[:end_pos].strip()
         complete_sentences.append(potential_sentence)
         remaining_text = remaining_text[end_pos:].lstrip()
+        search_from = 0
 
     return complete_sentences, remaining_text
 
@@ -301,22 +259,22 @@ class SentenceWithTags:
 class SentenceDivider:
     def __init__(
         self,
-        faster_first_response: bool = True,
-        segment_method: str = "pysbd",
+        faster_first_response: bool = False,
+        segment_method: str = "regex",
         valid_tags: List[str] = None,
     ):
         """
         Initialize the SentenceDivider.
 
         Args:
-            faster_first_response: Whether to split first sentence at commas
+            faster_first_response: Retained for configuration compatibility. Commas
+                never create subtitle boundaries because they split complete thoughts.
             segment_method: Method for segmenting sentences
             valid_tags: List of valid tag names to detect
         """
         self.faster_first_response = faster_first_response
         self.segment_method = segment_method
         self.valid_tags = valid_tags or ["think"]
-        self._is_first_sentence = True
         self._buffer = ""
         # Replace active_tags dict with a stack to handle nesting
         self._tag_stack = []
@@ -489,29 +447,11 @@ class SentenceDivider:
             if original_buffer_len > 0:
                 current_tags = self._get_current_tags()
 
-                # Handle first sentence with comma if enabled
-                if (
-                    self._is_first_sentence
-                    and self.faster_first_response
-                    and contains_comma(self._buffer)
-                ):
-                    sentence, remaining = comma_splitter(self._buffer)
-                    if sentence.strip():
-                        yield SentenceWithTags(
-                            text=sentence.strip(),
-                            tags=current_tags or [TagInfo("", TagState.NONE)],
-                        )
-                        self._buffer = remaining
-                        self._is_first_sentence = False
-                        processed_something = True
-                        continue  # Restart processing loop
-
                 # Process normal sentences based on end punctuation
                 if contains_end_punctuation(self._buffer):
                     sentences, remaining = self._segment_text(self._buffer)
                     if sentences:  # Only process if segmentation yielded sentences
                         self._buffer = remaining
-                        self._is_first_sentence = False
                         processed_something = True
                         for sentence in sentences:
                             if sentence.strip():
@@ -603,6 +543,5 @@ class SentenceDivider:
 
     def reset(self):
         """Reset the divider state for a new conversation"""
-        self._is_first_sentence = True
         self._buffer = ""
         self._tag_stack = []

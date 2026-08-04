@@ -686,7 +686,7 @@ class WebSocketHandler:
     async def _handle_workspace_state_event(
         self, websocket: WebSocket, client_uid: str, data: WSMessage
     ) -> None:
-        """Submit sanitized page state to the independent real-time controller."""
+        """Submit sanitized page state to this client's shared workspace session."""
         event_data = normalize_workspace_event(data.get("event"))
         context = self.client_contexts.get(client_uid)
         character_config = getattr(context, "character_config", None)

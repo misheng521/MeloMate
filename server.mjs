@@ -333,7 +333,10 @@ function workspaceInternalFile(controlDir, filename) {
 
 function safeWorkspaceFolder(value) {
   const rawParts = String(value || "").split(/[\\/]+/);
-  if (rawParts.some((part) => part === ".." || part.toLowerCase() === ".control")) return "";
+  if (rawParts.some((part) => {
+    const lowered = part.toLowerCase();
+    return part === ".." || lowered === ".control" || lowered === ".trash";
+  })) return "";
   const result = [];
   for (const part of rawParts) {
     if (!part || part === ".") continue;
@@ -714,6 +717,10 @@ function normalizeWorkspaceReport(value) {
   const openedAtMs = Number(rawPage.opened_at_ms || 0);
   const budget = { characters: 64_000, nodes: 4096 };
   return {
+    protocolName: String(value.protocolName || "").slice(0, 80),
+    protocolVersion: Number.isSafeInteger(Number(value.protocolVersion))
+      ? Math.max(0, Number(value.protocolVersion))
+      : 0,
     protocolAvailable: Boolean(value.protocolAvailable),
     appState: sanitizeWorkspaceValue(value.appState ?? null, budget),
     lastAction: sanitizeWorkspaceValue(value.lastAction ?? null, budget),
@@ -780,18 +787,26 @@ function workspaceControlScript(persona, pageId, accessToken, logicalPath) {
       result: null,
       error: ""
     };
-    if (typeof window.MeloMateGameAction === "function") {
+    const actionHandler = typeof window.MeloMateWorkspaceAction === "function"
+      ? window.MeloMateWorkspaceAction
+      : (typeof window.MeloMateGameAction === "function" ? window.MeloMateGameAction : null);
+    if (actionHandler) {
       detail.handled = true;
       try {
-        applyActionResult(detail, await window.MeloMateGameAction(detail.action, detail.payload, detail));
+        applyActionResult(detail, await actionHandler(detail.action, detail.payload, detail));
       } catch (exception) {
         detail.accepted = false;
         detail.error = exception && exception.message ? exception.message : String(exception);
       }
     } else {
-      const actionEvent = new CustomEvent("melomate-action", { detail, bubbles: true, cancelable: true });
-      document.dispatchEvent(actionEvent);
-      if (actionEvent.defaultPrevented) detail.handled = true;
+      const workspaceEvent = new CustomEvent("melomate-workspace-action", { detail, bubbles: true, cancelable: true });
+      document.dispatchEvent(workspaceEvent);
+      if (workspaceEvent.defaultPrevented || detail.handled === true) detail.handled = true;
+      if (!detail.handled) {
+        const legacyEvent = new CustomEvent("melomate-action", { detail, bubbles: true, cancelable: true });
+        document.dispatchEvent(legacyEvent);
+        if (legacyEvent.defaultPrevented || detail.handled === true) detail.handled = true;
+      }
     }
     const actionResult = {
       id: detail.id,
@@ -810,6 +825,12 @@ function workspaceControlScript(persona, pageId, accessToken, logicalPath) {
 
   function currentState() {
     try {
+      if (typeof window.MeloMateWorkspaceState === "function") {
+        return window.MeloMateWorkspaceState();
+      }
+      if (window.MeloMateWorkspaceState && typeof window.MeloMateWorkspaceState === "object") {
+        return window.MeloMateWorkspaceState;
+      }
       if (typeof window.MeloMateGameState === "function") {
         return window.MeloMateGameState();
       }
@@ -838,6 +859,8 @@ function workspaceControlScript(persona, pageId, accessToken, logicalPath) {
     }
     if (!force && !changed) return;
     const report = {
+      protocolName: "MeloMateWorkspace",
+      protocolVersion: 2,
       protocolAvailable: nextState != null,
       appState: nextState,
       lastAction: latestAction,

@@ -1,4 +1,5 @@
 import base64
+import functools
 import hashlib
 import hmac
 import json
@@ -27,8 +28,25 @@ MAX_SEARCH_RESULTS = 100
 MAX_ACTION_PAYLOAD_BYTES = 32 * 1024
 FRESH_STATE_MS = 5000
 MAX_CONTROL_LINES = 200
-RESERVED_WORKSPACE_PARTS = frozenset({".control"})
+MAX_TRASH_BYTES = 64 * 1024 * 1024
+MAX_TRASH_ENTRY_OVERHEAD_BYTES = 64 * 1024
+MAX_TRASH_ITEMS = 100
+MAX_TRASH_AGE_SECONDS = 7 * 24 * 60 * 60
+RESERVED_WORKSPACE_PARTS = frozenset({".control", ".trash"})
 _COMMAND_LOCK = threading.Lock()
+_WORKSPACE_MUTATION_LOCK = threading.RLock()
+_ACTION_LOCKS_GUARD = threading.Lock()
+_ACTION_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _locked_workspace_mutation(function):
+    """Serialize agent-owned mutations so checked edits cannot race each other."""
+    @functools.wraps(function)
+    def guarded(*args, **kwargs):
+        with _WORKSPACE_MUTATION_LOCK:
+            return function(*args, **kwargs)
+
+    return guarded
 
 
 def safe_name(value: str, fallback: str = "default") -> str:
@@ -147,6 +165,7 @@ def response(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+@_locked_workspace_mutation
 def create_workspace_folder(persona: str, folder: str) -> str:
     target = workspace_path(persona, folder)
     target.mkdir(parents=True, exist_ok=True)
@@ -159,6 +178,7 @@ def create_workspace_folder(persona: str, folder: str) -> str:
     )
 
 
+@_locked_workspace_mutation
 def write_workspace_file(persona: str, folder: str, filename: str, content: str) -> str:
     safe_filename = _validated_filename(filename)
 
@@ -179,6 +199,7 @@ def write_workspace_file(persona: str, folder: str, filename: str, content: str)
     )
 
 
+@_locked_workspace_mutation
 def append_workspace_file(
     persona: str,
     folder: str,
@@ -210,6 +231,7 @@ def append_workspace_file(
     )
 
 
+@_locked_workspace_mutation
 def write_workspace_project(persona: str, folder: str, files: list[dict[str, Any]]) -> str:
     if not files:
         raise ValueError("files is required.")
@@ -277,6 +299,123 @@ def read_workspace_file(persona: str, path: str) -> str:
     )
 
 
+def _sha256_file(target: Path) -> str:
+    digest = hashlib.sha256()
+    with target.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(64 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def inspect_workspace_item(persona: str, path: str = "") -> str:
+    """Return bounded metadata for one item without reading its contents."""
+    target = workspace_path(persona, path)
+    if not target.exists():
+        raise FileNotFoundError("workspace item was not found.")
+    root = persona_root(persona)
+    stat = target.stat()
+    payload: dict[str, Any] = {
+        "ok": True,
+        "persona": safe_name(persona),
+        "path": target.relative_to(WORKSPACE_ROOT).as_posix(),
+        "type": "directory" if target.is_dir() else "file",
+        "size": stat.st_size if target.is_file() else _item_size(target),
+        "modified_ms": int(stat.st_mtime * 1000),
+    }
+    if target.is_file():
+        payload["sha256"] = _sha256_file(target)
+    else:
+        payload["entries"] = sum(
+            1
+            for child in target.iterdir()
+            if child.name.casefold() not in RESERVED_WORKSPACE_PARTS
+            and not _is_reparse_point(child)
+        )
+    ensure_inside(root, target)
+    return response(payload)
+
+
+def read_workspace_file_range(
+    persona: str,
+    path: str,
+    offset: int = 0,
+    max_chars: int = 64_000,
+) -> str:
+    """Read a stable text range so large edits do not require repeated full reads."""
+    target = workspace_path(persona, path)
+    if not target.is_file():
+        raise FileNotFoundError("workspace file was not found.")
+    if target.stat().st_size > MAX_FILE_BYTES:
+        raise ValueError("workspace file is too large to read.")
+    start = max(0, int(offset or 0))
+    limit = max(1, min(int(max_chars or 64_000), 64_000))
+    content = target.read_text(encoding="utf-8")
+    chunk = content[start : start + limit]
+    return response(
+        {
+            "ok": True,
+            "persona": safe_name(persona),
+            "path": target.relative_to(WORKSPACE_ROOT).as_posix(),
+            "offset": start,
+            "next_offset": start + len(chunk),
+            "eof": start + len(chunk) >= len(content),
+            "total_chars": len(content),
+            "sha256": _sha256_file(target),
+            "content": chunk,
+        }
+    )
+
+
+@_locked_workspace_mutation
+def patch_workspace_file(
+    persona: str,
+    path: str,
+    expected_sha256: str,
+    replacements: list[dict[str, Any]],
+) -> str:
+    """Atomically apply checked exact-text replacements to one current file version."""
+    target = workspace_path(persona, path)
+    if not target.is_file():
+        raise FileNotFoundError("workspace file was not found.")
+    expected = str(expected_sha256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise ValueError("expected_sha256 must be the hash returned by the latest read.")
+    current_hash = _sha256_file(target)
+    if not hmac.compare_digest(current_hash, expected):
+        raise ValueError("workspace file changed; inspect or read it again before patching.")
+    if not isinstance(replacements, list) or not 1 <= len(replacements) <= 64:
+        raise ValueError("replacements must contain 1-64 exact text edits.")
+    updated = target.read_text(encoding="utf-8")
+    applied = 0
+    for edit in replacements:
+        if not isinstance(edit, dict):
+            raise ValueError("each replacement must be an object.")
+        old_text = str(edit.get("old_text") or "")
+        new_text = str(edit.get("new_text") or "")
+        replace_all = edit.get("replace_all") is True
+        if not old_text:
+            raise ValueError("replacement old_text must not be empty.")
+        matches = updated.count(old_text)
+        if matches == 0:
+            raise ValueError("replacement text was not found; read the file again.")
+        if matches > 1 and not replace_all:
+            raise ValueError("replacement text is not unique; include more context.")
+        updated = updated.replace(old_text, new_text, -1 if replace_all else 1)
+        applied += matches if replace_all else 1
+    if len(updated.encode("utf-8")) > MAX_FILE_BYTES:
+        raise ValueError("patched file would exceed the size limit.")
+    _atomic_write_text(target, updated)
+    return response(
+        {
+            "ok": True,
+            "persona": safe_name(persona),
+            "path": target.relative_to(WORKSPACE_ROOT).as_posix(),
+            "replacements": applied,
+            "sha256": _sha256_file(target),
+        }
+    )
+
+
 def list_workspace(persona: str, folder: str = "") -> str:
     target = workspace_path(persona, folder)
     target.mkdir(parents=True, exist_ok=True)
@@ -294,6 +433,7 @@ def list_workspace(persona: str, folder: str = "") -> str:
     return response({"ok": True, "persona": safe_name(persona), "entries": entries})
 
 
+@_locked_workspace_mutation
 def replace_workspace_text(
     persona: str,
     path: str,
@@ -331,6 +471,7 @@ def replace_workspace_text(
     )
 
 
+@_locked_workspace_mutation
 def move_workspace_item(
     persona: str,
     source: str,
@@ -360,6 +501,54 @@ def move_workspace_item(
     )
 
 
+def _item_size(target: Path) -> int:
+    if _is_reparse_point(target):
+        raise ValueError("Reparse points cannot be archived or restored.")
+    if target.is_file():
+        return target.stat().st_size
+    total = 0
+    for child in target.rglob("*"):
+        if _is_reparse_point(child):
+            raise ValueError("Reparse points cannot be archived or restored.")
+        if child.is_file():
+            total += child.stat().st_size
+    return total
+
+
+def _trash_root(persona: str) -> Path:
+    target = ensure_inside(persona_root(persona), persona_root(persona) / ".trash")
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _trash_entries(persona: str) -> list[Path]:
+    root = _trash_root(persona)
+    return sorted(
+        (
+            child
+            for child in root.iterdir()
+            if child.is_dir() and not _is_reparse_point(child)
+        ),
+        key=lambda child: child.stat().st_mtime,
+    )
+
+
+def _prune_trash(persona: str) -> None:
+    now = time.time()
+    entries = _trash_entries(persona)
+    for entry in list(entries):
+        if now - entry.stat().st_mtime > MAX_TRASH_AGE_SECONDS:
+            shutil.rmtree(entry)
+            entries.remove(entry)
+    sizes = {entry: _item_size(entry) for entry in entries}
+    total = sum(sizes.values())
+    while entries and (len(entries) > MAX_TRASH_ITEMS or total > MAX_TRASH_BYTES):
+        oldest = entries.pop(0)
+        total -= sizes.get(oldest, 0)
+        shutil.rmtree(oldest)
+
+
+@_locked_workspace_mutation
 def delete_workspace_item(
     persona: str,
     path: str,
@@ -372,12 +561,39 @@ def delete_workspace_item(
     if not target.exists():
         raise FileNotFoundError("workspace item was not found.")
     item_type = "directory" if target.is_dir() else "file"
-    if target.is_dir():
-        if any(target.iterdir()) and not recursive:
-            raise ValueError("The folder is not empty; set recursive=true to delete it.")
-        shutil.rmtree(target)
-    else:
-        target.unlink()
+    if target.is_dir() and any(target.iterdir()) and not recursive:
+        raise ValueError("The folder is not empty; set recursive=true to archive it.")
+    item_size = _item_size(target)
+    if item_size > MAX_TRASH_BYTES - MAX_TRASH_ENTRY_OVERHEAD_BYTES:
+        raise ValueError("workspace item is too large for recoverable deletion.")
+    _prune_trash(persona)
+    trash_id = f"{int(time.time() * 1000)}-{uuid4().hex}"
+    entry = ensure_inside(root, _trash_root(persona) / trash_id)
+    entry.mkdir(parents=False, exist_ok=False)
+    payload = ensure_inside(root, entry / "payload")
+    original_path = target.relative_to(root).as_posix()
+    try:
+        target.rename(payload)
+        _atomic_write_text(
+            entry / "metadata.json",
+            json.dumps(
+                {
+                    "id": trash_id,
+                    "original_path": original_path,
+                    "type": item_type,
+                    "size": item_size,
+                    "deleted_ms": int(time.time() * 1000),
+                },
+                ensure_ascii=False,
+            ),
+        )
+    except Exception:
+        if payload.exists() and not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            payload.rename(target)
+        shutil.rmtree(entry, ignore_errors=True)
+        raise
+    _prune_trash(persona)
     return response(
         {
             "ok": True,
@@ -385,6 +601,66 @@ def delete_workspace_item(
             "path": target.relative_to(WORKSPACE_ROOT).as_posix(),
             "type": item_type,
             "deleted": True,
+            "recoverable": True,
+            "trash_id": trash_id,
+        }
+    )
+
+
+def list_workspace_trash(persona: str) -> str:
+    _prune_trash(persona)
+    entries: list[dict[str, Any]] = []
+    for entry in reversed(_trash_entries(persona)):
+        metadata = entry / "metadata.json"
+        if not metadata.is_file() or metadata.stat().st_size > 16_384:
+            continue
+        try:
+            item = json.loads(metadata.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if isinstance(item, dict):
+            entries.append(item)
+    return response({"ok": True, "persona": safe_name(persona), "entries": entries})
+
+
+@_locked_workspace_mutation
+def restore_workspace_item(
+    persona: str,
+    trash_id: str,
+    destination: str = "",
+) -> str:
+    clean_id = str(trash_id or "").strip()
+    if not re.fullmatch(r"[0-9]{10,16}-[0-9a-f]{32}", clean_id):
+        raise ValueError("invalid trash_id.")
+    root = persona_root(persona)
+    entry = ensure_inside(root, _trash_root(persona) / clean_id)
+    metadata_path = ensure_inside(root, entry / "metadata.json")
+    payload = ensure_inside(root, entry / "payload")
+    if not metadata_path.is_file() or not payload.exists():
+        raise FileNotFoundError("recoverable workspace item was not found.")
+    if metadata_path.stat().st_size > 16_384:
+        raise ValueError("recoverable workspace metadata is invalid.")
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ValueError("recoverable workspace metadata is invalid.") from exc
+    if not isinstance(metadata, dict) or metadata.get("id") != clean_id:
+        raise ValueError("recoverable workspace metadata is invalid.")
+    restore_path = str(destination or metadata.get("original_path") or "")
+    target = workspace_path(persona, restore_path)
+    if target.exists():
+        raise FileExistsError("workspace restore destination already exists.")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _reject_reparse_components(root, target.parent)
+    payload.rename(target)
+    shutil.rmtree(entry)
+    return response(
+        {
+            "ok": True,
+            "persona": safe_name(persona),
+            "trash_id": clean_id,
+            "path": target.relative_to(WORKSPACE_ROOT).as_posix(),
+            "restored": True,
         }
     )
 
@@ -630,7 +906,19 @@ def wait_for_action_result(
     return latest_result, latest_state
 
 
-def send_workspace_action(
+def _workspace_action_lock(persona: str, page_id: str) -> threading.Lock:
+    # One lock per persona prevents an unbounded number of page ids from growing
+    # this process-owned map and also serializes commands across that workspace.
+    key = safe_name(persona)
+    with _ACTION_LOCKS_GUARD:
+        lock = _ACTION_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _ACTION_LOCKS[key] = lock
+        return lock
+
+
+def _send_workspace_action_unlocked(
     persona: str,
     action: str = "",
     payload: dict[str, Any] | None = None,
@@ -748,6 +1036,28 @@ def send_workspace_action(
     )
 
 
+def send_workspace_action(
+    persona: str,
+    action: str = "",
+    payload: dict[str, Any] | None = None,
+    wait_ms: int = 900,
+    expected_page_id: str = "",
+    expected_state_version: int | None = None,
+    action_id: str = "",
+) -> str:
+    """Serialize commands per page and revalidate inside the critical section."""
+    with _workspace_action_lock(persona, expected_page_id):
+        return _send_workspace_action_unlocked(
+            persona,
+            action,
+            payload,
+            wait_ms,
+            expected_page_id,
+            expected_state_version,
+            action_id,
+        )
+
+
 def read_workspace_state(persona: str, page_id: str = "") -> str:
     state = read_workspace_state_file(persona, page_id)
     if state is None:
@@ -757,7 +1067,7 @@ def read_workspace_state(persona: str, page_id: str = "") -> str:
                 "persona": safe_name(persona),
                 "available": False,
                 "state": None,
-                "message": "No workspace app has reported state yet. You cannot see the board or game state. Do not claim any move, coordinate, score, winner, or board position. Ask the user to open the workspace HTML through MeloMate or update the app to publish MeloMateGameState.",
+                "message": "No workspace app has reported state yet. Do not claim any visible value or page operation. Ask the user to open the workspace HTML through MeloMate or update the app to publish MeloMateWorkspaceState.",
             }
         )
     age_ms = state_age_ms(state)
@@ -777,7 +1087,7 @@ def read_workspace_state(persona: str, page_id: str = "") -> str:
             "message": (
                 "Workspace control is ready. Use only this reported state for game/app claims."
                 if control_ready
-                else "CONTROL_NOT_READY: The workspace page is stale or does not expose MeloMateGameState. Do not claim any move, click, choice, score, winner, or current UI state."
+                else "CONTROL_NOT_READY: The workspace page is stale or does not expose MeloMateWorkspaceState. Do not claim any operation or current UI state."
             ),
             "state": state,
         }

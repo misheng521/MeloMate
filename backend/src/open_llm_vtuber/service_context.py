@@ -22,6 +22,7 @@ from .vad.vad_factory import VADFactory
 from .agent.agent_factory import AgentFactory
 from .translate.translate_factory import TranslateFactory
 from .utils.optional_dependencies import missing_voice_clone_dependencies
+from .workspace_agent import WorkspaceAgentSession
 
 if TYPE_CHECKING:
     from .mcpp.mcp_client import MCPClient
@@ -78,8 +79,11 @@ class ServiceContext:
         self.history_uid: str = ""  # Add history_uid field
         self.send_text: Callable = None
         self.client_uid: str = None
-        self.workspace_awareness: dict[str, dict] = {}
-        self.workspace_user_guidance: list[dict] = []
+        self.workspace_agent = WorkspaceAgentSession(self)
+        # Compatibility aliases for older call sites. Both point at the one
+        # per-client WorkspaceAgentSession; there is no second controller memory.
+        self.workspace_awareness = self.workspace_agent.snapshots
+        self.workspace_user_guidance = self.workspace_agent.trusted_guidance
         # Decrypted only inside this client session. It is never sent back to the
         # browser after being loaded from the Windows credential vault.
         self.screen_vision_api_key: str = ""
@@ -287,8 +291,7 @@ class ServiceContext:
             self.send_text = None
             self.client_uid = None
             self.screen_vision_api_key = ""
-            self.workspace_awareness.clear()
-            self.workspace_user_guidance.clear()
+            self.workspace_agent.reset()
         if cancellation:
             raise cancellation
         logger.info("ServiceContext closed.")
@@ -718,14 +721,14 @@ Workspace file rules:
 - For games, mini apps, web pages, or code projects, create a branch folder under mini-apps or another fitting folder and prefer write_workspace_project with separate files such as index.html, style.css, and main.js.
 - When the user asks about an open workspace HTML game, tool, or mini app, use read_workspace_state only to discuss the current verified state. Never invent or duplicate a page operation, and never explain the internal control mechanism to the user.
 - If the user asks to play with you, compete with you, take turns with you, or says "we/我们" for a game, do not build any built-in AI opponent, bot opponent, automatic opponent move, autoMove, aiMove, minimax opponent, random opponent, or page-owned "computer" player. The opponent must be you operating through workspace tools. Only include a built-in computer/AI opponent if the user explicitly asks for a computer opponent.
-- For any interactive workspace HTML app where you should truly participate or operate it, design the app around the workspace control protocol instead of building fake built-in AI/operator logic. The page should continuously expose window.MeloMateGameState or a window.MeloMateGameState() function with JSON state such as screen, mode, board, currentTurn, players, legalMoves, selection, score, winner, gameOver, availableActions, and important UI values, and should handle window.MeloMateGameAction(action, payload) or the melomate-action event for semantic actions such as place-piece, select-cell, move, choose, click-item, set-value, confirm, pass, or restart. Keep this protocol available for the whole session, not just the first action.
+- For any interactive workspace HTML app where you should truly participate or operate it, design the app around the generic workspace control protocol instead of building fake built-in AI/operator logic. The page should continuously expose window.MeloMateWorkspaceState or a window.MeloMateWorkspaceState() function with JSON state for every important visible value and exact availableActions, and should handle window.MeloMateWorkspaceAction(action, payload) or the melomate-workspace-action event for semantic actions such as place-piece, select-cell, move, choose, click-item, set-value, confirm, pass, submit, or restart. This protocol is for games, editors, dashboards, forms, simulations, and other interactive pages. Keep it available for the whole session, not just the first action. The old MeloMateGameState/MeloMateGameAction names are compatibility aliases only.
 - Every availableActions item must contain a stable id plus the exact action and payload, for example {{"id":"e2-e4","action":"move","payload":{{"from":"e2","to":"e4"}}}}. Set agentShouldAct=true and expose availableActions only when the character may act; set agentShouldAct=false or return no actions at every other time. Include every legal choice the character should be allowed to select.
 - In generated game UI text and variable names, avoid claiming there is an "AI" player when the character is supposed to play. Use labels such as "{character_name}", "你", "我", "X/O", "black/white", or "player 1/player 2" instead of "AI" or "computer".
-- If read_workspace_state returns available=false or the state does not include the needed app/game fields, you cannot see the app. Do not guess, roleplay, or invent moves, choices, coordinates, score, winners, UI state, or whose turn it is. Say naturally that the app is not hooked up yet and ask to open it through MeloMate or revise the app to support MeloMateGameState.
+- If read_workspace_state returns available=false or the state does not include the needed app fields, you cannot see the app. Do not guess, roleplay, or invent operations, choices, coordinates, values, score, winners, UI state, or whose turn it is. Say naturally that the page is not connected yet and ask to open it through MeloMate or revise it to support MeloMateWorkspaceState.
 - Missing or stale live page state only prevents claims about the current on-screen state. It never cancels file work that the user's original message already authorized. Rebuild, replace, or delete the requested workspace files without requiring the page to be open.
 - Do not narrate internal game-control tool use with phrases like "let me check", "I'll look at the board", "我先看一下", "让我看看", or "让我看看棋盘再说". For games, read state and act silently, then speak only natural in-character table talk after your move if needed.
-- If an interactive workspace app does not support MeloMateGameState and MeloMateGameAction yet, do not attempt to operate it by pretending, chatting, or guessing. First revise the files to add the semantic protocol and remove fake built-in participant/operator logic, then open it again.
-- Use read_workspace_file plus replace_workspace_text for precise edits. Use search_workspace to locate relevant text, move_workspace_item for renames/moves, and delete_workspace_item only when the user's request actually authorizes deletion.
+- If an interactive workspace app does not support MeloMateWorkspaceState and MeloMateWorkspaceAction yet, do not attempt to operate it by pretending, chatting, or guessing. First revise the files to add the generic semantic protocol, then open it again.
+- For direct user requests to operate an open page, read_workspace_state and then call act_workspace_page with one exact advertised action id. For files, use inspect_workspace_item/read_workspace_file_range plus patch_workspace_file for checked edits. Use search_workspace to locate relevant text, move_workspace_item for renames/moves, and delete_workspace_item only when the user's request authorizes recoverable removal.
 - If any generated file is long, use append_workspace_file in small chunks instead of putting a whole long file into one tool call.
 - Keep each tool call argument compact and valid JSON. Do not put a large complete HTML/CSS/JS app into one write_workspace_file call.
 - After a successful file write, reply briefly without mentioning the exact file name unless the user asks.

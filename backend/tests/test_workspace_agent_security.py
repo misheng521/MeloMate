@@ -16,7 +16,6 @@ from src.open_llm_vtuber.agent.agents.basic_memory_agent import (  # noqa: E402
 )
 from src.open_llm_vtuber.conversations.single_conversation import (  # noqa: E402
     _attach_live_workspace_context,
-    _wants_live_workspace_context,
 )
 from src.open_llm_vtuber.mcpp.tool_executor import ToolExecutor  # noqa: E402
 from src.open_llm_vtuber.workspace_controller import (  # noqa: E402
@@ -24,18 +23,20 @@ from src.open_llm_vtuber.workspace_controller import (  # noqa: E402
     WorkspaceController,
     _agent_should_act,
     _compact_action_choices,
-    _decision_state,
-    _natural_spoken_reply,
+)
+from src.open_llm_vtuber.workspace_agent import (  # noqa: E402
+    WorkspaceAgentSession,
+    _natural_reply,
 )
 from src.open_llm_vtuber.workspace_intent import (  # noqa: E402
     workspace_fast_ack_text,
+    workspace_message_relevant,
     workspace_user_authorized_tools,
 )
 from src.open_llm_vtuber.workspace_security import (  # noqa: E402
     extract_workspace_action_grants,
     harden_workspace_tool_result,
     normalize_workspace_event,
-    workspace_awareness_tool_policy,
 )
 
 
@@ -47,16 +48,53 @@ class WorkspaceBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(workspace_fast_ack_text("今天天气怎么样"), "")
 
-    def test_decision_state_removes_duplicate_action_catalogs(self):
-        state = {
-            "board": [[0, 1], [0, 0]],
-            "availableActions": [{"id": "move-1"}],
-            "nested": {"legalMoves": [1, 2], "turn": "white"},
-        }
-        compact = _decision_state(state)
-        self.assertNotIn("availableActions", compact)
-        self.assertNotIn("legalMoves", compact["nested"])
-        self.assertEqual(compact["board"], [[0, 1], [0, 0]])
+    def test_actual_user_followup_can_continue_a_workspace_task(self):
+        inherited = workspace_user_authorized_tools("做一个通用网页编辑器")
+        continued = workspace_user_authorized_tools("继续，把样式也改好", inherited)
+        self.assertIn("write_workspace_project", continued)
+        self.assertIn("patch_workspace_file", continued)
+
+    def test_advice_questions_never_authorize_mutations(self):
+        delete_advice = workspace_user_authorized_tools(
+            "怎么删除工作区里的旧文件？"
+        )
+        edit_advice = workspace_user_authorized_tools("如何修改这个网页比较好？")
+        self.assertNotIn("delete_workspace_item", delete_advice)
+        self.assertNotIn("write_workspace_file", edit_advice)
+        self.assertNotIn("patch_workspace_file", edit_advice)
+        self.assertNotIn(
+            "delete_workspace_item",
+            workspace_user_authorized_tools("你能删除这个文件吗？"),
+        )
+        self.assertIn(
+            "delete_workspace_item",
+            workspace_user_authorized_tools("删除工作区里的旧文件"),
+        )
+
+    def test_natural_workspace_requests_map_to_general_file_capabilities(self):
+        self.assertIn(
+            "patch_workspace_file",
+            workspace_user_authorized_tools("把我的日记润色得更自然"),
+        )
+        self.assertIn(
+            "write_workspace_file",
+            workspace_user_authorized_tools("让页面按钮大一点"),
+        )
+        self.assertIn(
+            "move_workspace_item",
+            workspace_user_authorized_tools("把这个项目放到 archive 目录"),
+        )
+        restore_tools = workspace_user_authorized_tools("恢复刚才删除的文件")
+        self.assertIn("restore_workspace_item", restore_tools)
+        self.assertNotIn("delete_workspace_item", restore_tools)
+        self.assertNotIn(
+            "delete_workspace_item",
+            workspace_user_authorized_tools("不要删除这个文件"),
+        )
+        self.assertNotIn(
+            "write_workspace_file",
+            workspace_user_authorized_tools("不要修改这个文件"),
+        )
 
     def test_dense_grid_candidates_are_bounded_and_still_advertised(self):
         board = [[0 for _ in range(15)] for _ in range(15)]
@@ -127,35 +165,48 @@ class WorkspaceBoundaryTests(unittest.TestCase):
             [{"id": "move-2", "action": "move", "payload": {"to": 2}}],
         )
 
-    def test_workspace_aware_chat_is_read_only(self):
-        policy = workspace_awareness_tool_policy(
-            {
-                "workspace_awareness": {
-                    "persona": "XiaoKe",
-                    "snapshots": [
-                        {
-                            "updated_ms": 10,
-                            "page": {"id": "page-1"},
-                            "appState": {
-                                "agentShouldAct": True,
-                                "availableActions": [
-                                    {
-                                        "id": "move-1",
-                                        "action": "move",
-                                        "payload": {"to": 1},
-                                    }
-                                ],
-                            },
-                        }
-                    ],
-                }
-            }
-        )
-        self.assertEqual(set(policy["allowed_tool_names"]), {"read_workspace_state"})
-        self.assertEqual(policy["workspace_persona"], "XiaoKe")
-        self.assertNotIn("workspace_action_grants", policy)
+    def test_user_page_request_authorizes_read_and_exact_page_action(self):
+        tools = workspace_user_authorized_tools("轮到你了，你先下")
+        self.assertIn("read_workspace_state", tools)
+        self.assertIn("act_workspace_page", tools)
+        self.assertNotIn("write_workspace_file", tools)
 
-    def test_workspace_aware_turn_hides_all_mutating_tool_schemas(self):
+    def test_collaborative_apps_authorize_persistent_semantic_actions(self):
+        tools = workspace_user_authorized_tools("做一个表格，我们一起编辑")
+        self.assertIn("write_workspace_project", tools)
+        self.assertIn("act_workspace_page", tools)
+        game_tools = workspace_user_authorized_tools("帮我做一个五子棋，我们两个对战")
+        self.assertIn("write_workspace_project", game_tools)
+        self.assertIn("act_workspace_page", game_tools)
+
+    def test_workspace_task_is_bound_to_the_authorizing_persona(self):
+        class Context:
+            pass
+
+        session = WorkspaceAgentSession(Context())
+        session.begin_user_turn("我们一起操作这个应用", "XiaoKe")
+        self.assertTrue(session.page_action_authorized("XiaoKe", "page-1", claim=True))
+        self.assertFalse(session.page_action_authorized("XiaoKe", "page-2"))
+        self.assertFalse(session.page_action_authorized("Other"))
+        unrelated = session.begin_user_turn("今天天气很好", "XiaoKe")
+        self.assertEqual(
+            unrelated["user_authorized_workspace_tools"], frozenset()
+        )
+        previous_guidance = list(session.trusted_guidance)
+        session.begin_user_turn("工作区里有什么文件？", "XiaoKe")
+        self.assertEqual(session.trusted_guidance, previous_guidance)
+
+    def test_user_can_revoke_persistent_workspace_control(self):
+        class Context:
+            pass
+
+        session = WorkspaceAgentSession(Context())
+        session.begin_user_turn("我们一起下棋", "XiaoKe")
+        self.assertTrue(session.page_action_authorized("XiaoKe", "page-1"))
+        session.begin_user_turn("先停下，我不玩了", "XiaoKe")
+        self.assertFalse(session.page_action_authorized("XiaoKe", "page-1"))
+
+    def test_user_turn_filters_workspace_schemas_to_pre_authorized_tools(self):
         agent = BasicMemoryAgent.__new__(BasicMemoryAgent)
         tools = [
             {"type": "function", "function": {"name": "read_workspace_state"}},
@@ -167,12 +218,32 @@ class WorkspaceBoundaryTests(unittest.TestCase):
             tools,
             "OpenAI",
             {
-                "enforce": True,
-                "allowed_tool_names": {"read_workspace_state"},
+                "source": "user_turn",
+                "enforce": False,
+                "filter_workspace_tools": True,
+                "user_authorized_workspace_tools": {
+                    "read_workspace_state",
+                    "act_workspace_page",
+                },
             },
         )
         self.assertEqual(
             [tool["function"]["name"] for tool in filtered],
+            ["read_workspace_state"],
+        )
+
+        tainted = agent._filter_tools_for_policy(
+            [*tools, {"type": "function", "function": {"name": "external_tool"}}],
+            "OpenAI",
+            {
+                "source": "user_turn",
+                "enforce": True,
+                "filter_workspace_tools": False,
+                "allowed_tool_names": {"read_workspace_state"},
+            },
+        )
+        self.assertEqual(
+            [tool["function"]["name"] for tool in tainted],
             ["read_workspace_state"],
         )
 
@@ -187,9 +258,9 @@ class WorkspaceBoundaryTests(unittest.TestCase):
         self.assertLessEqual(len(payload["state"]["instruction"]), 600)
 
     def test_workspace_chat_context_does_not_hijack_unrelated_chat(self):
-        self.assertTrue(_wants_live_workspace_context("你觉得这一步棋怎么样？"))
-        self.assertFalse(_wants_live_workspace_context("今天天气很好，我们聊点别的"))
-        self.assertFalse(_wants_live_workspace_context("修改页面里的棋盘代码"))
+        self.assertTrue(workspace_message_relevant("你觉得这一步棋怎么样？"))
+        self.assertFalse(workspace_message_relevant("今天天气很好，我们聊点别的"))
+        self.assertTrue(workspace_message_relevant("修改页面里的棋盘代码"))
 
     def test_workspace_chat_refreshes_state_and_keeps_real_chat_history(self):
         class Character:
@@ -198,8 +269,6 @@ class WorkspaceBoundaryTests(unittest.TestCase):
 
         class Context:
             character_config = Character()
-            workspace_awareness = {}
-            workspace_user_guidance = []
 
         state = json.dumps(
             {
@@ -215,6 +284,9 @@ class WorkspaceBoundaryTests(unittest.TestCase):
             }
         )
         context = Context()
+        context.workspace_agent = WorkspaceAgentSession(context)
+        context.workspace_awareness = context.workspace_agent.snapshots
+        context.workspace_user_guidance = context.workspace_agent.trusted_guidance
         with patch(
             "src.open_llm_vtuber.conversations.single_conversation.workspace_core.read_workspace_state",
             return_value=state,
@@ -223,20 +295,78 @@ class WorkspaceBoundaryTests(unittest.TestCase):
                 context, "What is the current state?", None
             )
 
-        self.assertTrue(metadata["skip_memory"])
+        self.assertNotIn("skip_memory", metadata)
         self.assertNotIn("skip_history", metadata)
         snapshot = metadata["workspace_awareness"]["snapshots"][0]
         self.assertEqual(snapshot["state_version"], 7)
-        self.assertEqual(context.workspace_user_guidance[-1]["text"], "What is the current state?")
+        self.assertEqual(context.workspace_user_guidance, [])
+        self.assertEqual(metadata["workspace_tool_policy"]["source"], "user_turn")
+        self.assertTrue(metadata["workspace_tool_policy"]["enforce"])
+        self.assertEqual(metadata["workspace_tool_policy"]["allowed_tool_names"], frozenset())
+
+    def test_plain_file_task_does_not_import_untrusted_live_page_state(self):
+        class Character:
+            character_name = "XiaoKe"
+            conf_name = "XiaoKe"
+
+        class Context:
+            character_config = Character()
+
+        context = Context()
+        context.workspace_agent = WorkspaceAgentSession(context)
+        context.workspace_awareness = context.workspace_agent.snapshots
+        context.workspace_user_guidance = context.workspace_agent.trusted_guidance
+        with patch(
+            "src.open_llm_vtuber.conversations.single_conversation.workspace_core.read_workspace_state"
+        ) as read_state:
+            metadata = _attach_live_workspace_context(
+                context, "创建一份工作区会议记录文件", None
+            )
+
+        read_state.assert_not_called()
+        self.assertNotIn("workspace_awareness", metadata)
+        self.assertFalse(metadata["workspace_tool_policy"]["enforce"])
 
     def test_spoken_reply_filter_rejects_protocol_leaks(self):
-        self.assertEqual(_natural_spoken_reply("这步挺有意思，到你啦"), "这步挺有意思，到你啦")
-        self.assertEqual(_natural_spoken_reply('{"selectedActionId":"move-1"}'), "")
-        self.assertEqual(_natural_spoken_reply("payload: {row: 1} 我下好了"), "")
-        self.assertEqual(_natural_spoken_reply("move complete"), "")
+        self.assertEqual(_natural_reply("这步挺有意思，到你啦"), "这步挺有意思，到你啦")
+        self.assertEqual(_natural_reply('{"selectedActionId":"move-1"}'), "")
+        self.assertEqual(_natural_reply("工具已经执行，我下好了"), "")
+        self.assertEqual(_natural_reply("move complete"), "")
 
 
 class ToolExecutorBoundaryTests(unittest.TestCase):
+    def test_exact_page_action_drops_model_supplied_payload_and_action(self):
+        executor = ToolExecutor(object(), object())
+        normalized, error = executor.apply_tool_policy(
+            "act_workspace_page",
+            {
+                "persona": "XiaoKe",
+                "page_id": "page-1",
+                "state_version": 4,
+                "action_id": "move-4",
+                "action": "delete-everything",
+                "payload": {"path": "../secret"},
+                "wait_ms": 99_999,
+            },
+            {
+                "source": "user_turn",
+                "enforce": False,
+                "workspace_persona": "XiaoKe",
+                "user_authorized_workspace_tools": {"act_workspace_page"},
+            },
+        )
+        self.assertIsNone(error)
+        self.assertEqual(
+            normalized,
+            {
+                "persona": "XiaoKe",
+                "page_id": "page-1",
+                "state_version": 4,
+                "action_id": "move-4",
+                "wait_ms": 5000,
+            },
+        )
+
     def test_read_state_policy_preserves_only_bounded_page_selector(self):
         executor = ToolExecutor(object(), object())
         normalized, error = executor.apply_tool_policy(
@@ -247,9 +377,10 @@ class ToolExecutorBoundaryTests(unittest.TestCase):
                 "unexpected": "drop-me",
             },
             {
-                "source": "workspace_aware_chat",
+                "source": "user_turn",
                 "enforce": True,
                 "workspace_persona": "XiaoKe",
+                "user_authorized_workspace_tools": {"read_workspace_state"},
                 "allowed_tool_names": {"read_workspace_state"},
                 "remaining_tool_calls": {"read_workspace_state": 1},
             },
@@ -360,7 +491,7 @@ class ToolExecutorBoundaryTests(unittest.TestCase):
         self.assertTrue(policy["workspace_state_tainted"])
         self.assertIn("delete_workspace_item", policy["allowed_tool_names"])
         self.assertIn("write_workspace_project", policy["allowed_tool_names"])
-        self.assertNotIn("send_workspace_action", policy["allowed_tool_names"])
+        self.assertNotIn("act_workspace_page", policy["allowed_tool_names"])
         _, error = executor.apply_tool_policy(
             "delete_workspace_item",
             {"persona": "XiaoKe", "path": "mini-apps/old-game"},
@@ -419,10 +550,18 @@ class WorkspaceCoreFileTests(unittest.TestCase):
         self.assertIn("updated", content)
         workspace_core.delete_workspace_item("XiaoKe", "notes/final.txt")
         self.assertFalse((self.root / "XiaoKe" / "notes" / "final.txt").exists())
+        trash = json.loads(workspace_core.list_workspace_trash("XiaoKe"))
+        self.assertEqual(len(trash["entries"]), 1)
+        workspace_core.restore_workspace_item(
+            "XiaoKe", trash["entries"][0]["id"]
+        )
+        self.assertTrue((self.root / "XiaoKe" / "notes" / "final.txt").exists())
 
     def test_runtime_control_and_parent_paths_are_inaccessible(self):
         with self.assertRaises(ValueError):
             workspace_core.workspace_path("XiaoKe", ".control/state.json")
+        with self.assertRaises(ValueError):
+            workspace_core.workspace_path("XiaoKe", ".trash/item/payload")
         with self.assertRaises(ValueError):
             workspace_core.workspace_path("XiaoKe", "../Other/secret.txt")
         with self.assertRaises(ValueError):
@@ -438,6 +577,30 @@ class WorkspaceCoreFileTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "too many files"):
             workspace_core.write_workspace_project("XiaoKe", "project", files)
         self.assertFalse((self.root / "XiaoKe" / "project").exists())
+
+    def test_checked_patch_rejects_a_stale_file_version(self):
+        workspace_core.write_workspace_file(
+            "XiaoKe", "notes", "plan.txt", "old value"
+        )
+        inspected = json.loads(
+            workspace_core.inspect_workspace_item("XiaoKe", "notes/plan.txt")
+        )
+        patched = json.loads(
+            workspace_core.patch_workspace_file(
+                "XiaoKe",
+                "notes/plan.txt",
+                inspected["sha256"],
+                [{"old_text": "old value", "new_text": "new value"}],
+            )
+        )
+        self.assertTrue(patched["ok"])
+        with self.assertRaisesRegex(ValueError, "changed"):
+            workspace_core.patch_workspace_file(
+                "XiaoKe",
+                "notes/plan.txt",
+                inspected["sha256"],
+                [{"old_text": "new value", "new_text": "unsafe overwrite"}],
+            )
 
     def test_command_timestamps_are_strictly_monotonic(self):
         workspace_core.append_workspace_command(
@@ -580,7 +743,7 @@ class WorkspaceControllerTests(unittest.IsolatedAsyncioTestCase):
         )
 
     @staticmethod
-    def context(llm=None):
+    def context(llm=None, user_text="我们一起操作这个应用"):
         class Character:
             persona_prompt = "你是自然、简短的游戏伙伴。"
 
@@ -588,12 +751,37 @@ class WorkspaceControllerTests(unittest.IsolatedAsyncioTestCase):
             _llm = llm
 
         class Context:
-            workspace_awareness = {}
-            workspace_user_guidance = []
             character_config = Character()
             agent_engine = Agent() if llm is not None else None
 
-        return Context()
+        context = Context()
+        context.workspace_agent = WorkspaceAgentSession(context)
+        context.workspace_awareness = context.workspace_agent.snapshots
+        context.workspace_user_guidance = context.workspace_agent.trusted_guidance
+        context.workspace_agent.begin_user_turn(user_text, "XiaoKe")
+        return context
+
+    async def test_page_cannot_act_without_a_current_trusted_user_task(self):
+        sent_actions = []
+
+        async def read_state(_persona, _page_id):
+            return self.state_result(1, 1)
+
+        async def send_action(*args):
+            sent_actions.append(args)
+            return json.dumps({"confirmed": True})
+
+        controller = WorkspaceController(
+            self.context(user_text="今天天气很好"),
+            self._noop_send,
+            read_state,
+            send_action,
+            debounce_seconds=0,
+        )
+        controller.submit(self.event(1, 1))
+        await controller.wait_idle()
+        self.assertEqual(sent_actions, [])
+        await controller.close()
 
     async def test_rapid_updates_are_coalesced_to_latest_state(self):
         sent_actions = []

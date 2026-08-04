@@ -2557,8 +2557,8 @@ function handleWsMessage(message: WsMessage) {
 
   if (message.type === "workspace-control-status") {
     const labels: Record<string, WorkspaceControlStatus> = {
-      thinking: { label: "AI观察中", tone: "ready" },
-      acted: { label: "AI已操作", tone: "ready" },
+      thinking: { label: "观察中", tone: "ready" },
+      acted: { label: "已操作", tone: "ready" },
       paused: { label: "控制暂停", tone: "stale" },
       error: { label: "控制异常", tone: "stale" },
       closed: { label: "未连接", tone: "missing" },

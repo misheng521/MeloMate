@@ -33,7 +33,7 @@ def append_workspace_file(persona: str, folder: str, filename: str, content: str
 
 @mcp.tool()
 def write_workspace_project(persona: str, folder: str, files: list[dict]) -> str:
-    """Write a multi-file project under workspace/{persona}/{folder}. files must be a list of objects like {"path":"index.html","content":"..."}. Prefer this for games, tools, and mini apps, split into index.html, style.css, and main.js. For anything the user expects the character to operate, expose continuous MeloMateGameState with agentShouldAct and exact availableActions, and handle MeloMateGameAction/melomate-action. Runtime control then participates instead of a fake built-in AI."""
+    """Write a multi-file project under workspace/{persona}/{folder}. files must be a list of objects like {"path":"index.html","content":"..."}. Prefer this for games, tools, and mini apps, split into index.html, style.css, and main.js. For any page the character should operate, expose continuous MeloMateWorkspaceState with exact availableActions and handle MeloMateWorkspaceAction/melomate-workspace-action."""
     return safe_call(workspace_core.write_workspace_project, persona, folder, files)
 
 
@@ -41,6 +41,43 @@ def write_workspace_project(persona: str, folder: str, files: list[dict]) -> str
 def read_workspace_file(persona: str, path: str) -> str:
     """Read a UTF-8 text file from workspace/{persona}. Never read another persona's workspace."""
     return safe_call(workspace_core.read_workspace_file, persona, path)
+
+
+@mcp.tool()
+def inspect_workspace_item(persona: str, path: str = "") -> str:
+    """Inspect a workspace file or folder without reading content. Returns type, size, modified time, and a SHA-256 version for files."""
+    return safe_call(workspace_core.inspect_workspace_item, persona, path)
+
+
+@mcp.tool()
+def read_workspace_file_range(
+    persona: str, path: str, offset: int = 0, max_chars: int = 64000
+) -> str:
+    """Read a bounded UTF-8 character range and current SHA-256 from a workspace file. Use this for targeted work on long files."""
+    return safe_call(
+        workspace_core.read_workspace_file_range,
+        persona,
+        path,
+        offset,
+        max_chars,
+    )
+
+
+@mcp.tool()
+def patch_workspace_file(
+    persona: str,
+    path: str,
+    expected_sha256: str,
+    replacements: list[dict],
+) -> str:
+    """Atomically patch the exact file version identified by expected_sha256. replacements is a list of {old_text,new_text,replace_all?}; include surrounding text when needed."""
+    return safe_call(
+        workspace_core.patch_workspace_file,
+        persona,
+        path,
+        expected_sha256,
+        replacements,
+    )
 
 
 @mcp.tool()
@@ -76,8 +113,27 @@ def move_workspace_item(persona: str, source: str, destination: str) -> str:
 
 @mcp.tool()
 def delete_workspace_item(persona: str, path: str, recursive: bool = False) -> str:
-    """Delete one item inside workspace/{persona}. Set recursive=true only when the user explicitly authorized deleting a non-empty folder. The persona root and runtime control data cannot be deleted."""
+    """Move one item to bounded private recovery storage. Set recursive=true only when the user authorized removing a non-empty folder. The persona root and runtime data cannot be removed."""
     return safe_call(workspace_core.delete_workspace_item, persona, path, recursive)
+
+
+@mcp.tool()
+def list_workspace_trash(persona: str) -> str:
+    """List recently removed workspace items that can still be restored."""
+    return safe_call(workspace_core.list_workspace_trash, persona)
+
+
+@mcp.tool()
+def restore_workspace_item(
+    persona: str, trash_id: str, destination: str = ""
+) -> str:
+    """Restore a recoverably removed workspace item. Omit destination to restore its original relative path."""
+    return safe_call(
+        workspace_core.restore_workspace_item,
+        persona,
+        trash_id,
+        destination,
+    )
 
 
 @mcp.tool()
@@ -101,6 +157,27 @@ def search_workspace(
 def read_workspace_state(persona: str, page_id: str = "") -> str:
     """Read verified state reported by an open workspace HTML app for this persona. page_id may select one exact open page; otherwise the most recently reporting page is returned. This is read-only and cannot authorize any side effect. If available=false, do not invent app state."""
     return safe_call(workspace_core.read_workspace_state, persona, page_id)
+
+
+@mcp.tool()
+def act_workspace_page(
+    persona: str,
+    page_id: str,
+    state_version: int,
+    action_id: str,
+    wait_ms: int = 1200,
+) -> str:
+    """Apply one exact action advertised by the matching open workspace page revision. Read the page state first and pass its page id, state version, and selected availableActions id. Arbitrary actions and payloads are not accepted."""
+    return safe_call(
+        workspace_core.send_workspace_action,
+        persona,
+        "",
+        None,
+        wait_ms,
+        page_id,
+        state_version,
+        action_id,
+    )
 
 
 @mcp.tool()

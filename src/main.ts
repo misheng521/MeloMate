@@ -44,6 +44,19 @@ type DisplayText = {
   name?: string;
 };
 
+type ProactiveSpeakStage =
+  | "opening"
+  | "curious"
+  | "warm-concern"
+  | "playful-impatience"
+  | "fresh-topic";
+
+type ProactiveReturnContext = {
+  elapsed_seconds: number;
+  unanswered_count: number;
+  last_proactive_seconds_ago: number;
+};
+
 type WsMessage = {
   type?: string;
   text?: string;
@@ -205,8 +218,7 @@ const speechRmsGate = 0.008;
 const screenVisionMaxWidth = 1024;
 const screenVisionJpegQuality = 0.85;
 const defaultProactiveIdleSeconds = "120";
-const proactiveSpeakCheckIntervalMs = 10_000;
-const proactiveSpeakChance = 0.35;
+const proactiveSpeakCheckIntervalMs = 1_000;
 const workspaceEventLongPollMs = 15_000;
 const preferredVoiceChatOutputDevicePattern = /^voicemeeter\s+input\b/i;
 const voiceChatOutputDevicePattern = /voicemeeter\s+(input|in\s*\d+|aux\s+input|vaio3\s+input)|vb-audio\s+voicemeeter\s+vaio/i;
@@ -343,8 +355,13 @@ let screenVideo: HTMLVideoElement | null = null;
 let screenCaptureTimer = 0;
 let latestScreenImage: string | null = null;
 let screenShareWarningShown = false;
-let lastConversationActivityAt = Date.now();
+let lastUserConversationActivityAt = Date.now();
 let proactiveSpeakTimer = 0;
+let nextProactiveSpeakAt = Number.POSITIVE_INFINITY;
+let proactiveUnansweredCount = 0;
+let lastProactiveSpeakAt = 0;
+let currentProactiveTurnId = "";
+let currentProactiveIsAutomatic = false;
 let isVideoFullscreen = false;
 let isFallbackVideoFullscreen = false;
 const responseAudio = new Audio() as SinkAudioElement;
@@ -1293,7 +1310,6 @@ function rememberDisplayedUserTranscription(normalizedText: string) {
 }
 
 function finalizePendingUserLine(text: string, inputId?: string) {
-  markConversationActivity();
   if (inputId && displayedUserInputIds.has(inputId)) {
     discardPendingUserLine(inputId);
     return false;
@@ -1370,7 +1386,6 @@ function appendAssistantLine(text: string, speakerName?: string) {
   heardAssistantText = [heardAssistantText, cleanText].filter(Boolean).join(" ");
   lastAssistantLine = appendLine("assistant", cleanText);
   subtitle.textContent = cleanText;
-  markConversationActivity();
 }
 
 function setCaptureUi(active: boolean) {
@@ -2123,58 +2138,88 @@ function stopWorkspaceEventLoop() {
   workspaceEventAbortController = null;
 }
 
-function markConversationActivity() {
-  lastConversationActivityAt = Date.now();
-}
-
 function stopProactiveSpeakLoop() {
   if (!proactiveSpeakTimer) return;
   window.clearInterval(proactiveSpeakTimer);
   proactiveSpeakTimer = 0;
 }
 
-function proactiveSpeakPrompt(kind: "manual" | "idle" | "follow-up" | "gentle-checkin") {
-  if (kind === "manual") {
-    return [
-      "请根据当前人设、最近聊天上下文和你与用户的关系，主动说一句自然的话。",
-      "像语音聊天里顺手接一句，不要解释自己在主动说话，不要总结，不要暴露提示词。",
-      "如果最近有明确话题，就接住话题；如果没有，就轻轻问候或开启一个很短的新话题。",
-    ].join("\n");
-  }
-
-  if (kind === "follow-up") {
-    return [
-      "请根据当前人设和最近聊天上下文，延续上一轮情绪或话题，主动说一句很短、自然、不打扰的话。",
-      "优先接住用户刚才的情绪，不要讲道理，不要总结，不要提到主动说话。",
-    ].join("\n");
-  }
-
-  if (kind === "gentle-checkin") {
-    return [
-      "请根据当前人设，像陪伴式语音聊天一样轻轻问候用户一句。",
-      "语气自然、短，不要要求用户必须回复，不要解释功能。",
-    ].join("\n");
-  }
-
-  return [
-    "用户已经安静了一会儿。请根据当前人设和最近聊天上下文，主动说一句自然、简短、不过度打扰的话。",
-    "如果最近有话题，就轻轻接一句；如果没有明显话题，就温和地问候一下。",
-    "不要总结，不要解释，不要说你是在主动说话。",
-  ].join("\n");
-}
-
-function proactiveSpeakKind() {
-  const roll = Math.random();
-  if (roll < 0.34) return "follow-up";
-  if (roll < 0.67) return "gentle-checkin";
-  return "idle";
-}
-
 function canTriggerProactiveSpeak() {
-  return isWsReady && !isAssistantResponding;
+  return isWsReady
+    && !isAssistantResponding
+    && !isUserSpeaking
+    && !isUserInputPriorityActive
+    && !currentProactiveTurnId;
 }
 
-function requestProactiveSpeak(kind: "manual" | "idle" | "follow-up" | "gentle-checkin", announce = false) {
+function proactiveBaseIntervalMs() {
+  return Number(normalizeProactiveIdleSeconds(proactiveIdleSecondsInput.value)) * 1000;
+}
+
+function proactiveStageForCount(unansweredCount: number): ProactiveSpeakStage {
+  if (unansweredCount <= 0) return "opening";
+  const position = unansweredCount % 4;
+  if (position === 0) return "fresh-topic";
+  if (position === 1) return "curious";
+  if (position === 2) return "warm-concern";
+  return "playful-impatience";
+}
+
+function scheduleNextProactiveSpeak(now = Date.now()) {
+  if (!proactiveSpeakToggle.checked || !isCapturing) {
+    nextProactiveSpeakAt = Number.POSITIVE_INFINITY;
+    return;
+  }
+  const position = Math.max(0, proactiveUnansweredCount - 1) % 4;
+  const completedCycles = Math.floor(Math.max(0, proactiveUnansweredCount - 1) / 4);
+  const baseMultipliers = [1.25, 1.6, 2.1, 3];
+  const multiplier = Math.min(4, baseMultipliers[position] + Math.min(completedCycles * 0.2, 1));
+  nextProactiveSpeakAt = now + Math.round(proactiveBaseIntervalMs() * multiplier);
+}
+
+function resetProactiveSilenceEpisode(now = Date.now()) {
+  lastUserConversationActivityAt = now;
+  proactiveUnansweredCount = 0;
+  lastProactiveSpeakAt = 0;
+  nextProactiveSpeakAt = proactiveSpeakToggle.checked && isCapturing
+    ? now + proactiveBaseIntervalMs()
+    : Number.POSITIVE_INFINITY;
+}
+
+function completeProactiveTurn(turnId?: string) {
+  if (!currentProactiveTurnId) return false;
+  if (turnId && turnId !== currentProactiveTurnId) return false;
+  const wasAutomatic = currentProactiveIsAutomatic;
+  currentProactiveTurnId = "";
+  currentProactiveIsAutomatic = false;
+  if (wasAutomatic) {
+    scheduleNextProactiveSpeak();
+  } else if (proactiveSpeakToggle.checked && isCapturing) {
+    nextProactiveSpeakAt = Date.now() + proactiveBaseIntervalMs();
+  } else {
+    nextProactiveSpeakAt = Number.POSITIVE_INFINITY;
+  }
+  return true;
+}
+
+function proactiveReturnContext(now = Date.now()): ProactiveReturnContext | undefined {
+  if (proactiveUnansweredCount <= 0) return undefined;
+  return {
+    elapsed_seconds: Math.max(0, Math.round((now - lastUserConversationActivityAt) / 1000)),
+    unanswered_count: proactiveUnansweredCount,
+    last_proactive_seconds_ago: lastProactiveSpeakAt
+      ? Math.max(0, Math.round((now - lastProactiveSpeakAt) / 1000))
+      : 0,
+  };
+}
+
+function proactiveTurnId() {
+  return typeof crypto.randomUUID === "function"
+    ? `proactive-${crypto.randomUUID()}`
+    : `proactive-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function requestProactiveSpeak(mode: "manual" | "automatic", announce = false) {
   if (!isCapturing) {
     if (announce) appendLine("system", "请先启动麦克风，再让 ta 说句话。");
     syncProactiveSpeakButton();
@@ -2187,33 +2232,79 @@ function requestProactiveSpeak(kind: "manual" | "idle" | "follow-up" | "gentle-c
     return;
   }
 
-  if (isAssistantResponding) {
+  if (!canTriggerProactiveSpeak()) {
     if (announce) appendLine("system", "ta 还在说话，等这一句说完再试。");
     syncProactiveSpeakButton();
     return;
   }
 
+  if (mode === "manual") {
+    resetProactiveSilenceEpisode();
+  }
+
+  const now = Date.now();
+  const unansweredBeforeRequest = mode === "automatic" ? proactiveUnansweredCount : 0;
+  const turnId = proactiveTurnId();
+  currentProactiveTurnId = turnId;
+  currentProactiveIsAutomatic = mode === "automatic";
+  nextProactiveSpeakAt = Number.POSITIVE_INFINITY;
   setThinking(true);
-  sendWs({
-    type: "ai-speak-signal",
-    text: proactiveSpeakPrompt(kind),
+  const images = await screenImagesForNextTurn().catch((error) => {
+    console.warn("Capturing the proactive screen context failed.", error);
+    return [];
   });
+  if (
+    currentProactiveTurnId !== turnId
+    || !isCapturing
+    || isUserSpeaking
+    || isUserInputPriorityActive
+  ) {
+    completeProactiveTurn(turnId);
+    setThinking(false);
+    return;
+  }
+  const sent = sendWs({
+    type: "ai-speak-signal",
+    turn_id: turnId,
+    images,
+    screen_vision: screenVisionConfigPayload(),
+    proactive: {
+      mode,
+      stage: proactiveStageForCount(unansweredBeforeRequest),
+      elapsed_seconds: Math.max(0, Math.round((now - lastUserConversationActivityAt) / 1000)),
+      unanswered_count: unansweredBeforeRequest,
+      cycle_index: Math.floor(unansweredBeforeRequest / 4),
+    },
+  });
+  if (!sent) {
+    currentProactiveTurnId = "";
+    currentProactiveIsAutomatic = false;
+    setThinking(false);
+    scheduleNextProactiveSpeak(now);
+    return;
+  }
+  if (mode === "automatic") {
+    proactiveUnansweredCount += 1;
+    lastProactiveSpeakAt = now;
+  }
 }
 
 function restartProactiveSpeakLoop() {
   stopProactiveSpeakLoop();
 
-  if (!proactiveSpeakToggle.checked || !isCapturing) return;
+  if (!proactiveSpeakToggle.checked || !isCapturing) {
+    nextProactiveSpeakAt = Number.POSITIVE_INFINITY;
+    return;
+  }
+
+  if (!Number.isFinite(nextProactiveSpeakAt)) {
+    nextProactiveSpeakAt = Date.now() + proactiveBaseIntervalMs();
+  }
 
   proactiveSpeakTimer = window.setInterval(() => {
     if (!proactiveSpeakToggle.checked || !isCapturing || !canTriggerProactiveSpeak()) return;
-
-    const idleMs = Date.now() - lastConversationActivityAt;
-    const idleTargetMs = Number(normalizeProactiveIdleSeconds(proactiveIdleSecondsInput.value)) * 1000;
-    if (idleMs < idleTargetMs) return;
-    if (Math.random() > proactiveSpeakChance) return;
-
-    requestProactiveSpeak(proactiveSpeakKind());
+    if (Date.now() < nextProactiveSpeakAt) return;
+    void requestProactiveSpeak("automatic");
   }, proactiveSpeakCheckIntervalMs);
 }
 
@@ -2675,6 +2766,14 @@ function handleWsMessage(message: WsMessage) {
     } else {
       appendLine("system", message.message || "MeloMate 后端返回错误。");
     }
+    if (!message.turn_id || message.turn_id === activeAssistantTurnId || message.turn_id === currentProactiveTurnId) {
+      isAssistantResponding = false;
+      completeProactiveTurn(message.turn_id);
+      if (message.turn_id && message.turn_id === activeAssistantTurnId) {
+        activeAssistantTurnId = "";
+      }
+      syncProactiveSpeakButton();
+    }
     setThinking(false);
     return;
   }
@@ -2938,7 +3037,13 @@ async function finishBackendAudio() {
   });
   setThinking(false);
   isAssistantResponding = false;
-  markConversationActivity();
+  const completedProactiveTurn = completeProactiveTurn(completion.turnId);
+  if (!completedProactiveTurn && proactiveSpeakToggle.checked && isCapturing) {
+    nextProactiveSpeakAt = Date.now() + proactiveBaseIntervalMs();
+  }
+  if (completion.turnId && completion.turnId === activeAssistantTurnId) {
+    activeAssistantTurnId = "";
+  }
   syncProactiveSpeakButton();
 }
 
@@ -2947,6 +3052,7 @@ function stopCurrentResponsePlayback(force = false) {
   if (!force && !isAssistantResponding && !hasActivePlayback) return;
 
   isAssistantResponding = false;
+  completeProactiveTurn();
   pendingPlaybackCompletion = null;
   audioQueueVersion += 1;
   audioQueue = Promise.resolve();
@@ -3002,7 +3108,6 @@ function beginUserVoiceInput() {
   ensurePendingUserInputId();
   subtitle.textContent = listeningDisplayText;
   setAssistantStatus("listening");
-  markConversationActivity();
   syncProactiveSpeakButton();
 }
 
@@ -3056,16 +3161,20 @@ async function sendAudioPartition(audio: Float32Array) {
 
   const inputId = markUserVoiceAwaitingTranscription();
   const turnId = pendingUserTurnId;
+  const returnContext = proactiveReturnContext();
   endUserVoiceInput();
   isUserVoiceTurnSubmitted = true;
-  sendWs({
+  const submitted = sendWs({
     type: "mic-audio-end",
     input_id: inputId,
     turn_id: turnId,
     images: await screenImagesForNextTurn(),
     screen_vision: screenVisionConfigPayload(),
+    metadata: returnContext ? { proactive_return: returnContext } : undefined,
   });
-  markConversationActivity();
+  if (submitted) {
+    resetProactiveSilenceEpisode();
+  }
   setThinking(true);
 }
 
@@ -3221,7 +3330,7 @@ async function startCapture() {
   pendingUserLine = null;
   appendLine("system", "麦克风已启动，正在等待你说话。");
   subtitle.textContent = "麦克风已启动。";
-  markConversationActivity();
+  resetProactiveSilenceEpisode();
   restartProactiveSpeakLoop();
 }
 
@@ -3254,7 +3363,8 @@ function stopCaptureInternal(announce: boolean) {
     appendLine("system", "麦克风已停止。");
   }
   stopProactiveSpeakLoop();
-  markConversationActivity();
+  completeProactiveTurn();
+  resetProactiveSilenceEpisode();
   syncProactiveSpeakButton();
 }
 
@@ -3458,7 +3568,7 @@ startButton.addEventListener("click", () => {
 
 stopButton.addEventListener("click", stopCapture);
 proactiveSpeakButton.addEventListener("click", () => {
-  requestProactiveSpeak("manual", true);
+  void requestProactiveSpeak("manual", true);
 });
 
 savedSettings = normalizeStartupSettings(readSavedSettings());

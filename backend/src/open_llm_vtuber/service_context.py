@@ -79,6 +79,9 @@ class ServiceContext:
         self.history_uid: str = ""  # Add history_uid field
         self.send_text: Callable = None
         self.client_uid: str = None
+        # Recent automatic proactive replies are ephemeral, isolated per
+        # client, and deliberately excluded from chat history and memory.
+        self.proactive_utterances: list[str] = []
         self.workspace_agent = WorkspaceAgentSession(self)
         # Compatibility aliases for older call sites. Both point at the one
         # per-client WorkspaceAgentSession; there is no second controller memory.
@@ -290,6 +293,7 @@ class ServiceContext:
             self.history_uid = ""
             self.send_text = None
             self.client_uid = None
+            self.proactive_utterances.clear()
             self.screen_vision_api_key = ""
             self.workspace_agent.reset()
         if cancellation:

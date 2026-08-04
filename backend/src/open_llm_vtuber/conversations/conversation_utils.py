@@ -248,8 +248,10 @@ async def augment_text_with_screen_context(
     input_text: str,
     images: Optional[List[Dict[str, Any]]],
     screen_vision: Optional[Dict[str, Any]],
+    *,
+    force: bool = False,
 ) -> str:
-    if not wants_screen_vision(input_text):
+    if not force and not wants_screen_vision(input_text):
         return input_text
 
     if not images:

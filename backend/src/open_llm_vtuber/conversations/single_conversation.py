@@ -20,6 +20,7 @@ from .conversation_utils import (
 from .types import WebSocketSend
 from .tts_manager import TTSTaskManager
 from ..chat_history_manager import store_message
+from ..proactive_conversation import build_return_context_prompt
 from ..service_context import ServiceContext
 from ..workspace_intent import workspace_live_page_relevant
 
@@ -132,10 +133,24 @@ async def process_single_conversation(
             transcription_cache=transcription_cache,
             announced_transcription_ids=announced_transcription_ids,
         )
-        augmented_input_text = await augment_text_with_screen_context(
-            input_text, images, screen_vision
-        )
         metadata = dict(metadata or {})
+        augmented_input_text = await augment_text_with_screen_context(
+            input_text,
+            images,
+            screen_vision,
+            force=bool(
+                metadata.get("proactive_speak") and images and screen_vision
+            ),
+        )
+        return_context_prompt = build_return_context_prompt(
+            metadata.pop("proactive_return", None)
+        )
+        if return_context_prompt:
+            augmented_input_text = (
+                f"{return_context_prompt}\n\n"
+                "[用户本次真正说的话]\n"
+                f"{augmented_input_text}"
+            )
         metadata.pop("workspace_event", None)
         metadata.pop("workspace_event_data", None)
         metadata["workspace_persona"] = str(
@@ -269,6 +284,17 @@ async def process_single_conversation(
             websocket_send=websocket_send_with_turn,
             client_uid=client_uid,
         )
+
+        if (
+            full_response
+            and metadata.get("proactive_speak")
+            and metadata.get("proactive_mode") == "automatic"
+        ):
+            # Retain only a short per-client window for repetition avoidance and
+            # the user's one-shot return reaction.  It is never chat history or
+            # long-term character memory.
+            context.proactive_utterances.append(full_response.strip()[:180])
+            context.proactive_utterances[:] = context.proactive_utterances[-5:]
 
         if context.history_uid and full_response and not skip_history:
             store_message(

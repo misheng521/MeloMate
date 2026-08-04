@@ -12,7 +12,11 @@ backend/.voice_clone_ready
 backend/cache/
 backend/logs/
 backend/chat_history/
-characters/memory/**/*.bak
+# Per-persona conversation memory is editable local runtime data.  Keep only
+# documentation and the blank schema example in source control.
+characters/memory/*
+!characters/memory/README.md
+!characters/memory/core_memory.example.json
 reference_sounds/voice_clone_refs/
 
 # Large downloaded backend models

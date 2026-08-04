@@ -30,7 +30,7 @@ CORE_MEMORY_FILE = "core_memory.json"
 SINGLE_HISTORY_UID = "short_memory"
 MAX_MEMORY_ROUNDS = 20
 MAX_MEMORY_MESSAGES = MAX_MEMORY_ROUNDS * 2
-CORE_MEMORY_VERSION = 3
+CORE_MEMORY_VERSION = 4
 CORE_MEMORY_REVIEW_ROUNDS = 6
 MAX_PROFILE_ITEMS = 30
 MAX_EPISODE_ITEMS = 24
@@ -41,6 +41,9 @@ MAX_REVIEW_MESSAGES = CORE_MEMORY_REVIEW_ROUNDS * 4
 MAX_REVIEW_MESSAGE_CHARS = 4_000
 MAX_MESSAGE_CHARS = 100_000
 MAX_METADATA_BYTES = 16_384
+MAX_PENDING_INFERENCES = 40
+MAX_FORGOTTEN_TOPICS = 30
+MAX_CORE_BACKUPS = 8
 FILE_LOCK_TIMEOUT_SECONDS = 10.0
 
 _WINDOWS_RESERVED_NAMES = {
@@ -54,6 +57,30 @@ _WINDOWS_RESERVED_NAMES = {
 _locks_guard = threading.Lock()
 _conf_locks: dict[str, threading.RLock] = {}
 
+_MEMORY_SOURCES = {
+    "manual",
+    "user_explicit",
+    "user_confirmed",
+    "conversation_inference",
+    "legacy",
+}
+_SOURCE_PRIORITY = {
+    "legacy": 0,
+    "conversation_inference": 1,
+    "user_confirmed": 2,
+    "user_explicit": 3,
+    "manual": 4,
+}
+_MEMORY_STATUSES = {"active", "superseded", "forgotten"}
+_PROFILE_CATEGORIES = {
+    "likes",
+    "dislikes",
+    "facts",
+    "communication_preferences",
+    "boundaries",
+}
+_CONVERSATION_CATEGORIES = {"episodes", "open_threads"}
+
 _ADAPTATION_OPTIONS = {
     "response_length": {"adaptive", "brief", "detailed"},
     "initiative": {"low", "balanced", "high"},
@@ -65,7 +92,7 @@ _ADAPTATION_OPTIONS = {
 
 
 class HistoryStorageError(RuntimeError):
-    """Raised when neither a memory file nor its backup can be decoded."""
+    """Raised when a memory transaction cannot be completed safely."""
 
 
 class HistoryMessage(TypedDict):
@@ -196,14 +223,27 @@ def _read_json_unlocked(path: Path, default: object) -> object:
         backup = path.with_suffix(path.suffix + ".bak")
         try:
             recovered = json.loads(backup.read_text(encoding="utf-8-sig"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as backup_error:
-            raise HistoryStorageError(
-                f"Memory file {path.name} is unreadable and no valid backup exists"
-            ) from backup_error
+            recovery_source = backup.name
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            # A freshly-created memory may not have a .bak yet.  Preserve the
+            # broken edit and recover to the validated empty schema so one typo
+            # cannot make the entire chat service unavailable.
+            recovered = copy.deepcopy(default)
+            recovery_source = "the empty validated schema"
+        # Preserve the user's malformed manual edit before restoring the last valid
+        # copy.  This keeps chat usable without silently destroying editable JSON.
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        invalid = path.with_name(f"{path.stem}.invalid-{stamp}{path.suffix}")
+        try:
+            _replace_bytes(invalid, path.read_bytes())
+        except OSError:
+            logger.exception("Could not preserve malformed memory file {}", path.name)
         logger.error(
-            "Recovered damaged memory file {} from its last valid backup: {}",
+            "Memory file {} was malformed ({}); preserved it as {} and restored {}",
             path.name,
             type(primary_error).__name__,
+            invalid.name,
+            recovery_source,
         )
         _replace_bytes(path, _json_bytes(recovered))
         return recovered
@@ -217,7 +257,24 @@ def _write_json_unlocked(path: Path, data: object) -> None:
             raise HistoryStorageError(
                 f"Refusing to overwrite unreadable memory file {path.name}"
             ) from error
-        _replace_bytes(path.with_suffix(path.suffix + ".bak"), _json_bytes(current))
+        current_bytes = _json_bytes(current)
+        _replace_bytes(path.with_suffix(path.suffix + ".bak"), current_bytes)
+        if path.name == CORE_MEMORY_FILE:
+            backup_dir = path.parent / "backups"
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            revision = current.get("revision", 0) if isinstance(current, dict) else 0
+            backup_path = backup_dir / f"core_memory.r{revision}.{stamp}.json"
+            _replace_bytes(backup_path, current_bytes)
+            backups = sorted(
+                backup_dir.glob("core_memory.r*.json"),
+                key=lambda item: item.stat().st_mtime_ns,
+                reverse=True,
+            )
+            for stale in backups[MAX_CORE_BACKUPS:]:
+                try:
+                    stale.unlink()
+                except OSError:
+                    logger.warning("Could not rotate old memory backup: {}", stale.name)
     _replace_bytes(path, _json_bytes(data))
 
 
@@ -228,9 +285,11 @@ def _default_history() -> dict:
 def _default_core_memory() -> dict:
     return {
         "version": CORE_MEMORY_VERSION,
+        "revision": 0,
         "updated_at": _now(),
         "profile": {
             "preferred_name": "",
+            "preferred_name_source": "manual",
             "likes": [],
             "dislikes": [],
             "facts": [],
@@ -238,7 +297,8 @@ def _default_core_memory() -> dict:
             "boundaries": [],
         },
         "conversation": {
-            "summary": "",
+            "relationship_summary": "",
+            "relationship_summary_source": "conversation_inference",
             "episodes": [],
             "open_threads": [],
         },
@@ -250,6 +310,10 @@ def _default_core_memory() -> dict:
             "affection": "persona_default",
             "humor": "persona_default",
         },
+        "pending_inferences": [],
+        "forgotten_topics": [],
+        "manual_notes": [],
+        "extensions": {},
         "review": {
             "human_turns_since_review": 0,
             "last_reviewed_message_id": "",
@@ -257,6 +321,14 @@ def _default_core_memory() -> dict:
             "failed_attempts": 0,
         },
     }
+
+
+def _touch_core(core: dict) -> dict:
+    """Advance the optimistic revision for one atomic core-memory mutation."""
+    revision = core.get("revision", 0)
+    core["revision"] = min(int(revision) + 1, 2**63 - 1) if isinstance(revision, int) else 1
+    core["updated_at"] = _now()
+    return core
 
 
 def _validate_message(message: object) -> dict:
@@ -328,34 +400,55 @@ def _load_history_unlocked(safe_uid: str) -> dict:
     }
 
 
-def _memory_item(value: object, source: str = "legacy", confidence: float = 1.0) -> dict:
+def _memory_item(
+    value: object,
+    source: str = "manual",
+    confidence: float = 1.0,
+    *,
+    status: str = "active",
+) -> dict:
     now = _now()
     return {
+        "id": uuid4().hex,
         "value": str(value or ""),
         "source": source,
+        "status": status,
         "confidence": confidence,
+        "importance": 0.5,
         "created_at": now,
         "updated_at": now,
+        "last_confirmed_at": now if source in {"manual", "user_explicit"} else "",
         "keywords": [],
+        "evidence_message_ids": [],
     }
 
 
-def _validate_memory_item(item: object) -> dict | None:
+def _validate_memory_item(
+    item: object, *, default_source: str = "manual"
+) -> dict | None:
     if isinstance(item, str):
-        item = _memory_item(item)
+        item = _memory_item(item, source=default_source)
     if not isinstance(item, dict):
         return None
     value = _sanitize_memory_text(item.get("value"), MAX_MEMORY_ITEM_CHARS)
     if not value:
         return None
-    source = str(item.get("source") or "conversation_inference")
-    if source not in {"user_explicit", "conversation_inference", "legacy"}:
-        source = "conversation_inference"
+    source = str(item.get("source") or default_source)
+    if source not in _MEMORY_SOURCES:
+        source = default_source
+    status = str(item.get("status") or "active")
+    if status not in _MEMORY_STATUSES:
+        status = "active"
     try:
         confidence = float(item.get("confidence", 0.7))
     except (TypeError, ValueError):
         confidence = 0.7
     confidence = max(0.0, min(confidence, 1.0))
+    try:
+        importance = float(item.get("importance", 0.5))
+    except (TypeError, ValueError):
+        importance = 0.5
+    importance = max(0.0, min(importance, 1.0))
     keywords = item.get("keywords")
     clean_keywords = []
     if isinstance(keywords, list):
@@ -365,25 +458,117 @@ def _validate_memory_item(item: object) -> dict | None:
                 clean_keywords.append(clean)
     created_at = item.get("created_at")
     updated_at = item.get("updated_at")
+    last_confirmed_at = item.get("last_confirmed_at")
+    evidence = item.get("evidence_message_ids")
+    clean_evidence = []
+    if isinstance(evidence, list):
+        for message_id in evidence[:12]:
+            if isinstance(message_id, str) and 1 <= len(message_id) <= 128:
+                if message_id not in clean_evidence:
+                    clean_evidence.append(message_id)
     return {
+        "id": str(item.get("id") or uuid4().hex)[:128],
         "value": value,
         "source": source,
+        "status": status,
         "confidence": confidence,
+        "importance": importance,
         "created_at": created_at if isinstance(created_at, str) else _now(),
         "updated_at": updated_at if isinstance(updated_at, str) else _now(),
+        "last_confirmed_at": (
+            last_confirmed_at if isinstance(last_confirmed_at, str) else ""
+        ),
         "keywords": clean_keywords,
+        "evidence_message_ids": clean_evidence,
     }
 
 
-def _load_memory_items(value: object, limit: int) -> list[dict]:
+def _load_memory_items(
+    value: object, limit: int, *, default_source: str = "manual"
+) -> list[dict]:
     if not isinstance(value, list):
         return []
     items: list[dict] = []
     for raw_item in value:
-        item = _validate_memory_item(raw_item)
+        item = _validate_memory_item(raw_item, default_source=default_source)
         if item:
             items.append(item)
-    return items[-limit:]
+    return items[-max(limit * 2, limit):]
+
+
+def _validate_pending_inference(item: object) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    category = str(item.get("category") or "")
+    if category not in _PROFILE_CATEGORIES:
+        return None
+    value = _sanitize_memory_text(item.get("value"), MAX_MEMORY_ITEM_CHARS)
+    if not value or not _is_stable_memory_value(value):
+        return None
+    evidence = item.get("evidence_message_ids")
+    clean_evidence: list[str] = []
+    if isinstance(evidence, list):
+        for message_id in evidence[:12]:
+            if isinstance(message_id, str) and 1 <= len(message_id) <= 128:
+                if message_id not in clean_evidence:
+                    clean_evidence.append(message_id)
+    keywords = item.get("keywords")
+    clean_keywords: list[str] = []
+    if isinstance(keywords, list):
+        for keyword in keywords[:12]:
+            clean = _sanitize_memory_text(keyword, 40)
+            if clean and clean not in clean_keywords:
+                clean_keywords.append(clean)
+    try:
+        confidence = max(0.0, min(float(item.get("confidence", 0.65)), 0.85))
+    except (TypeError, ValueError):
+        confidence = 0.65
+    return {
+        "id": str(item.get("id") or uuid4().hex)[:128],
+        "category": category,
+        "value": value,
+        "confidence": confidence,
+        "evidence_count": len(clean_evidence),
+        "evidence_message_ids": clean_evidence,
+        "keywords": clean_keywords,
+        "first_seen_at": (
+            item.get("first_seen_at")
+            if isinstance(item.get("first_seen_at"), str)
+            else _now()
+        ),
+        "last_seen_at": (
+            item.get("last_seen_at")
+            if isinstance(item.get("last_seen_at"), str)
+            else _now()
+        ),
+    }
+
+
+def _validate_forgotten_topic(item: object) -> dict | None:
+    if isinstance(item, str):
+        item = {"value": item}
+    if not isinstance(item, dict):
+        return None
+    value = _sanitize_memory_text(item.get("value"), 100)
+    if not value:
+        return None
+    keywords = item.get("keywords")
+    clean_keywords: list[str] = []
+    if isinstance(keywords, list):
+        for keyword in keywords[:12]:
+            clean = _sanitize_memory_text(keyword, 40)
+            if clean and clean not in clean_keywords:
+                clean_keywords.append(clean)
+    return {
+        "id": str(item.get("id") or uuid4().hex)[:128],
+        "value": value,
+        "keywords": clean_keywords,
+        "created_at": (
+            item.get("created_at")
+            if isinstance(item.get("created_at"), str)
+            else _now()
+        ),
+    }
 
 
 def _load_core_unlocked(safe_uid: str) -> dict:
@@ -392,12 +577,17 @@ def _load_core_unlocked(safe_uid: str) -> dict:
         raise HistoryStorageError("Core memory must be a JSON object")
 
     core = _default_core_memory()
-    if raw.get("version") != CORE_MEMORY_VERSION:
+    raw_version = raw.get("version")
+    nested_profile = raw.get("profile")
+    if raw_version not in {3, CORE_MEMORY_VERSION} or not isinstance(
+        nested_profile, dict
+    ):
         preferred_name = raw.get("nickname")
         if isinstance(preferred_name, str):
             core["profile"]["preferred_name"] = _sanitize_memory_text(
                 preferred_name, 80
             )
+            core["profile"]["preferred_name_source"] = "legacy"
         for old_key, new_key in (
             ("likes", "likes"),
             ("dislikes", "dislikes"),
@@ -405,7 +595,7 @@ def _load_core_unlocked(safe_uid: str) -> dict:
             ("facts", "facts"),
         ):
             core["profile"][new_key] = _load_memory_items(
-                raw.get(old_key), MAX_PROFILE_ITEMS
+                raw.get(old_key), MAX_PROFILE_ITEMS, default_source="legacy"
             )
         turns = raw.get("turns_since_core_review", 0)
         if isinstance(turns, int) and turns >= 0:
@@ -420,6 +610,10 @@ def _load_core_unlocked(safe_uid: str) -> dict:
             core["updated_at"] = timestamp
         return core
 
+    if raw_version == CORE_MEMORY_VERSION:
+        revision = raw.get("revision")
+        if isinstance(revision, int) and revision >= 0:
+            core["revision"] = min(revision, 2**63 - 1)
     updated_at = raw.get("updated_at")
     if isinstance(updated_at, str):
         core["updated_at"] = updated_at
@@ -431,6 +625,13 @@ def _load_core_unlocked(safe_uid: str) -> dict:
             core["profile"]["preferred_name"] = _sanitize_memory_text(
                 preferred_name, 80
             )
+        preferred_name_source = profile.get("preferred_name_source")
+        if preferred_name_source in _MEMORY_SOURCES:
+            core["profile"]["preferred_name_source"] = preferred_name_source
+        elif core["profile"]["preferred_name"]:
+            core["profile"]["preferred_name_source"] = (
+                "manual" if raw_version == CORE_MEMORY_VERSION else "legacy"
+            )
         for key in (
             "likes",
             "dislikes",
@@ -439,19 +640,38 @@ def _load_core_unlocked(safe_uid: str) -> dict:
             "boundaries",
         ):
             core["profile"][key] = _load_memory_items(
-                profile.get(key), MAX_PROFILE_ITEMS
+                profile.get(key),
+                MAX_PROFILE_ITEMS,
+                default_source=(
+                    "manual" if raw_version == CORE_MEMORY_VERSION else "legacy"
+                ),
             )
 
     conversation = raw.get("conversation")
     if isinstance(conversation, dict):
-        core["conversation"]["summary"] = _sanitize_memory_text(
-            conversation.get("summary"), MAX_SUMMARY_CHARS, allow_sentences=True
+        core["conversation"]["relationship_summary"] = _sanitize_memory_text(
+            conversation.get("relationship_summary", conversation.get("summary")),
+            MAX_SUMMARY_CHARS,
+            allow_sentences=True,
         )
+        summary_source = conversation.get("relationship_summary_source")
+        if summary_source in _MEMORY_SOURCES:
+            core["conversation"]["relationship_summary_source"] = summary_source
+        elif raw_version == CORE_MEMORY_VERSION and core["conversation"]["relationship_summary"]:
+            core["conversation"]["relationship_summary_source"] = "manual"
         core["conversation"]["episodes"] = _load_memory_items(
-            conversation.get("episodes"), MAX_EPISODE_ITEMS
+            conversation.get("episodes"),
+            MAX_EPISODE_ITEMS,
+            default_source=(
+                "manual" if raw_version == CORE_MEMORY_VERSION else "legacy"
+            ),
         )
         core["conversation"]["open_threads"] = _load_memory_items(
-            conversation.get("open_threads"), MAX_OPEN_THREADS
+            conversation.get("open_threads"),
+            MAX_OPEN_THREADS,
+            default_source=(
+                "manual" if raw_version == CORE_MEMORY_VERSION else "legacy"
+            ),
         )
 
     adaptation = raw.get("adaptation")
@@ -473,6 +693,46 @@ def _load_core_unlocked(safe_uid: str) -> dict:
         failed_attempts = review.get("failed_attempts")
         if isinstance(failed_attempts, int) and failed_attempts >= 0:
             core["review"]["failed_attempts"] = min(failed_attempts, 20)
+
+    if raw_version == CORE_MEMORY_VERSION:
+        pending = raw.get("pending_inferences")
+        if isinstance(pending, list):
+            core["pending_inferences"] = [
+                item
+                for item in (
+                    _validate_pending_inference(value)
+                    for value in pending[-MAX_PENDING_INFERENCES:]
+                )
+                if item
+            ]
+        forgotten = raw.get("forgotten_topics")
+        if isinstance(forgotten, list):
+            core["forgotten_topics"] = [
+                item
+                for item in (
+                    _validate_forgotten_topic(value)
+                    for value in forgotten[-MAX_FORGOTTEN_TOPICS:]
+                )
+                if item
+            ]
+        manual_notes = raw.get("manual_notes")
+        if isinstance(manual_notes, list):
+            core["manual_notes"] = [
+                clean
+                for clean in (
+                    _sanitize_memory_text(value, 500, allow_sentences=True)
+                    for value in manual_notes[:30]
+                )
+                if clean
+            ]
+        extensions = raw.get("extensions")
+        if isinstance(extensions, dict):
+            try:
+                encoded = json.dumps(extensions, ensure_ascii=False).encode("utf-8")
+            except (TypeError, ValueError):
+                encoded = b""
+            if len(encoded) <= MAX_METADATA_BYTES:
+                core["extensions"] = copy.deepcopy(extensions)
     return core
 
 
@@ -640,14 +900,61 @@ def _extract_core_updates(message: str) -> dict:
 
 
 def _bounded_memory_items(items: list[dict], limit: int) -> list[dict]:
-    """Keep explicit user facts before inferred facts when a category reaches its cap."""
-    if len(items) <= limit:
-        return items
-    explicit = [item for item in items if item.get("source") == "user_explicit"]
-    inferred = [item for item in items if item.get("source") != "user_explicit"]
-    if len(explicit) >= limit:
-        return explicit[-limit:]
-    return explicit + inferred[-(limit - len(explicit)) :]
+    """Bound active memories without letting inference evict manual user data."""
+    active = [item for item in items if item.get("status") == "active"]
+    inactive = [item for item in items if item.get("status") != "active"][-12:]
+    if len(active) > limit:
+        protected = [
+            item
+            for item in active
+            if item.get("source") in {"manual", "user_explicit"}
+        ]
+        ordinary = [item for item in active if item not in protected]
+        if len(protected) >= limit:
+            protected.sort(
+                key=lambda item: (
+                    _SOURCE_PRIORITY.get(str(item.get("source")), 0),
+                    str(item.get("updated_at") or ""),
+                ),
+                reverse=True,
+            )
+            active = protected[:limit]
+        else:
+            active = protected + ordinary[-(limit - len(protected)) :]
+    return active + inactive
+
+
+def _memory_matches_topic(value: object, topic: object) -> bool:
+    memory_text = _normalize_item(value).casefold()
+    topic_text = _normalize_item(topic).casefold()
+    if not memory_text or not topic_text:
+        return False
+    if topic_text in memory_text or memory_text in topic_text:
+        return True
+    memory_terms = _query_terms(memory_text)
+    topic_terms = _query_terms(topic_text)
+    return bool(memory_terms and topic_terms and len(memory_terms & topic_terms) >= 2)
+
+
+def _is_forgotten_value(core: dict, value: object) -> bool:
+    for topic in core.get("forgotten_topics", []):
+        if not isinstance(topic, dict):
+            continue
+        if _memory_matches_topic(value, topic.get("value")):
+            return True
+        for keyword in topic.get("keywords", []):
+            if _memory_matches_topic(value, keyword):
+                return True
+    return False
+
+
+def _clear_forgotten_for_value(core: dict, value: object) -> None:
+    """A new direct statement deliberately re-authorizes that subject."""
+    core["forgotten_topics"] = [
+        topic
+        for topic in core.get("forgotten_topics", [])
+        if not _memory_matches_topic(value, topic.get("value"))
+    ]
 
 
 def _add_memory_items(
@@ -657,8 +964,9 @@ def _add_memory_items(
     source: str,
     confidence: float,
     limit: int,
+    forgotten_topics: object = None,
 ) -> list[dict]:
-    current = _load_memory_items(items, limit)
+    current = _load_memory_items(items, limit, default_source=source)
     incoming = values if isinstance(values, list) else []
     index = {
         _normalize_item(item["value"]).casefold(): position
@@ -667,13 +975,27 @@ def _add_memory_items(
     for value in incoming:
         if isinstance(value, dict):
             candidate = dict(value)
-            candidate.setdefault("source", source)
-            candidate.setdefault("confidence", confidence)
+            candidate["source"] = source
+            candidate["confidence"] = min(
+                confidence,
+                float(candidate.get("confidence", confidence))
+                if isinstance(candidate.get("confidence", confidence), (int, float))
+                else confidence,
+            )
         else:
             candidate = _memory_item(value, source=source, confidence=confidence)
-        validated = _validate_memory_item(candidate)
+        validated = _validate_memory_item(candidate, default_source=source)
         if not validated or not _is_stable_memory_value(validated["value"]):
             continue
+        if source not in {"manual", "user_explicit"} and isinstance(
+            forgotten_topics, list
+        ):
+            if any(
+                isinstance(topic, dict)
+                and _memory_matches_topic(validated["value"], topic.get("value"))
+                for topic in forgotten_topics
+            ):
+                continue
         key = _normalize_item(validated["value"]).casefold()
         existing_position = index.get(key)
         if existing_position is None:
@@ -682,25 +1004,63 @@ def _add_memory_items(
             continue
 
         existing = current[existing_position]
-        if existing.get("source") == "user_explicit" and source != "user_explicit":
+        if _SOURCE_PRIORITY.get(str(existing.get("source")), 0) > _SOURCE_PRIORITY.get(
+            source, 0
+        ):
             continue
         existing["source"] = source
+        existing["status"] = "active"
         existing["confidence"] = max(
             float(existing.get("confidence", 0.0)), validated["confidence"]
         )
         existing["updated_at"] = _now()
+        if source in {"manual", "user_explicit", "user_confirmed"}:
+            existing["last_confirmed_at"] = _now()
         existing["keywords"] = list(
             dict.fromkeys(
                 [*existing.get("keywords", []), *validated.get("keywords", [])]
             )
         )[:12]
+        existing["evidence_message_ids"] = list(
+            dict.fromkeys(
+                [
+                    *existing.get("evidence_message_ids", []),
+                    *validated.get("evidence_message_ids", []),
+                ]
+            )
+        )[:12]
     return _bounded_memory_items(current, limit)
+
+
+def _supersede_opposite_category(
+    core: dict, category: str, values: object, incoming_source: str
+) -> None:
+    opposite = {"likes": "dislikes", "dislikes": "likes"}.get(category)
+    if not opposite or not isinstance(values, list):
+        return
+    for incoming in values:
+        incoming_value = incoming.get("value") if isinstance(incoming, dict) else incoming
+        for item in core["profile"].get(opposite, []):
+            if item.get("status") != "active" or not _memory_matches_topic(
+                item.get("value"), incoming_value
+            ):
+                continue
+            if item.get("source") == "manual":
+                continue
+            if incoming_source == "user_explicit" or item.get("source") not in {
+                "user_explicit",
+                "user_confirmed",
+            }:
+                item["status"] = "superseded"
+                item["updated_at"] = _now()
 
 
 def _merge_explicit_core_updates(core: dict, updates: dict) -> dict:
     nickname = _sanitize_memory_text(updates.get("nickname"), 80)
     if nickname:
         core["profile"]["preferred_name"] = nickname
+        core["profile"]["preferred_name_source"] = "user_explicit"
+        _clear_forgotten_for_value(core, nickname)
     for key in (
         "likes",
         "dislikes",
@@ -708,14 +1068,19 @@ def _merge_explicit_core_updates(core: dict, updates: dict) -> dict:
         "communication_preferences",
         "boundaries",
     ):
+        values = updates.get(key)
+        if isinstance(values, list):
+            for value in values:
+                _clear_forgotten_for_value(core, value)
+        _supersede_opposite_category(core, key, values, "user_explicit")
         core["profile"][key] = _add_memory_items(
             core["profile"].get(key),
-            updates.get(key),
+            values,
             source="user_explicit",
             confidence=1.0,
             limit=MAX_PROFILE_ITEMS,
+            forgotten_topics=core.get("forgotten_topics"),
         )
-    core["updated_at"] = _now()
     return core
 
 
@@ -742,13 +1107,20 @@ def _forget_target_from_message(message: str) -> tuple[bool, str]:
 def _apply_forget_request(core: dict, message: str) -> dict:
     forget_all, target = _forget_target_from_message(message)
     if forget_all:
-        return _default_core_memory()
+        fresh = _default_core_memory()
+        # The caller touches the result once more before writing.  Carry the
+        # prior revision forward so an explicit full-forget remains a monotonic
+        # concurrency boundary rather than appearing older than stale reviews.
+        revision = core.get("revision", 0)
+        fresh["revision"] = revision if isinstance(revision, int) else 0
+        return fresh
     if not target:
         return core
 
     normalized_target = _normalize_item(target).casefold()
     if any(word in normalized_target for word in ("名字", "昵称", "称呼")):
         core["profile"]["preferred_name"] = ""
+        core["profile"]["preferred_name_source"] = "manual"
     for key in (
         "likes",
         "dislikes",
@@ -769,9 +1141,25 @@ def _apply_forget_request(core: dict, message: str) -> dict:
             if normalized_target not in _normalize_item(item.get("value")).casefold()
             and _normalize_item(item.get("value")).casefold() not in normalized_target
         ]
-    if normalized_target in _normalize_item(core["conversation"].get("summary")).casefold():
-        core["conversation"]["summary"] = ""
-    core["updated_at"] = _now()
+    if normalized_target in _normalize_item(
+        core["conversation"].get("relationship_summary")
+    ).casefold():
+        core["conversation"]["relationship_summary"] = ""
+        core["conversation"]["relationship_summary_source"] = (
+            "conversation_inference"
+        )
+    core["pending_inferences"] = [
+        item
+        for item in core.get("pending_inferences", [])
+        if not _memory_matches_topic(item.get("value"), target)
+    ]
+    forgotten = _validate_forgotten_topic({"value": target})
+    if forgotten and not any(
+        _memory_matches_topic(item.get("value"), target)
+        for item in core.get("forgotten_topics", [])
+    ):
+        core.setdefault("forgotten_topics", []).append(forgotten)
+        core["forgotten_topics"] = core["forgotten_topics"][-MAX_FORGOTTEN_TOPICS:]
     return core
 
 
@@ -796,6 +1184,210 @@ def _message_mentions_forget_target(message: str, target: str) -> bool:
             if separator in {"名字", "昵称", "生日"}:
                 candidates.add(separator)
     return any(len(value) >= 2 and value in haystack for value in candidates)
+
+
+def _review_operations(candidate: dict) -> tuple[list[dict], str, dict]:
+    """Normalize the v4 delta protocol and accept v3 output during upgrades."""
+    operations = candidate.get("operations")
+    normalized: list[dict] = []
+    if isinstance(operations, list):
+        normalized = [item for item in operations[:40] if isinstance(item, dict)]
+    else:
+        # Backward-compatible conversion for an in-flight review started by v3.
+        profile = candidate.get("profile")
+        if isinstance(profile, dict):
+            for category in _PROFILE_CATEGORIES - {"boundaries"}:
+                values = profile.get(category)
+                if isinstance(values, list):
+                    for value in values[:12]:
+                        payload = dict(value) if isinstance(value, dict) else {"value": value}
+                        normalized.append(
+                            {"op": "remember", "category": category, **payload}
+                        )
+        conversation = candidate.get("conversation")
+        if isinstance(conversation, dict):
+            for category in _CONVERSATION_CATEGORIES:
+                values = conversation.get(category)
+                if isinstance(values, list):
+                    for value in values[:12]:
+                        payload = dict(value) if isinstance(value, dict) else {"value": value}
+                        normalized.append(
+                            {"op": "remember", "category": category, **payload}
+                        )
+    summary = candidate.get("relationship_summary")
+    if not isinstance(summary, str):
+        conversation = candidate.get("conversation")
+        summary = conversation.get("summary") if isinstance(conversation, dict) else ""
+    adaptation = candidate.get("adaptation")
+    return normalized[:40], str(summary or ""), adaptation if isinstance(adaptation, dict) else {}
+
+
+def _pending_key(category: str, value: object) -> tuple[str, str]:
+    return category, _normalize_item(value).casefold()
+
+
+def _remember_review_inference(
+    core: dict,
+    operation: dict,
+    valid_human_messages: dict[str, str],
+) -> None:
+    category = str(operation.get("category") or "")
+    if category not in _PROFILE_CATEGORIES | _CONVERSATION_CATEGORIES:
+        return
+    value = _sanitize_memory_text(operation.get("value"), MAX_MEMORY_ITEM_CHARS)
+    if not value or not _is_stable_memory_value(value) or _is_forgotten_value(core, value):
+        return
+    evidence = operation.get("evidence_message_ids")
+    evidence_ids = []
+    if isinstance(evidence, list):
+        evidence_ids = list(
+            dict.fromkeys(
+                message_id
+                for message_id in evidence[:12]
+                if isinstance(message_id, str)
+                and message_id in valid_human_messages
+                and _memory_matches_topic(
+                    valid_human_messages[message_id], value
+                )
+            )
+        )
+    if not evidence_ids:
+        return
+    keywords = operation.get("keywords")
+    clean_keywords = []
+    if isinstance(keywords, list):
+        clean_keywords = [
+            clean
+            for clean in (
+                _sanitize_memory_text(keyword, 40) for keyword in keywords[:12]
+            )
+            if clean
+        ]
+    try:
+        confidence = max(
+            0.0, min(float(operation.get("confidence", 0.65)), 0.85)
+        )
+    except (TypeError, ValueError):
+        confidence = 0.65
+    candidate = {
+        "value": value,
+        "confidence": confidence,
+        "keywords": clean_keywords,
+        "evidence_message_ids": evidence_ids,
+    }
+
+    if category in _CONVERSATION_CATEGORIES:
+        # Episodes and open threads describe the dialogue itself, not user identity.
+        # They still require at least one verifiable human-message reference.
+        if not evidence_ids:
+            return
+        limit = MAX_EPISODE_ITEMS if category == "episodes" else MAX_OPEN_THREADS
+        core["conversation"][category] = _add_memory_items(
+            core["conversation"].get(category),
+            [candidate],
+            source="conversation_inference",
+            confidence=0.75,
+            limit=limit,
+            forgotten_topics=core.get("forgotten_topics"),
+        )
+        return
+
+    # Profile inferences must be independently supported twice.  A deterministic
+    # direct statement is stored immediately elsewhere as user_explicit.
+    key = _pending_key(category, value)
+    pending = core.get("pending_inferences", [])
+    existing = next(
+        (
+            item
+            for item in pending
+            if _pending_key(str(item.get("category")), item.get("value")) == key
+        ),
+        None,
+    )
+    if existing is None:
+        pending_item = _validate_pending_inference(
+            {
+                "category": category,
+                **candidate,
+                "first_seen_at": _now(),
+                "last_seen_at": _now(),
+            }
+        )
+        if pending_item:
+            pending.append(pending_item)
+    else:
+        existing["evidence_message_ids"] = list(
+            dict.fromkeys([*existing.get("evidence_message_ids", []), *evidence_ids])
+        )[:12]
+        existing["evidence_count"] = len(existing["evidence_message_ids"])
+        existing["confidence"] = max(
+            float(existing.get("confidence", 0.0)), confidence
+        )
+        existing["keywords"] = list(
+            dict.fromkeys([*existing.get("keywords", []), *clean_keywords])
+        )[:12]
+        existing["last_seen_at"] = _now()
+    core["pending_inferences"] = pending[-MAX_PENDING_INFERENCES:]
+
+    confirmed = next(
+        (
+            item
+            for item in core["pending_inferences"]
+            if _pending_key(str(item.get("category")), item.get("value")) == key
+            and len(item.get("evidence_message_ids", [])) >= 2
+        ),
+        None,
+    )
+    if not confirmed:
+        return
+    _supersede_opposite_category(
+        core, category, [confirmed["value"]], "conversation_inference"
+    )
+    core["profile"][category] = _add_memory_items(
+        core["profile"].get(category),
+        [
+            {
+                "value": confirmed["value"],
+                "keywords": confirmed.get("keywords", []),
+                "evidence_message_ids": confirmed.get("evidence_message_ids", []),
+            }
+        ],
+        source="conversation_inference",
+        confidence=max(float(confirmed.get("confidence", 0.65)), 0.75),
+        limit=MAX_PROFILE_ITEMS,
+        forgotten_topics=core.get("forgotten_topics"),
+    )
+    core["pending_inferences"] = [
+        item
+        for item in core["pending_inferences"]
+        if _pending_key(str(item.get("category")), item.get("value")) != key
+    ]
+
+
+def _apply_review_state_operation(core: dict, operation: dict) -> None:
+    action = str(operation.get("op") or "")
+    if action not in {"supersede", "resolve_thread"}:
+        return
+    target_id = str(operation.get("target_id") or "")
+    if not target_id:
+        return
+    category = str(operation.get("category") or "")
+    if action == "resolve_thread":
+        category = "open_threads"
+    if category in _PROFILE_CATEGORIES:
+        items = core["profile"].get(category, [])
+    elif category in _CONVERSATION_CATEGORIES:
+        items = core["conversation"].get(category, [])
+    else:
+        return
+    for item in items:
+        if item.get("id") != target_id or item.get("status") != "active":
+            continue
+        if item.get("source") in {"manual", "user_explicit"}:
+            return
+        item["status"] = "superseded"
+        item["updated_at"] = _now()
+        return
 
 
 def prepare_core_memory_review(conf_uid: str) -> dict | None:
@@ -837,6 +1429,7 @@ def prepare_core_memory_review(conf_uid: str) -> dict | None:
         snapshot_message_id = human_messages[-1]["id"]
         review_messages = [
             {
+                "id": message["id"],
                 "role": message["role"],
                 "content": message["content"][:MAX_REVIEW_MESSAGE_CHARS],
             }
@@ -844,15 +1437,20 @@ def prepare_core_memory_review(conf_uid: str) -> dict | None:
         ]
         return {
             "snapshot_message_id": snapshot_message_id,
+            "base_revision": core.get("revision", 0),
             "messages": review_messages,
             "core_memory": copy.deepcopy(core),
         }
 
 
 def commit_core_memory_review(
-    conf_uid: str, snapshot_message_id: str, candidate: object
+    conf_uid: str,
+    snapshot_message_id: str,
+    candidate: object,
+    *,
+    base_core_memory: dict | None = None,
 ) -> bool:
-    """Validate and merge a model-produced summary without overwriting explicit facts."""
+    """Apply a bounded model delta without overwriting manual or explicit facts."""
     if not snapshot_message_id or not isinstance(candidate, dict):
         return False
     with _locked_conf(conf_uid) as safe_uid:
@@ -886,51 +1484,64 @@ def commit_core_memory_review(
             if boundary_index is not None and boundary_index > snapshot_index:
                 # A newer forget/review boundary supersedes this older snapshot.
                 return False
-        profile = candidate.get("profile")
-        if isinstance(profile, dict):
-            for key in (
-                "likes",
-                "dislikes",
-                "facts",
-                "communication_preferences",
-            ):
-                core["profile"][key] = _add_memory_items(
-                    core["profile"].get(key),
-                    profile.get(key),
-                    source="conversation_inference",
-                    confidence=0.75,
-                    limit=MAX_PROFILE_ITEMS,
+        # Only accept evidence IDs that were present in the bounded snapshot
+        # shown to the reviewer, and require semantic overlap in
+        # _remember_review_inference.  Merely guessing an older valid ID is not
+        # sufficient evidence.
+        visible_messages = state["messages"][
+            max(0, snapshot_index - MAX_REVIEW_MESSAGES + 1) : snapshot_index + 1
+        ]
+        valid_human_messages = {
+            str(message.get("id")): str(message.get("content") or "")
+            for message in visible_messages
+            if message.get("role") == "human"
+        }
+        operations, summary_text, adaptation = _review_operations(candidate)
+        for operation in operations:
+            if operation.get("op") == "remember":
+                _remember_review_inference(
+                    core, operation, valid_human_messages
                 )
+            else:
+                _apply_review_state_operation(core, operation)
 
-        conversation = candidate.get("conversation")
-        if isinstance(conversation, dict):
-            summary = _sanitize_memory_text(
-                conversation.get("summary"), MAX_SUMMARY_CHARS, allow_sentences=True
+        summary = _sanitize_memory_text(
+            summary_text, MAX_SUMMARY_CHARS, allow_sentences=True
+        )
+        base_conversation = (
+            base_core_memory.get("conversation")
+            if isinstance(base_core_memory, dict)
+            and isinstance(base_core_memory.get("conversation"), dict)
+            else {}
+        )
+        current_summary = core["conversation"].get("relationship_summary", "")
+        base_summary = base_conversation.get(
+            "relationship_summary", base_conversation.get("summary", current_summary)
+        )
+        summary_is_unchanged = not base_conversation or current_summary == base_summary
+        if (
+            summary
+            and summary_is_unchanged
+            and core["conversation"].get("relationship_summary_source") != "manual"
+        ):
+            core["conversation"]["relationship_summary"] = summary
+            core["conversation"]["relationship_summary_source"] = (
+                "conversation_inference"
             )
-            if summary:
-                core["conversation"]["summary"] = summary
-            core["conversation"]["episodes"] = _add_memory_items(
-                core["conversation"].get("episodes"),
-                conversation.get("episodes"),
-                source="conversation_inference",
-                confidence=0.75,
-                limit=MAX_EPISODE_ITEMS,
-            )
-            if isinstance(conversation.get("open_threads"), list):
-                core["conversation"]["open_threads"] = _add_memory_items(
-                    [],
-                    conversation.get("open_threads"),
-                    source="conversation_inference",
-                    confidence=0.75,
-                    limit=MAX_OPEN_THREADS,
-                )
 
-        adaptation = candidate.get("adaptation")
-        if isinstance(adaptation, dict):
-            for key, allowed in _ADAPTATION_OPTIONS.items():
-                value = adaptation.get(key)
-                if value in allowed:
-                    core["adaptation"][key] = value
+        base_adaptation = (
+            base_core_memory.get("adaptation")
+            if isinstance(base_core_memory, dict)
+            and isinstance(base_core_memory.get("adaptation"), dict)
+            else {}
+        )
+        for key, allowed in _ADAPTATION_OPTIONS.items():
+            value = adaptation.get(key)
+            if value not in allowed:
+                continue
+            if base_adaptation and core["adaptation"].get(key) != base_adaptation.get(key):
+                continue
+            core["adaptation"][key] = value
 
         core["review"]["human_turns_since_review"] = sum(
             1
@@ -940,7 +1551,7 @@ def commit_core_memory_review(
         core["review"]["last_reviewed_message_id"] = snapshot_message_id
         core["review"]["last_review_at"] = _now()
         core["review"]["failed_attempts"] = 0
-        core["updated_at"] = _now()
+        _touch_core(core)
         _write_json_unlocked(_path(safe_uid, CORE_MEMORY_FILE), core)
     return True
 
@@ -952,7 +1563,7 @@ def record_core_memory_review_failure(conf_uid: str) -> None:
         core["review"]["failed_attempts"] = min(
             int(core["review"].get("failed_attempts") or 0) + 1, 20
         )
-        core["updated_at"] = _now()
+        _touch_core(core)
         _write_json_unlocked(_path(safe_uid, CORE_MEMORY_FILE), core)
 
 
@@ -1025,7 +1636,7 @@ def store_message(
                     int(core["review"].get("human_turns_since_review") or 0) + 1,
                     10_000,
                 )
-            core["updated_at"] = _now()
+            _touch_core(core)
             _write_json_unlocked(_path(safe_uid, CORE_MEMORY_FILE), core)
         _write_json_unlocked(_path(safe_uid, SHORT_MEMORY_FILE), state)
 
@@ -1067,8 +1678,13 @@ def delete_history(conf_uid: str, history_uid: str) -> bool:
         return False
     with _locked_conf(conf_uid) as safe_uid:
         _ensure_memory_files_unlocked(safe_uid)
+        previous_core = _load_core_unlocked(safe_uid)
+        fresh_core = _default_core_memory()
+        revision = previous_core.get("revision", 0)
+        fresh_core["revision"] = revision if isinstance(revision, int) else 0
+        _touch_core(fresh_core)
         _write_json_unlocked(_path(safe_uid, SHORT_MEMORY_FILE), _default_history())
-        _write_json_unlocked(_path(safe_uid, CORE_MEMORY_FILE), _default_core_memory())
+        _write_json_unlocked(_path(safe_uid, CORE_MEMORY_FILE), fresh_core)
     return True
 
 
@@ -1140,37 +1756,67 @@ def _query_terms(query: str) -> set[str]:
     return words
 
 
+_SEMANTIC_TERM_GROUPS = (
+    ("吃", "饭", "食物", "美食", "口味", "饮食", "料理"),
+    ("玩", "游戏", "对局", "开黑", "电竞"),
+    ("工作", "上班", "职业", "项目", "代码", "开发"),
+    ("学习", "上课", "考试", "学校", "作业"),
+    ("心情", "情绪", "难过", "开心", "焦虑", "压力"),
+    ("音乐", "歌", "歌曲", "听歌", "歌手"),
+    ("电影", "影视", "动漫", "动画", "追剧"),
+    ("运动", "健身", "跑步", "球", "锻炼"),
+)
+
+
+def _semantic_query_terms(text: str) -> set[str]:
+    normalized = _normalize_item(text).casefold()
+    terms = _query_terms(normalized)
+    for group in _SEMANTIC_TERM_GROUPS:
+        if any(marker in normalized for marker in group):
+            for marker in group:
+                terms.add(marker)
+                terms.update(_query_terms(marker))
+    return terms
+
+
 def _relevant_memory_values(items: object, query: str, limit: int) -> list[str]:
-    validated = _load_memory_items(items, max(limit * 6, limit))
+    validated = [
+        item
+        for item in _load_memory_items(items, max(limit * 6, limit))
+        if item.get("status") == "active"
+    ]
     if not validated:
         return []
     query_text = _normalize_item(query).casefold()
-    terms = _query_terms(query)
-    ranked: list[tuple[float, int, str]] = []
+    terms = _semantic_query_terms(query)
+    ranked: list[tuple[float, float, int, str]] = []
     for index, item in enumerate(validated):
         value = _normalize_item(item["value"])
         value_lower = value.casefold()
-        score = 0.0
+        relevance = 0.0
         if query_text and (query_text in value_lower or value_lower in query_text):
-            score += 6.0
-        item_terms = _query_terms(value)
-        score += float(len(terms.intersection(item_terms)))
+            relevance += 6.0
+        item_terms = _semantic_query_terms(value)
+        relevance += float(len(terms.intersection(item_terms))) * 1.25
         for keyword in item.get("keywords", []):
             keyword_lower = _normalize_item(keyword).casefold()
             if keyword_lower and keyword_lower in query_text:
-                score += 2.0
-        if item.get("source") == "user_explicit":
-            score += 0.5
-        ranked.append((score, index, value))
+                relevance += 2.0
+        trust = _SOURCE_PRIORITY.get(str(item.get("source")), 0) * 0.2
+        trust += float(item.get("confidence", 0.0)) * 0.25
+        trust += float(item.get("importance", 0.5)) * 0.25
+        ranked.append((relevance, trust, index, value))
 
-    matched = [item for item in ranked if item[0] > 0.5]
+    # Trust only orders memories that already match the current topic; it must
+    # never turn an unrelated manual or explicit record into a match.
+    matched = [item for item in ranked if item[0] > 0.75]
     selected = (
         matched
         if query_text
         else ranked[-min(2, len(ranked)) :]
     )
-    selected.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return [item[2] for item in selected[:limit]]
+    selected.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    return [item[3] for item in selected[:limit]]
 
 
 def get_core_memory_prompt(conf_uid: str, query: str = "") -> str:
@@ -1201,7 +1847,9 @@ def get_core_memory_prompt(conf_uid: str, query: str = "") -> str:
             lines.append(f"{title}：" + "；".join(values))
 
     summary = _sanitize_memory_text(
-        conversation.get("summary"), MAX_SUMMARY_CHARS, allow_sentences=True
+        conversation.get("relationship_summary"),
+        MAX_SUMMARY_CHARS,
+        allow_sentences=True,
     )
     if summary:
         lines.append(f"近期关系与对话概括：{summary}")
@@ -1211,6 +1859,17 @@ def get_core_memory_prompt(conf_uid: str, query: str = "") -> str:
     open_threads = _relevant_memory_values(conversation.get("open_threads"), query, 4)
     if open_threads:
         lines.append("可自然续接但不要强行拉回的话题：" + "；".join(open_threads))
+
+    manual_notes = _relevant_memory_values(
+        [
+            _memory_item(value, source="manual")
+            for value in core.get("manual_notes", [])
+        ],
+        query,
+        3,
+    )
+    if manual_notes:
+        lines.append("用户手工补充的背景备注：" + "；".join(manual_notes))
 
     adaptation_labels = {
         "response_length": {

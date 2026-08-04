@@ -223,6 +223,11 @@ class BasicMemoryAgent(AgentInterface):
                 self._memory_conf_uid,
                 str(snapshot.get("snapshot_message_id") or ""),
                 candidate,
+                base_core_memory=(
+                    snapshot.get("core_memory")
+                    if isinstance(snapshot.get("core_memory"), dict)
+                    else None
+                ),
             )
             if not committed:
                 raise ValueError("Memory review snapshot was no longer valid")

@@ -1,0 +1,38 @@
+{
+  "version": 4,
+  "revision": 0,
+  "updated_at": "",
+  "profile": {
+    "preferred_name": "",
+    "preferred_name_source": "manual",
+    "likes": [],
+    "dislikes": [],
+    "facts": [],
+    "communication_preferences": [],
+    "boundaries": []
+  },
+  "conversation": {
+    "relationship_summary": "",
+    "relationship_summary_source": "manual",
+    "episodes": [],
+    "open_threads": []
+  },
+  "adaptation": {
+    "response_length": "adaptive",
+    "initiative": "balanced",
+    "question_frequency": "balanced",
+    "advice_style": "ask_first",
+    "affection": "persona_default",
+    "humor": "persona_default"
+  },
+  "pending_inferences": [],
+  "forgotten_topics": [],
+  "manual_notes": [],
+  "extensions": {},
+  "review": {
+    "human_turns_since_review": 0,
+    "last_reviewed_message_id": "",
+    "last_review_at": "",
+    "failed_attempts": 0
+  }
+}

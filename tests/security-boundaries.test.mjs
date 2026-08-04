@@ -25,12 +25,18 @@ test("workspace bridge dispatches each control exactly once", () => {
 
   assert.match(
     bridgeSource,
-    /if \(typeof window\.MeloMateGameAction === "function"\)[\s\S]*?} else {[\s\S]*?document\.dispatchEvent\(actionEvent\)/,
+    /typeof window\.MeloMateWorkspaceAction === "function"[\s\S]*?await actionHandler\([\s\S]*?new CustomEvent\("melomate-workspace-action"/,
+  );
+  assert.match(bridgeSource, /if \(!detail\.handled\) {[\s\S]*?new CustomEvent\("melomate-action"/);
+  assert.equal(
+    (bridgeSource.match(/new CustomEvent\("melomate-workspace-action"/g) || []).length,
+    1,
   );
   assert.equal(
     (bridgeSource.match(/new CustomEvent\("melomate-action"/g) || []).length,
     1,
   );
+  assert.match(bridgeSource, /window\.MeloMateWorkspaceState/);
   assert.doesNotMatch(bridgeSource, /window\.dispatchEvent\(windowEvent\)/);
   assert.doesNotMatch(bridgeSource, /window\.dispatchEvent\(event\)/);
   assert.doesNotMatch(bridgeSource, /runCommand|command\.type === "key"|KeyboardEvent/);
@@ -75,9 +81,15 @@ test("local services enforce origin, host and per-launch authentication boundari
   const workspaceOrigin = `http://127.0.0.1:${workspacePort}`;
   const fixtureRoot = resolve(projectRoot, "workspace", "security-test-persona");
   mkdirSync(fixtureRoot, { recursive: true });
+  mkdirSync(resolve(fixtureRoot, ".trash", "private-item"), { recursive: true });
   writeFileSync(
     resolve(fixtureRoot, "index.html"),
     "<!doctype html><title>Security fixture</title>",
+    "utf8",
+  );
+  writeFileSync(
+    resolve(fixtureRoot, ".trash", "private-item", "payload"),
+    "deleted private content",
     "utf8",
   );
   context.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
@@ -215,6 +227,17 @@ test("local services enforce origin, host and per-launch authentication boundari
       Origin: frontendOrigin,
       "X-MeloMate-Session": sessionToken,
     }),
+    404,
+  );
+  assert.equal(
+    await status(`${frontendOrigin}/api/workspace-open-url?persona=security-test-persona&path=.trash/private-item/payload`, {
+      Origin: frontendOrigin,
+      "X-MeloMate-Session": sessionToken,
+    }),
+    404,
+  );
+  assert.equal(
+    await status(`${workspaceOrigin}/workspace-files/security-test-persona/${fixtureWorkspaceToken}/.trash/private-item/payload`),
     404,
   );
   assert.equal(

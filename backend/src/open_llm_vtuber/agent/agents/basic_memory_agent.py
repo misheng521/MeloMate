@@ -31,9 +31,7 @@ from ...mcpp.json_detector import StreamJSONDetector
 from ...mcpp.types import ToolCallObject
 from ...mcpp.tool_executor import ToolExecutor
 from ...workspace_security import (
-    WORKSPACE_AWARE_CHAT_SYSTEM_GUARD,
     WORKSPACE_STATE_RESULT_SYSTEM_GUARD,
-    workspace_awareness_tool_policy,
 )
 from ...workspace_intent import (
     workspace_fast_ack_text,
@@ -54,6 +52,12 @@ WORKSPACE_TOOL_NAMES = {
     "search_workspace",
     "read_workspace_state",
     "open_workspace_item",
+    "inspect_workspace_item",
+    "act_workspace_page",
+    "restore_workspace_item",
+    "read_workspace_file_range",
+    "patch_workspace_file",
+    "list_workspace_trash",
 }
 
 SILENT_WORKSPACE_TOOL_NAMES = {
@@ -68,15 +72,17 @@ WORKSPACE_WRITE_TOOL_NAMES = {
     "replace_workspace_text",
     "move_workspace_item",
     "delete_workspace_item",
+    "restore_workspace_item",
+    "patch_workspace_file",
 }
 
 DEFAULT_MAX_TOOL_ROUNDS = 8
-WORKSPACE_MAX_TOOL_ROUNDS = 16
+WORKSPACE_MAX_TOOL_ROUNDS = 24
 MAX_TOOL_CALLS_PER_ROUND = 8
 MAX_TOOL_CALLS_PER_TURN = 16
-MAX_WORKSPACE_TOOL_CALLS_PER_TURN = 32
-TOOL_TURN_TIMEOUT_SECONDS = 300
-TOOL_LIMIT_MESSAGE = "工具操作已安全停止：本次回复达到调用次数或时间限制。"
+MAX_WORKSPACE_TOOL_CALLS_PER_TURN = 64
+TOOL_TURN_TIMEOUT_SECONDS = 600
+TOOL_LIMIT_MESSAGE = "这次工作量比较大，我已经保留了完成的部分，你说继续我就接着做。"
 
 
 class BasicMemoryAgent(AgentInterface):
@@ -221,7 +227,7 @@ class BasicMemoryAgent(AgentInterface):
         self._memory.append(message_data)
 
     def add_external_assistant_message(self, message: str) -> None:
-        """Record a verified workspace Agent utterance in the shared chat memory."""
+        """Record a verified workspace reply in the shared chat memory."""
         self._add_message(str(message or "").strip(), "assistant")
 
     def set_memory_from_history(self, conf_uid: str, history_uid: str) -> None:
@@ -295,14 +301,26 @@ class BasicMemoryAgent(AgentInterface):
         mode: str,
         tool_policy: Dict[str, Any] | None,
     ) -> List[Dict[str, Any]]:
-        if tool_policy is None or tool_policy.get("enforce") is not True:
+        if tool_policy is None:
             return tools
-        allowed = set(tool_policy.get("allowed_tool_names") or ())
-        return [
-            tool
-            for tool in tools
-            if self._formatted_tool_name(tool, mode) in allowed
-        ]
+        if tool_policy.get("enforce") is True:
+            allowed = set(tool_policy.get("allowed_tool_names") or ())
+            return [
+                tool
+                for tool in tools
+                if self._formatted_tool_name(tool, mode) in allowed
+            ]
+        if tool_policy.get("filter_workspace_tools") is True:
+            allowed_workspace = set(
+                tool_policy.get("user_authorized_workspace_tools") or ()
+            )
+            return [
+                tool
+                for tool in tools
+                if self._formatted_tool_name(tool, mode) not in WORKSPACE_TOOL_NAMES
+                or self._formatted_tool_name(tool, mode) in allowed_workspace
+            ]
+        return tools
 
     @staticmethod
     def _secure_system_prompt_for_policy(
@@ -318,8 +336,6 @@ class BasicMemoryAgent(AgentInterface):
                 "work immediately. Do not repeat a promise to start, and do not say "
                 "the work is complete until the tools confirm it."
             )
-        if tool_policy.get("source") == "workspace_aware_chat":
-            return f"{secured_prompt}\n\n{WORKSPACE_AWARE_CHAT_SYSTEM_GUARD}"
         if tool_policy.get("workspace_state_tainted") is True:
             return f"{secured_prompt}\n\n{WORKSPACE_STATE_RESULT_SYSTEM_GUARD}"
         return secured_prompt
@@ -512,7 +528,6 @@ class BasicMemoryAgent(AgentInterface):
         )
         tool_rounds = 0
         total_tool_calls = 0
-        workspace_context_isolated = False
 
         while True:
             tools_for_api = self._filter_tools_for_policy(
@@ -644,16 +659,6 @@ class BasicMemoryAgent(AgentInterface):
 
                 if tool_results_for_llm:
                     messages.append({"role": "user", "content": tool_results_for_llm})
-                if (
-                    tool_policy
-                    and tool_policy.get("workspace_state_tainted") is True
-                    and not workspace_context_isolated
-                ):
-                    tool_exchange = messages[len(initial_messages) :]
-                    messages[:] = [*initial_messages[-1:], *tool_exchange]
-                    workspace_context_isolated = True
-                    remember_turn = False
-
                 # stop_reason = None
                 continue
             else:
@@ -683,7 +688,6 @@ class BasicMemoryAgent(AgentInterface):
         )
         tool_rounds = 0
         total_tool_calls = 0
-        workspace_context_isolated = False
 
         while True:
             if self.prompt_mode_flag:
@@ -831,15 +835,6 @@ class BasicMemoryAgent(AgentInterface):
                         messages.append(
                             {"role": "user", "content": combined_results_str}
                         )
-                    if (
-                        tool_policy
-                        and tool_policy.get("workspace_state_tainted") is True
-                        and not workspace_context_isolated
-                    ):
-                        tool_exchange = messages[len(initial_messages) :]
-                        messages[:] = [*initial_messages[-1:], *tool_exchange]
-                        workspace_context_isolated = True
-                        remember_turn = False
                 continue
 
             elif pending_tool_calls and assistant_message_for_api:
@@ -902,15 +897,6 @@ class BasicMemoryAgent(AgentInterface):
 
                 if tool_results_for_llm:
                     messages.extend(tool_results_for_llm)
-                if (
-                    tool_policy
-                    and tool_policy.get("workspace_state_tainted") is True
-                    and not workspace_context_isolated
-                ):
-                    tool_exchange = messages[len(initial_messages) :]
-                    messages[:] = [*initial_messages[-1:], *tool_exchange]
-                    workspace_context_isolated = True
-                    remember_turn = False
                 continue
 
             else:
@@ -940,24 +926,19 @@ class BasicMemoryAgent(AgentInterface):
             self.reset_interrupt()
             self.prompt_mode_flag = False
 
-            awareness_tool_policy = workspace_awareness_tool_policy(
-                input_data.metadata
-            )
-            is_workspace_aware = awareness_tool_policy is not None
             metadata = input_data.metadata if isinstance(input_data.metadata, dict) else {}
             user_text = self._user_input_text(input_data)
-            tool_policy = awareness_tool_policy or {
+            provided_policy = metadata.get("workspace_tool_policy")
+            tool_policy = provided_policy if isinstance(provided_policy, dict) else {
                 "source": "user_turn",
                 "enforce": False,
+                "filter_workspace_tools": True,
                 "workspace_persona": str(metadata.get("workspace_persona") or ""),
                 "user_authorized_workspace_tools": workspace_user_authorized_tools(
                     user_text
                 ),
             }
-            messages = self._to_messages(
-                input_data,
-                include_memory=not is_workspace_aware,
-            )
+            messages = self._to_messages(input_data, include_memory=True)
             tools = None
             tool_mode = None
             llm_supports_native_tools = False
@@ -967,16 +948,6 @@ class BasicMemoryAgent(AgentInterface):
             system_prompt = self._system
             max_tool_rounds = DEFAULT_MAX_TOOL_ROUNDS
             max_tool_calls = MAX_TOOL_CALLS_PER_TURN
-            if is_workspace_aware:
-                persona = str(tool_policy.get("workspace_persona") or "assistant")
-                system_prompt = (
-                    f"You are the workspace participant named {persona}. "
-                    "Answer only the user's actual current message naturally. You may "
-                    "discuss the supplied live page/file state, but no private chat "
-                    "history or long-term memory is available in this isolated turn."
-                )
-                max_tool_rounds = 3
-
             if self._use_mcpp and self._tool_manager:
                 tools = None
                 if isinstance(self._llm, ClaudeAsyncLLM):
@@ -1002,8 +973,7 @@ class BasicMemoryAgent(AgentInterface):
                     )
 
             if (
-                not is_workspace_aware
-                and remember_turn
+                remember_turn
                 and self._workspace_write_tools_available(tools, tool_mode)
             ):
                 fast_ack = workspace_fast_ack_text(user_text)

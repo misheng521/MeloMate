@@ -33,6 +33,12 @@ WORKSPACE_TOOL_NAMES = {
     "search_workspace",
     "read_workspace_state",
     "open_workspace_item",
+    "inspect_workspace_item",
+    "read_workspace_file_range",
+    "patch_workspace_file",
+    "list_workspace_trash",
+    "restore_workspace_item",
+    "act_workspace_page",
 }
 TOOL_EXECUTION_TIMEOUT_SECONDS = 30
 MAX_TOOL_ARGUMENT_CHARS = 256_000
@@ -188,6 +194,26 @@ class ToolExecutor:
                     "TOOL_POLICY_DENIED: this workspace side effect was not "
                     "authorized by the user's message for this turn."
                 )
+            if tool_name == "act_workspace_page":
+                page_id = str(tool_input.get("page_id") or "").strip()[:128]
+                action_id = str(tool_input.get("action_id") or "").strip()[:128]
+                try:
+                    state_version = max(0, int(tool_input.get("state_version") or 0))
+                    wait_ms = max(0, min(int(tool_input.get("wait_ms") or 1200), 5000))
+                except (TypeError, ValueError, OverflowError):
+                    return tool_input, "TOOL_POLICY_DENIED: invalid page action revision."
+                if not page_id or not action_id or state_version <= 0:
+                    return tool_input, (
+                        "TOOL_POLICY_DENIED: page_id, positive state_version, and "
+                        "one advertised action_id are required."
+                    )
+                tool_input = {
+                    "persona": expected_persona or supplied_persona,
+                    "page_id": page_id,
+                    "state_version": state_version,
+                    "action_id": action_id,
+                    "wait_ms": wait_ms,
+                }
         if tool_policy is None or tool_policy.get("enforce") is not True:
             return tool_input, None
         allowed = set(tool_policy.get("allowed_tool_names") or ())
@@ -246,8 +272,6 @@ class ToolExecutor:
         """Prevent untrusted page state from authorizing unrelated follow-up tools."""
         if tool_policy is None or tool_name != "read_workspace_state":
             return
-        if tool_policy.get("source") == "workspace_aware_chat":
-            return
         if tool_policy.get("source") != "user_turn":
             return
         persona = ""
@@ -265,7 +289,7 @@ class ToolExecutor:
                 "allowed_tool_names": allowed,
                 "workspace_persona": persona,
                 "workspace_state_tainted": True,
-                "remaining_tool_calls": {name: 32 for name in allowed},
+                "remaining_tool_calls": {name: 64 for name in allowed},
             }
         )
 

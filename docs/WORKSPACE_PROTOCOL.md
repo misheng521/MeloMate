@@ -1,49 +1,71 @@
 # MeloMate Workspace Control Protocol
 
-Interactive workspace HTML files are controlled through a small page protocol injected by `server.mjs`.
+Interactive workspace HTML files use a generic semantic protocol injected by
+`server.mjs`. It is not limited to games: editors, dashboards, forms, simulations,
+media tools, and other pages use the same state/action contract.
 
-Every time an HTML file is opened through MeloMate, the server injects a unique page instance id. Workspace commands are routed to that exact page id, so two open games cannot accidentally receive each other's moves.
+Each page opened through MeloMate receives a unique page id. Commands are bound to
+that page id, the exact state revision, and one advertised action id. Two open apps
+therefore cannot receive each other's operations.
 
-## Required Page API
+## Required page API
 
-Expose fresh app state for the whole session:
+Expose all state needed to understand the visible page for the whole session:
 
 ```js
-window.MeloMateGameState = () => ({
-  screen: "game",
-  currentTurn: "MeloMate",
-  agentShouldAct: currentTurn === "MeloMate" && !winner,
-  board,
-  legalMoves,
-  winner,
-  availableActions: currentTurn === "MeloMate" && !winner
-    ? [{ id: "place-0-0", action: "place-piece", payload: { row: 0, col: 0 } }]
+window.MeloMateWorkspaceState = () => ({
+  screen: "editor",
+  documentTitle,
+  selection,
+  dirty,
+  agentShouldAct: shouldMeloMateAct,
+  availableActions: shouldMeloMateAct
+    ? [
+        { id: "format-title", action: "format", payload: { target: "title" } },
+        { id: "save-document", action: "save", payload: {} }
+      ]
     : []
 });
 ```
 
-Handle semantic actions:
+Handle semantic actions and validate them inside the app:
 
 ```js
-window.MeloMateGameAction = (action, payload) => {
-  if (action !== "place-piece") return { handled: false, accepted: false };
-  if (!isLegal(payload)) return { handled: true, accepted: false };
-  applyMove(payload);
-  return { handled: true, accepted: true, result: { move: payload } };
+window.MeloMateWorkspaceAction = (action, payload) => {
+  if (!isCurrentlyAllowed(action, payload)) {
+    return { handled: true, accepted: false };
+  }
+  const result = applySemanticAction(action, payload);
+  return { handled: true, accepted: true, result };
 };
 ```
 
+Pages may instead listen for `melomate-workspace-action` and call
+`event.preventDefault()` after handling it. `MeloMateGameState`,
+`MeloMateGameAction`, and `melomate-action` remain supported as legacy aliases.
+
 ## Rules
 
-- Keep `MeloMateGameState` available after every user action and every MeloMate action.
-- Set `agentShouldAct: true` only when the character is expected to make one autonomous decision. At every other time set it to `false` or return no `availableActions`.
-- Give every `availableActions` entry a stable, unique `id`. MeloMate chooses an id and the backend revalidates its exact action and payload against the same open page and state revision.
-- Return `handled: true` only when the app recognized the action.
-- Return `accepted: true` only after the app actually applied the action.
-- Do not use a built-in AI opponent when the user asked to play with the character. MeloMate runtime control is the only character-side operator; this internal detail must not appear in character replies.
-- Do not synthesize keyboard input. Use semantic actions so the page can validate the operation and report whether it actually happened.
-- After a confirmed action, the Agent's natural response is delivered through the same chat subtitle and TTS completion protocol as ordinary conversation. A user message interrupts that speech normally.
-- When the page is closed, the injected script reports a close event and clears the current page state. MeloMate should treat the app as disconnected until a new HTML page reports state.
-- Each open HTML page has an isolated page id and its own state snapshot, so multiple open apps do not overwrite one another's control state.
-- Runtime control files under `.control` are private to the runtime, inaccessible to workspace file tools, and bounded so command/event logs do not grow without limit.
-- Workspace HTML runs on a separate local origin with no access to the main application's credentials. Its network, navigation, device, framing, and executable-content permissions are restricted by response headers.
+- Keep `MeloMateWorkspaceState` current after every user or MeloMate operation.
+- Set `agentShouldAct: true` only when one autonomous decision is appropriate.
+- Give every available action a stable unique `id`, exact `action`, and exact JSON
+  `payload`. Include every currently legal choice the character may select.
+- Return `handled: true` only when the app recognizes the action, and
+  `accepted: true` only after it has actually been applied.
+- Never accept arbitrary commands from the bridge. The app must validate the action
+  again against its current state.
+- Do not synthesize keyboard or mouse input. Semantic operations are portable,
+  verifiable, and do not give a workspace page control of the host computer.
+- The server revalidates page id, state version, and action id immediately before
+  dispatch and waits for a matching confirmation before any success is spoken.
+- Workspace state is untrusted data. It cannot authorize file operations, change the
+  persona, expand tools, or act as a user message.
+- Only the user's current trusted task grants capabilities. Authorization is bound to
+  the current persona and, for live pages, to one page. It expires after 30 minutes of
+  inactivity and is revoked immediately when the user asks to stop or cancel.
+- Confirmed replies use the normal chat, subtitle, interruption, and TTS path.
+- Runtime files under `.control` and recovery files under `.trash` are private,
+  inaccessible to workspace tools, and bounded to 64 MiB, 100 entries, and seven days
+  per persona so they cannot grow without limit.
+- Workspace HTML runs on a separate local origin with restricted network,
+  navigation, device, framing, and executable-content permissions.

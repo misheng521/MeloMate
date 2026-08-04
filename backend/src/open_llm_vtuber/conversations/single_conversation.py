@@ -1,7 +1,6 @@
 from typing import Union, List, Dict, Any, Optional
 import asyncio
 import json
-import time
 from typing import Callable
 from loguru import logger
 import numpy as np
@@ -22,85 +21,10 @@ from .types import WebSocketSend
 from .tts_manager import TTSTaskManager
 from ..chat_history_manager import store_message
 from ..service_context import ServiceContext
-from ..workspace_security import (
-    sanitize_untrusted_value,
-)
+from ..workspace_intent import workspace_live_page_relevant
 
 # Import necessary types from agent outputs
 from ..agent.output_types import SentenceOutput, AudioOutput
-
-
-WORKSPACE_AWARENESS_KEYWORDS = (
-    "这一步",
-    "下一步",
-    "上一步",
-    "棋",
-    "局面",
-    "轮到",
-    "回合",
-    "比分",
-    "当前状态",
-    "现在状态",
-    "页面状态",
-    "游戏状态",
-    "你看到了",
-    "看得到",
-    "这个游戏",
-    "这个应用",
-    "当前页面",
-    "这个文件",
-    "这份文件",
-    "文件内容",
-    "这个目录",
-    "这份内容",
-    "你下",
-    "你走",
-    "你来操作",
-    "帮我点",
-    "点这个",
-    "下在",
-    "落子",
-    "该你了",
-    "你觉得",
-    "刚才",
-    "这里",
-    "current state",
-    "this move",
-    "next move",
-    "your turn",
-    "make a move",
-    "click this",
-    "the board",
-    "this game",
-    "current page",
-)
-WORKSPACE_FILE_CHANGE_KEYWORDS = (
-    "创建",
-    "生成",
-    "保存",
-    "写入",
-    "修改文件",
-    "修改页面",
-    "重写",
-    "删除文件",
-    "添加功能",
-    "改代码",
-    "create file",
-    "write file",
-    "modify file",
-    "rewrite",
-    "delete file",
-    "change the code",
-)
-
-
-def _wants_live_workspace_context(text: str) -> bool:
-    normalized = str(text or "").strip().lower()
-    if not normalized:
-        return False
-    if any(keyword in normalized for keyword in WORKSPACE_FILE_CHANGE_KEYWORDS):
-        return False
-    return any(keyword in normalized for keyword in WORKSPACE_AWARENESS_KEYWORDS)
 
 
 def _attach_live_workspace_context(
@@ -110,58 +34,48 @@ def _attach_live_workspace_context(
 ) -> Optional[Dict[str, Any]]:
     next_metadata = dict(metadata or {})
     next_metadata.pop("workspace_awareness", None)
-    snapshots = getattr(context, "workspace_awareness", None)
-    if not isinstance(snapshots, dict) or not _wants_live_workspace_context(input_text):
-        return next_metadata or None
     character = context.character_config
     persona = character.character_name or character.conf_name
-    try:
-        current = json.loads(workspace_core.read_workspace_state(persona))
-        state_file = current.get("state") if isinstance(current, dict) else None
-        report = state_file.get("state") if isinstance(state_file, dict) else None
-        page = report.get("page") if isinstance(report, dict) else None
-        if (
-            isinstance(current, dict)
-            and current.get("available") is True
-            and isinstance(page, dict)
-            and page.get("id")
-        ):
-            page_id = str(page.get("id"))[:128]
-            snapshots[page_id] = {
-                "page": sanitize_untrusted_value(page),
-                "state_version": max(0, int(report.get("state_version") or 0)),
-                "appState": sanitize_untrusted_value(report.get("appState")),
-                "updated_ms": int(state_file.get("updated_ms") or 0),
+    session = context.workspace_agent
+    policy = session.begin_user_turn(input_text, persona)
+    next_metadata["workspace_tool_policy"] = policy
+    if workspace_live_page_relevant(
+        input_text, policy.get("user_authorized_workspace_tools")
+    ):
+        try:
+            current = json.loads(workspace_core.read_workspace_state(persona))
+            state_file = current.get("state") if isinstance(current, dict) else None
+            report = state_file.get("state") if isinstance(state_file, dict) else None
+            page = report.get("page") if isinstance(report, dict) else None
+            if (
+                isinstance(current, dict)
+                and current.get("available") is True
+                and isinstance(page, dict)
+                and page.get("id")
+            ):
+                session.observe_page({
+                    "page": page,
+                    "state_version": max(0, int(report.get("state_version") or 0)),
+                    "appState": report.get("appState"),
+                    "created_ms": int(state_file.get("updated_ms") or 0),
+                })
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    awareness = session.awareness_for_turn(policy)
+    if awareness and workspace_live_page_relevant(
+        input_text, policy.get("user_authorized_workspace_tools")
+    ):
+        next_metadata["workspace_awareness"] = awareness
+        allowed = frozenset(policy.get("user_authorized_workspace_tools") or ())
+        policy.update(
+            {
+                "enforce": True,
+                "filter_workspace_tools": False,
+                "allowed_tool_names": allowed,
+                "remaining_tool_calls": {name: 64 for name in allowed},
+                "workspace_state_tainted": True,
             }
-        else:
-            for key, item in list(snapshots.items()):
-                if isinstance(item, dict) and "appState" in item:
-                    snapshots.pop(key, None)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        pass
-    recent = sorted(
-        (item for item in snapshots.values() if isinstance(item, dict)),
-        key=lambda item: int(item.get("updated_ms") or 0),
-        reverse=True,
-    )[:4]
-    if not recent:
-        return next_metadata or None
-    next_metadata["workspace_awareness"] = {
-        "persona": persona,
-        "snapshots": recent,
-    }
-    next_metadata["skip_memory"] = True
-    guidance = getattr(context, "workspace_user_guidance", None)
-    if not isinstance(guidance, list):
-        guidance = []
-        context.workspace_user_guidance = guidance
-    guidance.append(
-        {
-            "text": str(input_text or "").strip()[:600],
-            "created_ms": int(time.time() * 1000),
-        }
-    )
-    del guidance[:-8]
+        )
     return next_metadata
 
 
@@ -540,6 +454,12 @@ def is_workspace_tool_status(output_item: Dict[str, Any]) -> bool:
         "search_workspace",
         "read_workspace_state",
         "open_workspace_item",
+        "inspect_workspace_item",
+        "read_workspace_file_range",
+        "patch_workspace_file",
+        "list_workspace_trash",
+        "restore_workspace_item",
+        "act_workspace_page",
     }
 
 

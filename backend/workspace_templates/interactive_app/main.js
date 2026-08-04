@@ -36,17 +36,22 @@ document.querySelector("#reset").addEventListener("click", () => {
   render();
 });
 
-window.MeloMateGameState = () => ({
+window.MeloMateWorkspaceState = () => ({
   screen: "template",
   step: state.step,
   currentTurn: state.currentTurn,
   log: state.log,
+  agentShouldAct: state.currentTurn === "melomate",
   availableActions: state.currentTurn === "melomate" ? [{ id: "take-step", action: "take-step", payload: {} }] : [],
 });
 
-window.MeloMateGameAction = (action) => {
+window.MeloMateWorkspaceAction = (action) => {
   if (action !== "take-step") return { handled: false, accepted: false };
   return applyMeloMateStep();
 };
+
+// Legacy aliases let this template run against older MeloMate builds too.
+window.MeloMateGameState = window.MeloMateWorkspaceState;
+window.MeloMateGameAction = window.MeloMateWorkspaceAction;
 
 render();

@@ -84,6 +84,10 @@ class AgentFactory:
                 tool_manager=tool_manager,
                 tool_executor=tool_executor,
                 mcp_prompt_string=mcp_prompt_string,
+                memory_conf_uid=str(kwargs.get("memory_conf_uid") or ""),
+                memory_character_name=str(
+                    kwargs.get("memory_character_name") or "角色"
+                ),
             )
 
         elif conversation_agent_choice == "hume_ai_agent":

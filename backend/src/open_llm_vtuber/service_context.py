@@ -547,6 +547,8 @@ class ServiceContext:
                 tool_manager=self.tool_manager,
                 tool_executor=self.tool_executor,
                 mcp_prompt_string=self.mcp_prompt,
+                memory_conf_uid=self.character_config.conf_uid,
+                memory_character_name=self.character_config.character_name,
             )
 
             logger.debug(f"Agent choice: {agent_config.conversation_agent_choice}")
@@ -649,7 +651,9 @@ class ServiceContext:
 
     # ==== utils
 
-    async def construct_system_prompt(self, persona_prompt: str) -> str:
+    async def construct_system_prompt(
+        self, persona_prompt: str, current_user_text: str = ""
+    ) -> str:
         """
         Append tool prompts to persona prompt.
 
@@ -662,7 +666,9 @@ class ServiceContext:
         logger.debug(f"Constructing persona prompt (chars={len(persona_prompt)})")
 
         if self.character_config and self.character_config.conf_uid:
-            core_memory_prompt = get_core_memory_prompt(self.character_config.conf_uid)
+            core_memory_prompt = get_core_memory_prompt(
+                self.character_config.conf_uid, current_user_text
+            )
             if core_memory_prompt:
                 persona_prompt += f"\n\n{core_memory_prompt}\n"
 

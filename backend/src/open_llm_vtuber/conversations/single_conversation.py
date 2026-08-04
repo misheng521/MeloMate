@@ -190,7 +190,8 @@ async def process_single_conversation(
             and hasattr(context.agent_engine, "set_system")
         ):
             refreshed_prompt = await context.construct_system_prompt(
-                context.character_config.persona_prompt
+                context.character_config.persona_prompt,
+                current_user_text=input_text,
             )
             context.agent_engine.set_system(refreshed_prompt)
             context.system_prompt = refreshed_prompt
@@ -278,6 +279,11 @@ async def process_single_conversation(
                 name=context.character_config.character_name,
             )
             logger.info(f"AI response completed (chars={len(full_response)})")
+            schedule_memory_review = getattr(
+                context.agent_engine, "schedule_core_memory_review", None
+            )
+            if callable(schedule_memory_review):
+                schedule_memory_review()
 
         return full_response  # Return accumulated full_response
 

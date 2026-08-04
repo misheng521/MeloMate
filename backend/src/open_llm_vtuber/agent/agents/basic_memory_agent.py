@@ -17,7 +17,17 @@ from ..output_types import SentenceOutput, DisplayText
 from ..stateless_llm.stateless_llm_interface import StatelessLLMInterface
 from ..stateless_llm.claude_llm import AsyncLLM as ClaudeAsyncLLM
 from ..stateless_llm.openai_compatible_llm import AsyncLLM as OpenAICompatibleAsyncLLM
-from ...chat_history_manager import get_history
+from ...chat_history_manager import (
+    commit_core_memory_review,
+    get_history,
+    prepare_core_memory_review,
+    record_core_memory_review_failure,
+)
+from ...memory_consolidator import (
+    MAX_REVIEW_RESPONSE_CHARS,
+    build_memory_review_request,
+    parse_memory_review_response,
+)
 from ..transformers import (
     sentence_divider,
     actions_extractor,
@@ -104,6 +114,8 @@ class BasicMemoryAgent(AgentInterface):
         tool_manager: Optional[ToolManager] = None,
         tool_executor: Optional[ToolExecutor] = None,
         mcp_prompt_string: str = "",
+        memory_conf_uid: str = "",
+        memory_character_name: str = "",
     ):
         """Initialize agent with LLM and configuration."""
         super().__init__()
@@ -122,6 +134,9 @@ class BasicMemoryAgent(AgentInterface):
         self._tool_executor = tool_executor
         self._mcp_prompt_string = mcp_prompt_string
         self._json_detector = StreamJSONDetector()
+        self._memory_conf_uid = str(memory_conf_uid or "")
+        self._memory_character_name = str(memory_character_name or "角色")
+        self._memory_review_task: asyncio.Task | None = None
 
         self._formatted_tools_openai = []
         self._formatted_tools_claude = []
@@ -157,7 +172,6 @@ class BasicMemoryAgent(AgentInterface):
             [
                 self._tool_manager,
                 self._tool_executor,
-                self._json_detector,
             ]
         ):
             logger.warning(
@@ -165,6 +179,78 @@ class BasicMemoryAgent(AgentInterface):
             )
 
         logger.info("BasicMemoryAgent initialized.")
+
+    def schedule_core_memory_review(self) -> bool:
+        """Start one bounded background consolidation when its turn threshold is due."""
+        if not self._memory_conf_uid:
+            return False
+        if self._memory_review_task and not self._memory_review_task.done():
+            return False
+
+        snapshot = prepare_core_memory_review(self._memory_conf_uid)
+        if snapshot is None:
+            return False
+        self._memory_review_task = asyncio.create_task(
+            self._run_core_memory_review(snapshot),
+            name=f"memory-review-{self._memory_conf_uid}",
+        )
+        return True
+
+    async def _run_core_memory_review(self, snapshot: dict) -> None:
+        try:
+            messages, system = build_memory_review_request(
+                snapshot, self._memory_character_name
+            )
+            response_parts: list[str] = []
+            response_size = 0
+            async with asyncio.timeout(60):
+                stream = self._llm.chat_completion(messages=messages, system=system)
+                async for event in stream:
+                    text = ""
+                    if isinstance(event, str):
+                        text = event
+                    elif isinstance(event, dict) and event.get("type") == "text_delta":
+                        text = str(event.get("text") or "")
+                    if not text:
+                        continue
+                    response_size += len(text)
+                    if response_size > MAX_REVIEW_RESPONSE_CHARS:
+                        raise ValueError("Memory review response exceeded its limit")
+                    response_parts.append(text)
+
+            candidate = parse_memory_review_response("".join(response_parts))
+            committed = commit_core_memory_review(
+                self._memory_conf_uid,
+                str(snapshot.get("snapshot_message_id") or ""),
+                candidate,
+            )
+            if not committed:
+                raise ValueError("Memory review snapshot was no longer valid")
+            logger.info("Core memory review completed.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            record_core_memory_review_failure(self._memory_conf_uid)
+            logger.warning(
+                "Core memory review failed safely ({}).", type(error).__name__
+            )
+
+    async def close(self) -> None:
+        """Give an in-flight review a short grace period, then cancel it cleanly."""
+        task = self._memory_review_task
+        self._memory_review_task = None
+        if task is None:
+            return
+        if not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+            except asyncio.TimeoutError:
+                task.cancel()
+            except asyncio.CancelledError:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+        await asyncio.gather(task, return_exceptions=True)
 
     def _set_llm(self, llm: StatelessLLMInterface):
         """Set the LLM for chat completion."""

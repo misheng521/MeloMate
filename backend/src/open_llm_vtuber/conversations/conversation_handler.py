@@ -8,10 +8,14 @@ from fastapi import WebSocket
 from loguru import logger
 
 from ..chat_history_manager import store_message
+from ..proactive_conversation import (
+    build_proactive_prompt,
+    normalize_proactive_request,
+    sanitize_user_metadata,
+)
 from ..service_context import ServiceContext
 from .single_conversation import process_single_conversation
 from .conversation_utils import EMOJI_LIST
-from prompts import prompt_loader
 
 
 async def handle_conversation_trigger(
@@ -34,25 +38,19 @@ async def handle_conversation_trigger(
     metadata = None
 
     if msg_type == "ai-speak-signal":
-        user_input = str(data.get("text") or "").strip()
-        if not user_input:
-            try:
-                # Get proactive speak prompt from config
-                prompt_name = "proactive_speak_prompt"
-                prompt_file = context.system_config.tool_prompts.get(prompt_name)
-                if prompt_file:
-                    user_input = prompt_loader.load_util(prompt_file)
-                else:
-                    logger.warning("Proactive speak prompt not configured, using default")
-                    user_input = "Please say something."
-            except Exception as e:
-                logger.error(f"Error loading proactive speak prompt: {e}")
-                user_input = "Please say something."
+        # Never trust a browser-supplied hidden prompt.  The client may only send
+        # bounded state; the actual instruction is assembled by the server.
+        proactive_request = normalize_proactive_request(data.get("proactive"))
+        user_input = build_proactive_prompt(
+            proactive_request,
+            trusted_recent_utterances=context.proactive_utterances,
+        )
 
         # Add metadata to indicate this is a proactive speak request
         # that should be skipped in both memory and history
         metadata = {
             "proactive_speak": True,
+            "proactive_mode": proactive_request["mode"],
             "skip_memory": True,  # Skip storing in AI's internal memory
             "skip_history": True,  # Skip storing in local conversation history
         }
@@ -67,10 +65,27 @@ async def handle_conversation_trigger(
         )
     elif msg_type == "text-input":
         user_input = data.get("text", "")
-        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else None
+        metadata = sanitize_user_metadata(
+            data.get("metadata"), preserve_other=False
+        )
     else:  # mic-audio-end
         user_input = received_data_buffers[client_uid]
         received_data_buffers[client_uid] = np.array([])
+        # Audio metadata originates entirely in the browser.  Only the one
+        # explicitly validated return context is accepted on this path.
+        metadata = sanitize_user_metadata(
+            data.get("metadata"), preserve_other=False
+        )
+
+    if msg_type != "ai-speak-signal":
+        proactive_return = metadata.get("proactive_return") if metadata else None
+        if isinstance(proactive_return, dict):
+            proactive_return["recent_utterances"] = list(
+                context.proactive_utterances[-5:]
+            )
+        # A real user message ends the current silence episode.  Keep this
+        # state server-side and consume it even if the reply later fails.
+        context.proactive_utterances.clear()
 
     images = data.get("images")
     screen_vision = data.get("screen_vision")

@@ -322,7 +322,7 @@ class WebSocketHandler:
             json.dumps(
                 {
                     "type": "set-model-and-conf",
-                    "model_info": session_service_context.live2d_model.model_info,
+                    "avatar_info": session_service_context.avatar_model.model_info,
                     "conf_name": session_service_context.character_config.conf_name,
                     "character_name": session_service_context.character_config.character_name,
                     "conf_uid": session_service_context.character_config.conf_uid,
@@ -352,7 +352,7 @@ class WebSocketHandler:
                 character_config=self.default_context_cache.character_config.model_copy(
                     deep=True
                 ),
-                live2d_model=self.default_context_cache.live2d_model,
+                avatar_model=self.default_context_cache.avatar_model,
                 asr_engine=self.default_context_cache.asr_engine,
                 tts_engine=self.default_context_cache.tts_engine,
                 vad_engine=self.default_context_cache.vad_engine,
@@ -851,7 +851,7 @@ class WebSocketHandler:
             json.dumps(
                 {
                     "type": "set-model-and-conf",
-                    "model_info": context.live2d_model.model_info,
+                    "avatar_info": context.avatar_model.model_info,
                     "conf_name": context.character_config.conf_name,
                     "character_name": context.character_config.character_name,
                     "conf_uid": context.character_config.conf_uid,

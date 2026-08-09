@@ -9,9 +9,9 @@ const appRoot = dirname(fileURLToPath(import.meta.url));
 const root = resolve(appRoot, "dist");
 const contentRoots = {
   "/backgrounds": resolve(appRoot, "backgrounds"),
-  "/models": resolve(appRoot, "models/live2d"),
   "/reference_sounds": resolve(appRoot, "reference_sounds"),
 };
+const avatarModelsRoot = resolve(appRoot, "models");
 const workspaceRoot = resolve(appRoot, "workspace");
 
 function configuredPort(value) {
@@ -226,6 +226,7 @@ const types = {
   ".ogg": "audio/ogg",
   ".mp4": "video/mp4",
   ".webm": "video/webm",
+  ".vrm": "model/gltf-binary",
 };
 
 function isInside(basePath, filePath) {
@@ -997,23 +998,17 @@ function listBackgrounds() {
   return backgrounds.length ? backgrounds : [{ name: "Default", url: "/backgrounds/default.svg" }];
 }
 
-function listLive2DModels() {
-  return walkFiles(contentRoots["/models"])
-    .filter((filePath) => filePath.toLowerCase().endsWith(".model3.json"))
-    .map((filePath) => {
-      const modelRoot = contentRoots["/models"];
-      const relativeModelFile = relative(modelRoot, filePath).replace(/\\/g, "/");
-      const directory = dirname(relativeModelFile).replace(/\\/g, "/");
-      const topFolder = relativeModelFile.split("/")[0] || basename(filePath, ".model3.json");
-      const fileName = basename(filePath, ".model3.json");
-      return {
-        id: topFolder,
-        name: fileName.replace(/[_-]+/g, " "),
-        directory,
-        fileName,
-        scale: 0.9,
-      };
-    })
+function listVrmModels() {
+  if (!existsSync(avatarModelsRoot)) return [];
+  return readdirSync(avatarModelsRoot, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && extname(entry.name).toLowerCase() === ".vrm")
+    .map((entry) => ({
+      id: entry.name,
+      name: basename(entry.name, extname(entry.name)).replace(/[_-]+/g, " "),
+      fileName: entry.name,
+      url: `/vrm-models/${encodeURIComponent(entry.name)}`,
+      size: statSync(join(avatarModelsRoot, entry.name)).size,
+    }))
     .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
 }
 
@@ -1053,8 +1048,8 @@ async function handleContentApiRequest(request, response, requireWorkspaceAccess
     return true;
   }
 
-  if (pathname === "/api/live2d-models") {
-    jsonResponse(response, 200, { models: listLive2DModels() });
+  if (pathname === "/api/vrm-models") {
+    jsonResponse(response, 200, { models: listVrmModels() });
     return true;
   }
 
@@ -1131,6 +1126,14 @@ function resolveMainRequest(url) {
     pathname = decodeURIComponent(encodedPathname);
   } catch {
     return null;
+  }
+  if (pathname.startsWith("/vrm-models/")) {
+    const fileName = pathname.slice("/vrm-models/".length);
+    if (!fileName || fileName.includes("/") || fileName.includes("\\") || extname(fileName).toLowerCase() !== ".vrm") {
+      return null;
+    }
+    const modelPath = safeResolve(avatarModelsRoot, fileName);
+    return modelPath ? existingFileInside(avatarModelsRoot, modelPath) : null;
   }
   const assetPath = resolveAliasedAsset(pathname);
   if (assetPath) {

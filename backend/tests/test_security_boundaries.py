@@ -48,7 +48,6 @@ class SecurityBoundaryTests(unittest.TestCase):
         registered = {(route.path, type(route).__name__) for route in router.routes}
         self.assertNotIn(("/asr", "APIRoute"), registered)
         self.assertNotIn(("/tts-ws", "APIWebSocketRoute"), registered)
-        self.assertIn(("/live2d-models/info", "APIRoute"), registered)
 
 
 if __name__ == "__main__":

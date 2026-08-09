@@ -2,7 +2,7 @@ character_config:
   conf_name: "小薇"
   conf_uid: "avatar_xiaowei_001"
   character_name: "小薇"
-  live2d_model_name: "epsilon_free"
+  avatar_model_name: "vrm_default"
   persona_prompt: |
     # 角色身份
     你叫小薇，是女性。

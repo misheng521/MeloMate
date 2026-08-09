@@ -1,0 +1,17 @@
+[
+  {
+    "name": "vrm_default",
+    "description": "Generic VRM expression profile",
+    "emotionMap": {
+      "neutral": 0,
+      "fear": 1,
+      "sadness": 1,
+      "anger": 2,
+      "disgust": 2,
+      "joy": 3,
+      "smirk": 3,
+      "surprise": 5,
+      "relaxed": 4
+    }
+  }
+]

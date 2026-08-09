@@ -13,7 +13,7 @@ from .tts_manager import TTSTaskManager
 from ..agent.output_types import SentenceOutput, AudioOutput, DisplayText, Actions
 from ..agent.input_types import BatchInput, TextData, ImageData, TextSource, ImageSource
 from ..asr.asr_interface import ASRInterface
-from ..live2d_model import Live2dModel
+from ..avatar_model import AvatarModel
 from ..tts.tts_interface import TTSInterface
 from ..utils.stream_audio import prepare_audio_payload
 
@@ -299,7 +299,7 @@ def create_batch_input(
 async def process_agent_output(
     output: Union[AudioOutput, SentenceOutput],
     character_config: Any,
-    live2d_model: Live2dModel,
+    avatar_model: AvatarModel,
     tts_engine: TTSInterface,
     websocket_send: WebSocketSend,
     tts_manager: TTSTaskManager,
@@ -313,7 +313,7 @@ async def process_agent_output(
         if isinstance(output, SentenceOutput):
             full_response = await handle_sentence_output(
                 output,
-                live2d_model,
+                avatar_model,
                 tts_engine,
                 websocket_send,
                 tts_manager,
@@ -337,7 +337,7 @@ async def process_agent_output(
 
 async def handle_sentence_output(
     output: SentenceOutput,
-    live2d_model: Live2dModel,
+    avatar_model: AvatarModel,
     tts_engine: TTSInterface,
     websocket_send: WebSocketSend,
     tts_manager: TTSTaskManager,
@@ -352,7 +352,7 @@ async def handle_sentence_output(
     async for display_text, tts_text, actions in output:
         logger.debug(f"Processing agent sentence (tts_chars={len(tts_text)})")
 
-        display_text.text = live2d_model.remove_emotion_keywords(display_text.text)
+        display_text.text = avatar_model.remove_emotion_keywords(display_text.text)
         display_text.text = remove_stage_directions(display_text.text)
         tts_text = remove_stage_directions(tts_text)
         display_text.text = clean_response_fragment(display_text.text)
@@ -394,7 +394,7 @@ async def handle_sentence_output(
             tts_text=tts_text,
             display_text=display_text,
             actions=actions,
-            live2d_model=live2d_model,
+            avatar_model=avatar_model,
             tts_engine=tts_engine,
             websocket_send=websocket_send,
             voice_style=voice_style,
@@ -463,7 +463,7 @@ async def speak_text_response(
         response = await process_agent_output(
             output=output,
             character_config=context.character_config,
-            live2d_model=context.live2d_model,
+            avatar_model=context.avatar_model,
             tts_engine=context.get_current_tts_engine(),
             websocket_send=send,
             tts_manager=manager,

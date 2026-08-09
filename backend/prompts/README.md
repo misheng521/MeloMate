@@ -4,7 +4,7 @@ This directory contains utility prompts used in MeloMate. These are general-purp
 
 ## Examples of Utility Prompts
 
-*   **Live2D Expressions:** Prompts that inform the LLM about available Live2D expressions.
+*   **Avatar Expressions:** Prompts that inform the LLM about available avatar expressions.
 *   **Tool Usage:** Prompts that guide the LLM on how to use available tools.
 *   ... and many more.
 

@@ -19,7 +19,7 @@ class LettaAgent(AgentInterface):
 
     def __init__(
         self,
-        live2d_model,
+        avatar_model,
         id,
         tts_preprocessor_config: TTSPreprocessorConfig = None,
         faster_first_response: bool = False,
@@ -33,14 +33,14 @@ class LettaAgent(AgentInterface):
         self.id = id
         # Initialize decorator parameters
         self._tts_preprocessor_config = tts_preprocessor_config
-        self._live2d_model = live2d_model
+        self._avatar_model = avatar_model
         self._faster_first_response = faster_first_response
         self._segment_method = segment_method
 
         # Delay decorator application
         self.chat = tts_filter(self._tts_preprocessor_config)(
             display_processor()(
-                actions_extractor(self._live2d_model)(
+                actions_extractor(self._avatar_model)(
                     sentence_divider(
                         faster_first_response=self._faster_first_response,
                         segment_method=self._segment_method,

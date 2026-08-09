@@ -6,16 +6,11 @@
     "lib": ["ES2020", "DOM", "DOM.Iterable"],
     "skipLibCheck": true,
     "moduleResolution": "Bundler",
-    "baseUrl": ".",
-    "paths": {
-      "@framework/*": ["WebSDK/Framework/src/*"],
-      "@cubismsdksamples/*": ["WebSDK/src/*"]
-    },
     "allowImportingTsExtensions": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
     "strict": false
   },
-  "include": ["src", "WebSDK"]
+  "include": ["src"]
 }

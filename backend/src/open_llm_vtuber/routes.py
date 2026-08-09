@@ -1,15 +1,12 @@
 import hmac
 import os
 from uuid import uuid4
-from pathlib import Path
 from fastapi import APIRouter, WebSocket, Response
-from starlette.responses import JSONResponse
 from starlette.websockets import WebSocketDisconnect
 from loguru import logger
 from .service_context import ServiceContext
 from .websocket_handler import WebSocketHandler
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SESSION_PROTOCOL_PREFIX = "melomate.session."
 
 
@@ -140,33 +137,5 @@ def init_webtool_routes(default_context_cache: ServiceContext) -> APIRouter:
     async def web_tool_redirect_alt():
         """Redirect /web_tool to /web_tool/index.html"""
         return Response(status_code=302, headers={"Location": "/web-tool/index.html"})
-
-    @router.get("/live2d-models/info")
-    async def get_live2d_folder_info():
-        """Get information about available Live2D models"""
-        live2d_dir = PROJECT_ROOT / "models" / "live2d"
-        if not live2d_dir.exists():
-            return JSONResponse(
-                {"error": "Live2D models directory not found"}, status_code=404
-            )
-
-        valid_characters = []
-        for model_file in live2d_dir.rglob("*.model3.json"):
-            folder_name = model_file.relative_to(live2d_dir).parts[0]
-            model_name = model_file.name.replace(".model3.json", "")
-
-            valid_characters.append(
-                {
-                    "name": folder_name,
-                    "model_path": str(model_file).replace("\\", "/"),
-                }
-            )
-        return JSONResponse(
-            {
-                "type": "live2d-models/info",
-                "count": len(valid_characters),
-                "characters": valid_characters,
-            }
-        )
 
     return router

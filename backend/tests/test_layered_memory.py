@@ -418,7 +418,7 @@ class BackgroundMemoryReviewTests(unittest.IsolatedAsyncioTestCase):
         agent = BasicMemoryAgent(
             llm=_FakeReviewLLM(),
             system="角色人设",
-            live2d_model=None,
+            avatar_model=None,
             use_mcpp=False,
             memory_conf_uid="persona",
             memory_character_name="小可",

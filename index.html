@@ -4,7 +4,6 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>MeloMate</title>
-    <script src="./libs/live2dcubismcore.min.js"></script>
     <script src="./libs/ort.min.js"></script>
     <script src="./libs/vad.bundle.min.js"></script>
   </head>
@@ -61,6 +60,8 @@
             </div>
           </aside>
           <canvas id="canvas"></canvas>
+          <div id="avatarStatus" class="avatar-status" role="status" hidden></div>
+          <div id="avatarZoomHint" class="avatar-zoom-hint" aria-hidden="true">半身 · 滚轮缩放</div>
           <button id="proactiveSpeakButton" class="proactive-speak-button" type="button" disabled>
             让ta说句话
           </button>

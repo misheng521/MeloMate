@@ -22,6 +22,9 @@ reference_sounds/voice_clone_refs/
 # Large downloaded backend models
 models/backend/
 
+# Local avatar files can be large and often forbid redistribution.
+models/*.vrm
+
 # Local tooling and editor files
 .env
 .env.*

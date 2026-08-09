@@ -11,7 +11,7 @@ system_config:
   port: 12393 # 服务器监听的端口
   config_alts_dir: '../characters/profiles' # 用于存放替代配置的目录
   tool_prompts: # 要插入到角色提示词中的工具提示词
-    live2d_expression_prompt: 'live2d_expression_prompt' # 用于 Live2D 表情控制；聊天显示和 TTS 会过滤方括号标签。
+    avatar_expression_prompt: 'avatar_expression_prompt' # 用于数字人表情控制；聊天显示和 TTS 会过滤方括号标签。
     # 启用 think_tag_prompt 可让不具备思考输出的 LLM 也能展示内心想法、心理活动和动作（以括号形式呈现），但不会进行语音合成。更多详情请参考 think_tag_prompt。
     # think_tag_prompt: 'think_tag_prompt'
     # live_prompt: 'live_prompt'
@@ -29,7 +29,7 @@ system_config:
 character_config:
   conf_name: '小可' # 角色配置文件的名称
   conf_uid: 'avatar_xiaoke_001' # 角色配置的唯一标识符
-  live2d_model_name: 'epsilon_free' # Live2D 模型名称
+  avatar_model_name: 'vrm_default' # 通用 VRM 表情配置
   character_name: '小可' # AI 的显示名称。
   avatar: 'mao.png' # 建议使用正方形图像作为头像。将其保存到 avatars 文件夹中。留空则使用角色名称的首字母作为头像。
   human_name: 'Human' # 用户的显示名称。

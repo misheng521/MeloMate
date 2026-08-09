@@ -1,6 +1,6 @@
 # MeloMate
 
-MeloMate is a local AI voice companion app with a Vite frontend, Live2D rendering, microphone input, a Python WebSocket backend, character profiles, memory files, backgrounds, and reference voice assets.
+MeloMate is a local AI voice companion app with lightweight VRM rendering, microphone input, a Python WebSocket backend, character profiles, memory files, backgrounds, and reference voice assets.
 
 This repository is the **source edition**. It is intended for development, GitHub hosting, and reproducible setup. Generated folders such as `node_modules`, `dist`, `backend/.venv`, caches, logs, and large downloaded backend models are intentionally not part of the source tree.
 
@@ -144,7 +144,7 @@ npm run check
 ## Project Layout
 
 - `src` - Main frontend TypeScript code.
-- `WebSDK` - Live2D Cubism Web SDK integration used by the frontend.
+- `src/vrm-avatar.ts` - Three.js/three-vrm renderer, idle motion, blinking, expressions, and local audio lip sync.
 - `public` - Browser-side runtime libraries and WASM files.
 - `backend/src/open_llm_vtuber` - Python backend modules for WebSocket, conversation, ASR, TTS, memory, tools, and configuration.
 - `docs/WORKSPACE_PROTOCOL.md` - Protocol for interactive workspace apps that both the user and MeloMate can control.
@@ -152,7 +152,7 @@ npm run check
 - `backend/conf.yaml` - Main backend configuration.
 - `characters/profiles` - Character YAML profiles.
 - `characters/memory` - Default character memory files.
-- `models/live2d` - Live2D model assets.
+- `models/*.vrm` - VRM avatars automatically discovered by the frontend model picker.
 - `backgrounds` - Background images discovered by the frontend.
 - `reference_sounds/samples` - Small sample reference voices.
 
@@ -166,6 +166,7 @@ The source edition should stay small and reproducible. Do not commit:
 - `backend/cache`
 - `backend/logs`
 - `models/backend`
+- `models/*.vrm` unless the model license explicitly permits redistribution
 - downloaded Hugging Face or ModelScope caches
 
 A portable edition should be built as a release artifact, for example `MeloMate-v0.1.0-windows-portable.zip`. That package may include `dist`, a prebuilt Python environment, and selected backend models, but it should be generated from this source tree instead of committed to Git.
@@ -182,9 +183,15 @@ models/backend/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/
 
 Create that folder only in your local checkout or in a portable release package.
 
+## VRM Avatars
+
+Export avatars as `.vrm` files and place them directly in `models/`. Reload MeloMate and choose the model from the **模型** tab. The renderer supports VRM 0.x and VRM 1.0. For full lip sync, a model should provide the standard `aa`, `ih`, `ou`, `ee`, and `oh` expression presets.
+
+Avatar rendering and lip sync run locally and do not use an online avatar service or consume API quota. MeloMate caps the avatar renderer at 30 FPS and limits pixel density to reduce CPU/GPU usage.
+
 ## Notes
 
 - API keys in `backend/conf.yaml` are placeholders. Keep real keys local.
 - `server.mjs` only binds to `127.0.0.1` by default.
 - Voicemeeter integration is optional and Windows-specific.
-- Check `NOTICE.md` before publishing a public release, because SDKs, Live2D models, browser libraries, and audio samples may have separate redistribution terms.
+- Check `NOTICE.md` before publishing a public release, because VRM models, browser libraries, and audio samples may have separate redistribution terms.

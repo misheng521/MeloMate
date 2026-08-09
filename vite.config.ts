@@ -10,12 +10,6 @@ export default defineConfig({
   root: projectRoot,
   publicDir: path.resolve(projectRoot, "public"),
   base: "./",
-  resolve: {
-    alias: {
-      "@framework": path.resolve(projectRoot, "WebSDK/Framework/src"),
-      "@cubismsdksamples": path.resolve(projectRoot, "WebSDK/src"),
-    },
-  },
   optimizeDeps: {
     entries: ["src/main.ts"],
   },

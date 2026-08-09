@@ -1,6 +1,4 @@
-﻿import { initializeLive2D } from "../WebSDK/src/main";
-import { LAppAdapter } from "../WebSDK/src/lappadapter";
-import { updateModelConfig } from "../WebSDK/src/lappdefine";
+import { VrmAvatar } from "./vrm-avatar";
 import "./styles.css";
 
 type LineRole = "user" | "assistant" | "system";
@@ -14,7 +12,7 @@ type SavedSettings = {
   model: string;
   apiKey: string;
   backgroundUrl?: string;
-  live2dModelId?: string;
+  vrmModelId?: string;
   voiceChatOutputEnabled?: boolean;
   voiceChatOutputDeviceId?: string;
   voiceCloneEnabled?: boolean;
@@ -74,6 +72,9 @@ type WsMessage = {
   volumes?: number[];
   slice_length?: number;
   display_text?: DisplayText;
+  actions?: {
+    expressions?: Array<number | string>;
+  };
   conf_name?: string;
   character_name?: string;
   client_uid?: string;
@@ -127,12 +128,12 @@ type CharacterConfigOption = {
   character_name?: string;
 };
 
-type Live2DModelOption = {
+type VrmModelOption = {
   id: string;
   name: string;
-  directory: string;
   fileName: string;
-  scale: number;
+  url: string;
+  size: number;
 };
 
 type AssetPanelTab = "background" | "character" | "workspace";
@@ -153,31 +154,14 @@ const credentialProfileStorageKey = "melomate-credential-profile";
 const maxVoiceCloneReferenceBytes = 10 * 1024 * 1024;
 const allowedVoiceCloneReferenceExtensions = new Set([".wav", ".mp3", ".flac", ".ogg"]);
 const backgroundManifestUrl = "/api/backgrounds";
-const live2DModelManifestUrl = "/api/live2d-models";
+const vrmModelManifestUrl = "/api/vrm-models";
 const workspaceManifestUrl = "/api/workspace";
 const workspaceStateUrl = "/api/workspace-state";
 const workspaceEventsUrl = "/api/workspace-events";
 const fallbackBackgrounds: BackgroundOption[] = [{ name: "Default", url: "/backgrounds/default.svg" }];
 const defaultCharacterConfigFile = "小可.yaml";
 const defaultCharacterOption: CharacterConfigOption = { filename: defaultCharacterConfigFile };
-const defaultLive2DModelId = "epsilon_free";
-const fallbackLive2DModelOptions: Live2DModelOption[] = [
-  {
-    id: "epsilon_free",
-    name: "Epsilon",
-    directory: "epsilon_free/runtime",
-    fileName: "Epsilon_free",
-    scale: 0.9,
-  },
-  {
-    id: "mao_pro",
-    name: "Mao Pro",
-    directory: "mao_pro/runtime",
-    fileName: "mao_pro",
-    scale: 0.9,
-  },
-];
-let live2dModelOptions: Live2DModelOption[] = fallbackLive2DModelOptions;
+let vrmModelOptions: VrmModelOption[] = [];
 const referenceAudioDbName = "melomate-reference-audio";
 const moonshotApiEndpoint = "https://api.moonshot.cn/v1";
 const defaultApiEndpoint = "https://api.deepseek.com";
@@ -282,6 +266,19 @@ const workspaceTab = document.querySelector<HTMLButtonElement>("#workspaceTab")!
 const backgroundList = document.querySelector<HTMLDivElement>("#backgroundList")!;
 const characterList = document.querySelector<HTMLDivElement>("#characterList")!;
 const workspaceList = document.querySelector<HTMLDivElement>("#workspaceList")!;
+const avatarCanvas = document.querySelector<HTMLCanvasElement>("#canvas")!;
+const avatarStatus = document.querySelector<HTMLDivElement>("#avatarStatus")!;
+const avatarZoomHint = document.querySelector<HTMLDivElement>("#avatarZoomHint")!;
+
+function setAvatarStatus(message: string, tone: "loading" | "ready" | "error" = "loading") {
+  avatarStatus.textContent = message;
+  avatarStatus.dataset.tone = tone;
+  avatarStatus.hidden = !message;
+}
+
+const avatarDriver = new VrmAvatar(avatarCanvas, setAvatarStatus, (label) => {
+  avatarZoomHint.textContent = label;
+});
 
 type SinkAudioElement = HTMLAudioElement & {
   setSinkId?: (sinkId: string) => Promise<void>;
@@ -344,9 +341,9 @@ let lastWorkspaceEventMs = Date.now();
 const handledWorkspaceEventIds = new Set<string>();
 let lastAppliedCharacterConfigFile = "";
 let currentAssistantName = "小可";
-let activeLive2DModelId = "";
-let pendingLive2DModelId = "";
-let isLive2DModelSwitching = false;
+let activeVrmModelId = "";
+let pendingVrmModelId = "";
+let isVrmModelSwitching = false;
 let voiceChatOutputSinkId = "";
 let isSettingsReadOnly = false;
 let lastAudibleVolume = 100;
@@ -538,7 +535,7 @@ function currentSettings(): SavedSettings {
     model: normalizeModel(modelInput.value),
     apiKey: apiKeyInput.value.trim(),
     backgroundUrl: savedSettings?.backgroundUrl || backgroundOptions[0]?.url || "",
-    live2dModelId: selectedLive2DModelOption().id,
+    vrmModelId: selectedVrmModelOption()?.id || "",
     voiceChatOutputEnabled: voiceChatOutputToggle.checked && !voiceChatOutputToggle.disabled,
     voiceChatOutputDeviceId: voiceChatOutputSelect.value,
     voiceCloneEnabled: voiceCloneToggle.checked,
@@ -868,33 +865,32 @@ async function refreshWorkspaceList() {
   }
 }
 
-function selectedLive2DModelOption() {
+function selectedVrmModelOption() {
   return (
-    live2dModelOptions.find((option) => option.id === savedSettings?.live2dModelId) ||
-    live2dModelOptions.find((option) => option.id === defaultLive2DModelId) ||
-    live2dModelOptions[0] ||
-    fallbackLive2DModelOptions[0]
+    vrmModelOptions.find((option) => option.id === savedSettings?.vrmModelId) ||
+    vrmModelOptions[0] ||
+    null
   );
 }
 
-function saveLive2DModel(id: string) {
-  activeLive2DModelId = id;
+function saveVrmModel(id: string) {
+  activeVrmModelId = id;
   savedSettings = {
     ...(savedSettings || currentSettings()),
-    live2dModelId: id,
+    vrmModelId: id,
   };
   persistSavedSettings();
 }
 
-function syncLive2DModelActiveState() {
-  const selectedId = pendingLive2DModelId || activeLive2DModelId || selectedLive2DModelOption().id;
+function syncVrmModelActiveState() {
+  const selectedId = pendingVrmModelId || activeVrmModelId || selectedVrmModelOption()?.id || "";
   characterList.querySelectorAll<HTMLButtonElement>(".character-item").forEach((button) => {
     const isActive = button.dataset.modelId === selectedId;
-    const isLoading = isLive2DModelSwitching && button.dataset.modelId === pendingLive2DModelId;
+    const isLoading = isVrmModelSwitching && button.dataset.modelId === pendingVrmModelId;
     button.classList.toggle("active", isActive);
     button.classList.toggle("loading", isLoading);
     button.setAttribute("aria-pressed", String(isActive));
-    button.disabled = isLive2DModelSwitching;
+    button.disabled = isVrmModelSwitching;
     button.setAttribute("aria-busy", String(isLoading));
   });
 }
@@ -928,67 +924,70 @@ function selectCharacterConfigFile(file: string) {
   }
 }
 
-function live2DModelJsonUrl(option: Live2DModelOption) {
-  return `/models/${option.directory}/${option.fileName}.model3.json`;
-}
-
-async function readLive2DModelOptions() {
+async function readVrmModelOptions() {
   try {
-    const response = await authenticatedFetch(live2DModelManifestUrl, { cache: "no-store" });
-    if (!response.ok) throw new Error(`Live2D manifest failed: ${response.status}`);
-    const data = (await response.json()) as { models?: Live2DModelOption[] };
-    const models = data.models?.filter((option) => option.id && option.directory && option.fileName);
-    return models?.length ? models : fallbackLive2DModelOptions;
+    const response = await authenticatedFetch(vrmModelManifestUrl, { cache: "no-store" });
+    if (!response.ok) throw new Error(`VRM manifest failed: ${response.status}`);
+    const data = (await response.json()) as { models?: VrmModelOption[] };
+    return data.models?.filter((option) => option.id && option.fileName && option.url) || [];
   } catch (error) {
     console.warn(error);
-    return fallbackLive2DModelOptions;
+    setAvatarStatus("VRM 模型列表加载失败。", "error");
+    return [];
   }
 }
 
-async function ensureLive2DModelAvailable(option: Live2DModelOption) {
-  const response = await fetch(live2DModelJsonUrl(option), { cache: "no-store" });
-  if (!response.ok) {
-    throw new Error(`模型文件加载失败：${option.name}`);
-  }
+function formatModelSize(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "VRM";
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-async function settleLive2DModelLayout() {
-  refreshLive2DLayout();
+async function settleVrmModelLayout() {
+  refreshAvatarLayout();
   await new Promise((resolve) => window.setTimeout(resolve, 180));
-  refreshLive2DLayout();
+  refreshAvatarLayout();
 }
 
-async function selectLive2DModel(id: string) {
-  const option = live2dModelOptions.find((modelOption) => modelOption.id === id);
+async function selectVrmModel(id: string) {
+  const option = vrmModelOptions.find((modelOption) => modelOption.id === id);
   if (!option) return;
-  if (isLive2DModelSwitching || id === activeLive2DModelId) return;
+  if (isVrmModelSwitching || id === activeVrmModelId) return;
 
-  const previousModelId = activeLive2DModelId || selectedLive2DModelOption().id;
-  isLive2DModelSwitching = true;
-  pendingLive2DModelId = option.id;
-  syncLive2DModelActiveState();
+  const previousModelId = activeVrmModelId;
+  isVrmModelSwitching = true;
+  pendingVrmModelId = option.id;
+  syncVrmModelActiveState();
 
   try {
-    await ensureLive2DModelAvailable(option);
-    updateModelConfig("/models/", option.directory, option.fileName, option.scale);
-    LAppAdapter.getInstance().setChara("/models/" + option.directory, option.fileName);
-    saveLive2DModel(option.id);
-    await settleLive2DModelLayout();
+    await avatarDriver.load(option.url);
+    saveVrmModel(option.id);
+    await settleVrmModelLayout();
   } catch (error) {
     console.warn(error);
-    pendingLive2DModelId = previousModelId;
-    appendLine("system", error instanceof Error ? error.message : "模型切换失败。");
+    pendingVrmModelId = previousModelId;
+    const message = error instanceof Error ? error.message : "模型切换失败。";
+    setAvatarStatus(message, "error");
+    appendLine("system", message);
   } finally {
-    isLive2DModelSwitching = false;
-    pendingLive2DModelId = "";
-    syncLive2DModelActiveState();
+    isVrmModelSwitching = false;
+    pendingVrmModelId = "";
+    syncVrmModelActiveState();
   }
 }
 
-function renderLive2DModelOptions() {
+function renderVrmModelOptions() {
   characterList.textContent = "";
 
-  live2dModelOptions.forEach((option) => {
+  if (!vrmModelOptions.length) {
+    const message = document.createElement("p");
+    message.className = "workspace-message";
+    message.textContent = "未找到 VRM 模型。把 .vrm 文件放进 MeloMate/models 后刷新页面。";
+    characterList.appendChild(message);
+    setAvatarStatus("请把 .vrm 模型放进 MeloMate/models。", "error");
+    return;
+  }
+
+  vrmModelOptions.forEach((option) => {
     const item = document.createElement("button");
     item.className = "character-item";
     item.type = "button";
@@ -1006,16 +1005,16 @@ function renderLive2DModelOptions() {
 
     const meta = document.createElement("span");
     meta.className = "character-file";
-    meta.textContent = option.id;
+    meta.textContent = `${option.fileName} · ${formatModelSize(option.size)}`;
 
     item.append(portrait, label, meta);
     item.addEventListener("click", () => {
-      void selectLive2DModel(option.id);
+      void selectVrmModel(option.id);
     });
     characterList.appendChild(item);
   });
 
-  syncLive2DModelActiveState();
+  syncVrmModelActiveState();
 }
 
 function renderCharacterOptions(options: CharacterConfigOption[]) {
@@ -1574,9 +1573,10 @@ function syncProactiveSpeakButton() {
   proactiveSpeakButton.disabled = !isCapturing || !isWsReady || isAssistantResponding || isSettingsReadOnly;
 }
 
-function refreshLive2DLayout() {
+function refreshAvatarLayout() {
+  avatarDriver.resize();
   window.setTimeout(() => {
-    window.dispatchEvent(new Event("resize"));
+    avatarDriver.resize();
   }, 80);
 }
 
@@ -1587,7 +1587,7 @@ function syncVideoFullscreenState(active: boolean) {
   videoFrame.classList.toggle("video-fullscreen", active);
   videoFullscreenButton.textContent = active ? "×" : "⛶";
   videoFullscreenButton.setAttribute("aria-label", active ? "退出全屏" : "进入全屏");
-  refreshLive2DLayout();
+  refreshAvatarLayout();
 }
 
 async function toggleVideoFullscreen() {
@@ -2820,6 +2820,7 @@ function queueAudioMessage(message: WsMessage) {
       }
 
       if (message.audio) {
+        avatarDriver.setExpression(message.actions?.expressions);
         await playBackendAudio(message.audio, queueVersion, turnId);
       }
     })
@@ -2836,10 +2837,19 @@ async function playBackendAudio(audioBase64: string, queueVersion: number, turnI
   setAnswering(true);
 
   const audioSource = `data:audio/wav;base64,${audioBase64}`;
+  let lipSyncTrack = null;
+  try {
+    lipSyncTrack = await avatarDriver.prepareLipSync(audioBase64);
+  } catch (error) {
+    console.warn("VRM lip-sync analysis failed; audio playback will continue.", error);
+  }
+  if (queueVersion !== audioQueueVersion || !shouldAcceptAssistantOutput({ turn_id: turnId })) return;
+
   responseAudio.src = audioSource;
   await applyAudioOutput();
   if (queueVersion !== audioQueueVersion || !shouldAcceptAssistantOutput({ turn_id: turnId })) return;
 
+  avatarDriver.startLipSync(responseAudio, lipSyncTrack);
   const playbackTasks = [playAudioElement(responseAudio)];
   const canUseVoiceChatOutput = await applyVoiceChatAudioOutput();
   if (queueVersion !== audioQueueVersion || !shouldAcceptAssistantOutput({ turn_id: turnId })) return;
@@ -2849,7 +2859,11 @@ async function playBackendAudio(audioBase64: string, queueVersion: number, turnI
     playbackTasks.push(playAudioElement(voiceChatAudio));
   }
 
-  await Promise.all(playbackTasks);
+  try {
+    await Promise.all(playbackTasks);
+  } finally {
+    avatarDriver.stopLipSync();
+  }
 }
 
 async function playAudioElement(audio: HTMLAudioElement) {
@@ -3060,6 +3074,7 @@ function stopCurrentResponsePlayback(force = false) {
   responseAudio.pause();
   responseAudio.removeAttribute("src");
   responseAudio.load();
+  avatarDriver.stopLipSync();
   voiceChatAudio.pause();
   voiceChatAudio.removeAttribute("src");
   voiceChatAudio.load();
@@ -3458,12 +3473,10 @@ async function applyCurrentSettingsWhenConnected() {
   }
 }
 
-function bootLive2D() {
-  const modelOption = selectedLive2DModelOption();
-  activeLive2DModelId = modelOption.id;
-  updateModelConfig("/models/", modelOption.directory, modelOption.fileName, modelOption.scale);
-  initializeLive2D();
-  syncLive2DModelActiveState();
+async function bootVrmAvatar() {
+  const modelOption = selectedVrmModelOption();
+  if (!modelOption) return;
+  await selectVrmModel(modelOption.id);
 }
 
 clearHiddenSystemErrors();
@@ -3593,8 +3606,8 @@ async function startup() {
   connectWebSocket();
   setAssetPanelTab(activeAssetPanelTab, false);
   await setupBackgroundPicker();
-  live2dModelOptions = await readLive2DModelOptions();
-  renderLive2DModelOptions();
+  vrmModelOptions = await readVrmModelOptions();
+  renderVrmModelOptions();
   await purgeLegacyReferenceAudioStorage();
   await refreshDevices();
   setCaptureUi(false);
@@ -3604,7 +3617,7 @@ async function startup() {
   syncProactiveSpeakControls();
   syncProactiveSpeakButton();
   restartProactiveSpeakLoop();
-  bootLive2D();
+  await bootVrmAvatar();
 }
 
 void startup();

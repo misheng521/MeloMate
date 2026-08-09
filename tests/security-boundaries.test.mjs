@@ -172,6 +172,22 @@ test("local services enforce origin, host and per-launch authentication boundari
     }),
     200,
   );
+  const vrmManifestResponse = await fetch(`${frontendOrigin}/api/vrm-models`, {
+    headers: {
+      Origin: frontendOrigin,
+      "X-MeloMate-Session": sessionToken,
+    },
+  });
+  assert.equal(vrmManifestResponse.status, 200);
+  const vrmManifest = await vrmManifestResponse.json();
+  assert.ok(vrmManifest.models.some((model) => model.fileName === "melomate_test_avatar.vrm"));
+  const vrmHeadResponse = await fetch(`${frontendOrigin}/vrm-models/melomate_test_avatar.vrm`, {
+    method: "HEAD",
+  });
+  assert.equal(vrmHeadResponse.status, 200);
+  assert.equal(vrmHeadResponse.headers.get("content-type"), "model/gltf-binary");
+  assert.equal(await status(`${frontendOrigin}/vrm-models/BACKEND_MODELS.md`), 404);
+  assert.equal(await status(`${frontendOrigin}/vrm-models/backend/private-model.bin`), 404);
   assert.equal(
     await status(`${frontendOrigin}/api/workspace-events?persona=security-test-persona&since=0&wait_ms=100`, {
       Origin: frontendOrigin,

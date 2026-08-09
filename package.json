@@ -2,7 +2,7 @@
   "name": "melomate",
   "version": "0.1.0",
   "private": true,
-  "description": "Local AI voice companion app with Live2D frontend and Python backend.",
+  "description": "Local AI voice companion app with a lightweight VRM frontend and Python backend.",
   "license": "UNLICENSED",
   "type": "module",
   "scripts": {
@@ -14,8 +14,12 @@
   "engines": {
     "node": ">=20"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@pixiv/three-vrm": "^3.5.5",
+    "three": "^0.185.1"
+  },
   "devDependencies": {
+    "@types/three": "^0.185.4",
     "typescript": "~5.5.2",
     "vite": "6.4.3"
   }

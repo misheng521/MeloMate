@@ -8,7 +8,7 @@ from typing import List, Optional, Dict, Tuple
 from loguru import logger
 
 from ..agent.output_types import DisplayText, Actions
-from ..live2d_model import Live2dModel
+from ..avatar_model import AvatarModel
 from ..tts.tts_interface import TTSInterface
 from ..utils.stream_audio import prepare_audio_payload
 from .types import WebSocketSend
@@ -70,7 +70,7 @@ class TTSTaskManager:
         tts_text: str,
         display_text: DisplayText,
         actions: Optional[Actions],
-        live2d_model: Live2dModel,
+        avatar_model: AvatarModel,
         tts_engine: TTSInterface,
         websocket_send: WebSocketSend,
         voice_style: Optional[Dict[str, str]] = None,
@@ -81,8 +81,8 @@ class TTSTaskManager:
         Args:
             tts_text: Text to synthesize
             display_text: Text to display in UI
-            actions: Live2D model actions
-            live2d_model: Live2D model instance
+            actions: Avatar expression actions
+            avatar_model: Avatar expression profile
             tts_engine: TTS engine instance
             websocket_send: WebSocket send function
         """
@@ -124,7 +124,7 @@ class TTSTaskManager:
                 tts_text=tts_text,
                 display_text=display_text,
                 actions=actions,
-                live2d_model=live2d_model,
+                avatar_model=avatar_model,
                 tts_engine=tts_engine,
                 voice_style_key=voice_style_key,
                 voice_style_prompt=voice_style_prompt,
@@ -176,7 +176,7 @@ class TTSTaskManager:
         tts_text: str,
         display_text: DisplayText,
         actions: Optional[Actions],
-        live2d_model: Live2dModel,
+        avatar_model: AvatarModel,
         tts_engine: TTSInterface,
         voice_style_key: str,
         voice_style_prompt: Optional[str],

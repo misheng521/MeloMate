@@ -2,7 +2,7 @@ character_config:
   conf_name: "小鱼"
   conf_uid: "avatar_xiaoyu_001"
   character_name: "小鱼"
-  live2d_model_name: "mao_pro"
+  avatar_model_name: "vrm_default"
   voice_style:
     normal: "女，青年，中音调"
     happy: "女，青年，高音调"

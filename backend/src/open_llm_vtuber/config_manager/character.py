@@ -15,7 +15,7 @@ class CharacterConfig(I18nMixin):
 
     conf_name: str = Field(..., alias="conf_name")
     conf_uid: str = Field(..., alias="conf_uid")
-    live2d_model_name: str = Field(..., alias="live2d_model_name")
+    avatar_model_name: str = Field(..., alias="avatar_model_name")
     character_name: str = Field(default="", alias="character_name")
     human_name: str = Field(default="Human", alias="human_name")
     voice_style: Dict[str, str] = Field(default_factory=dict, alias="voice_style")
@@ -36,8 +36,8 @@ class CharacterConfig(I18nMixin):
             en="Unique identifier for the character configuration",
             zh="角色配置唯一标识符",
         ),
-        "live2d_model_name": Description(
-            en="Name of the Live2D model to use", zh="使用的Live2D模型名称"
+        "avatar_model_name": Description(
+            en="Name of the avatar expression profile", zh="数字人表情配置名称"
         ),
         "character_name": Description(
             en="Name of the AI character in conversation", zh="对话中AI角色的名字"

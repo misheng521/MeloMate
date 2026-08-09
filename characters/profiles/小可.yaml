@@ -3,7 +3,7 @@ character_config:
   conf_uid: "avatar_xiaoke_001"
   character_name: "小可"
   human_name: "用户"
-  live2d_model_name: "epsilon_free"
+  avatar_model_name: "vrm_default"
   voice_style:
     normal: ""
     happy: ""

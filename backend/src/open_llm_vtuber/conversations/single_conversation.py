@@ -248,7 +248,7 @@ async def process_single_conversation(
                     response_part = await process_agent_output(
                         output=output_item,
                         character_config=context.character_config,
-                        live2d_model=context.live2d_model,
+                        avatar_model=context.avatar_model,
                         tts_engine=context.get_current_tts_engine(),
                         websocket_send=websocket_send_with_turn,  # Pass websocket_send for audio/tts messages
                         tts_manager=tts_manager,

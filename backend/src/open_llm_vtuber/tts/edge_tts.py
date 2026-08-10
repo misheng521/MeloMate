@@ -1,5 +1,6 @@
 import sys
 import os
+import time
 
 import edge_tts
 from loguru import logger
@@ -14,6 +15,9 @@ sys.path.append(current_dir)
 
 
 class TTSEngine(TTSInterface):
+    RETRY_DELAYS = (0.45, 1.2)
+    MIN_AUDIO_BYTES = 128
+
     def __init__(self, voice="en-US-AvaMultilingualNeural"):
         self.voice = voice
 
@@ -38,16 +42,37 @@ class TTSEngine(TTSInterface):
 
         """
         file_name = self.generate_cache_file_name(file_name_no_ext, self.file_extension)
+        last_error = None
 
-        try:
-            communicate = edge_tts.Communicate(text, self.voice)
-            communicate.save_sync(file_name)
-        except Exception as e:
-            logger.critical(f"\nError: edge-tts unable to generate audio: {e}")
-            logger.critical("It's possible that edge-tts is blocked in your region.")
-            return None
+        for attempt in range(len(self.RETRY_DELAYS) + 1):
+            try:
+                if os.path.exists(file_name):
+                    os.remove(file_name)
+                communicate = edge_tts.Communicate(text, self.voice)
+                communicate.save_sync(file_name)
+                if not os.path.exists(file_name) or os.path.getsize(file_name) < self.MIN_AUDIO_BYTES:
+                    raise RuntimeError("Edge TTS returned an empty or incomplete audio file.")
+                if attempt:
+                    logger.info(f"Edge TTS recovered after {attempt + 1} attempts.")
+                return file_name
+            except Exception as error:
+                last_error = error
+                if os.path.exists(file_name):
+                    try:
+                        os.remove(file_name)
+                    except OSError:
+                        pass
+                if attempt < len(self.RETRY_DELAYS):
+                    delay = self.RETRY_DELAYS[attempt]
+                    logger.warning(
+                        f"Edge TTS attempt {attempt + 1} failed: {error}. "
+                        f"Retrying in {delay:.2f}s."
+                    )
+                    time.sleep(delay)
 
-        return file_name
+        logger.critical(f"\nError: edge-tts unable to generate audio after retries: {last_error}")
+        logger.critical("The Edge speech service may be temporarily unavailable or blocked.")
+        return None
 
 
 # en-US-AvaMultilingualNeural

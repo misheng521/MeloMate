@@ -1389,6 +1389,7 @@ function appendAssistantLine(text: string, speakerName?: string) {
 
 function setCaptureUi(active: boolean) {
   isCapturing = active;
+  avatarDriver.setConversationState(active ? "listening" : "idle");
   startButton.disabled = active || isCaptureStarting;
   stopButton.disabled = !active;
   status.textContent = isCaptureStarting ? "启动中" : active ? "捕捉中" : "已停止";
@@ -1416,6 +1417,17 @@ function setAssistantStatus(state: "idle" | "thinking" | "answering" | "listenin
   status.classList.toggle("listening", isListening);
   status.classList.toggle("thinking", isThinking);
   status.classList.toggle("answering", isAnswering);
+  avatarDriver.setConversationState(
+    isListening
+      ? "listening"
+      : isThinking
+        ? "thinking"
+        : isAnswering
+          ? "speaking"
+          : isCapturing
+            ? "listening"
+            : "idle",
+  );
 }
 
 function setThinking(isThinking: boolean) {
@@ -2821,7 +2833,7 @@ function queueAudioMessage(message: WsMessage) {
 
       if (message.audio) {
         avatarDriver.setExpression(message.actions?.expressions);
-        await playBackendAudio(message.audio, queueVersion, turnId);
+        await playBackendAudio(message.audio, queueVersion, text, turnId);
       }
     })
     .catch((error) => {
@@ -2829,7 +2841,12 @@ function queueAudioMessage(message: WsMessage) {
     });
 }
 
-async function playBackendAudio(audioBase64: string, queueVersion: number, turnId?: string) {
+async function playBackendAudio(
+  audioBase64: string,
+  queueVersion: number,
+  spokenText: string,
+  turnId?: string,
+) {
   if (queueVersion !== audioQueueVersion || !shouldAcceptAssistantOutput({ turn_id: turnId })) return;
 
   responseAudio.pause();
@@ -2839,7 +2856,7 @@ async function playBackendAudio(audioBase64: string, queueVersion: number, turnI
   const audioSource = `data:audio/wav;base64,${audioBase64}`;
   let lipSyncTrack = null;
   try {
-    lipSyncTrack = await avatarDriver.prepareLipSync(audioBase64);
+    lipSyncTrack = await avatarDriver.prepareLipSync(audioBase64, spokenText);
   } catch (error) {
     console.warn("VRM lip-sync analysis failed; audio playback will continue.", error);
   }

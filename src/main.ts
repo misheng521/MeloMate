@@ -42,13 +42,6 @@ type DisplayText = {
   name?: string;
 };
 
-type ProactiveSpeakStage =
-  | "opening"
-  | "curious"
-  | "warm-concern"
-  | "playful-impatience"
-  | "fresh-topic";
-
 type ProactiveReturnContext = {
   elapsed_seconds: number;
   unanswered_count: number;
@@ -226,14 +219,12 @@ const modelInput = document.querySelector<HTMLInputElement>("#model")!;
 const apiKeyInput = document.querySelector<HTMLInputElement>("#apiKey")!;
 const toggleApiKey = document.querySelector<HTMLButtonElement>("#toggleApiKey")!;
 const clearApiKey = document.querySelector<HTMLButtonElement>("#clearApiKey")!;
-const apiKeyHint = document.querySelector<HTMLParagraphElement>("#apiKeyHint")!;
 const screenVisionToggle = document.querySelector<HTMLInputElement>("#screenVisionToggle")!;
 const screenVisionEndpointInput = document.querySelector<HTMLInputElement>("#screenVisionEndpoint")!;
 const screenVisionModelInput = document.querySelector<HTMLInputElement>("#screenVisionModel")!;
 const screenVisionApiKeyInput = document.querySelector<HTMLInputElement>("#screenVisionApiKey")!;
 const toggleScreenVisionApiKey = document.querySelector<HTMLButtonElement>("#toggleScreenVisionApiKey")!;
 const clearScreenVisionApiKey = document.querySelector<HTMLButtonElement>("#clearScreenVisionApiKey")!;
-const screenVisionApiKeyHint = document.querySelector<HTMLParagraphElement>("#screenVisionApiKeyHint")!;
 const screenVisionIntervalInput = document.querySelector<HTMLInputElement>("#screenVisionInterval")!;
 const proactiveSpeakToggle = document.querySelector<HTMLInputElement>("#proactiveSpeakToggle")!;
 const proactiveIdleSecondsInput = document.querySelector<HTMLInputElement>("#proactiveIdleSeconds")!;
@@ -268,7 +259,8 @@ const characterList = document.querySelector<HTMLDivElement>("#characterList")!;
 const workspaceList = document.querySelector<HTMLDivElement>("#workspaceList")!;
 const avatarCanvas = document.querySelector<HTMLCanvasElement>("#canvas")!;
 const avatarStatus = document.querySelector<HTMLDivElement>("#avatarStatus")!;
-const avatarZoomHint = document.querySelector<HTMLDivElement>("#avatarZoomHint")!;
+const avatarZoomRange = document.querySelector<HTMLInputElement>("#avatarZoomRange")!;
+const avatarZoomValue = document.querySelector<HTMLOutputElement>("#avatarZoomValue")!;
 
 function setAvatarStatus(message: string, tone: "loading" | "ready" | "error" = "loading") {
   avatarStatus.textContent = message;
@@ -276,8 +268,10 @@ function setAvatarStatus(message: string, tone: "loading" | "ready" | "error" = 
   avatarStatus.hidden = !message;
 }
 
-const avatarDriver = new VrmAvatar(avatarCanvas, setAvatarStatus, (label) => {
-  avatarZoomHint.textContent = label;
+const avatarDriver = new VrmAvatar(avatarCanvas, setAvatarStatus, (percentage) => {
+  const value = String(percentage);
+  avatarZoomRange.value = value;
+  avatarZoomValue.value = `${value}%`;
 });
 
 type SinkAudioElement = HTMLAudioElement & {
@@ -491,17 +485,11 @@ function syncSecretToggle(input: HTMLInputElement, button: HTMLButtonElement) {
 
 function syncCredentialUi() {
   apiKeyInput.placeholder = savedChatApiKeyAvailable
-    ? "已由 Windows 加密保存；留空继续使用"
+    ? "留空继续使用已保存的 Key"
     : "请输入 API Key";
   screenVisionApiKeyInput.placeholder = savedScreenVisionApiKeyAvailable
-    ? "已由 Windows 加密保存；留空继续使用"
+    ? "留空继续使用已保存的 Key"
     : "请输入识图 API Key";
-  apiKeyHint.textContent = savedChatApiKeyAvailable
-    ? "已绑定当前 Windows 用户安全保存，不会写入浏览器或工作区。"
-    : "Key 不会写入浏览器；应用后由 Windows 当前用户加密保存。";
-  screenVisionApiKeyHint.textContent = savedScreenVisionApiKeyAvailable
-    ? "已绑定当前 Windows 用户安全保存，不会回传给页面。"
-    : "Key 不会写入浏览器；应用后由 Windows 当前用户加密保存。";
   clearApiKey.disabled = isSettingsReadOnly || !savedChatApiKeyAvailable;
   clearScreenVisionApiKey.disabled = isSettingsReadOnly || !savedScreenVisionApiKeyAvailable;
 }
@@ -2168,15 +2156,6 @@ function proactiveBaseIntervalMs() {
   return Number(normalizeProactiveIdleSeconds(proactiveIdleSecondsInput.value)) * 1000;
 }
 
-function proactiveStageForCount(unansweredCount: number): ProactiveSpeakStage {
-  if (unansweredCount <= 0) return "opening";
-  const position = unansweredCount % 4;
-  if (position === 0) return "fresh-topic";
-  if (position === 1) return "curious";
-  if (position === 2) return "warm-concern";
-  return "playful-impatience";
-}
-
 function scheduleNextProactiveSpeak(now = Date.now()) {
   if (!proactiveSpeakToggle.checked || !isCapturing) {
     nextProactiveSpeakAt = Number.POSITIVE_INFINITY;
@@ -2282,10 +2261,8 @@ async function requestProactiveSpeak(mode: "manual" | "automatic", announce = fa
     screen_vision: screenVisionConfigPayload(),
     proactive: {
       mode,
-      stage: proactiveStageForCount(unansweredBeforeRequest),
       elapsed_seconds: Math.max(0, Math.round((now - lastUserConversationActivityAt) / 1000)),
       unanswered_count: unansweredBeforeRequest,
-      cycle_index: Math.floor(unansweredBeforeRequest / 4),
     },
   });
   if (!sent) {
@@ -2662,6 +2639,7 @@ function handleWsMessage(message: WsMessage) {
     const labels: Record<string, WorkspaceControlStatus> = {
       thinking: { label: "观察中", tone: "ready" },
       acted: { label: "已操作", tone: "ready" },
+      waiting: { label: "等待中", tone: "ready" },
       paused: { label: "控制暂停", tone: "stale" },
       error: { label: "控制异常", tone: "stale" },
       closed: { label: "未连接", tone: "missing" },
@@ -3532,6 +3510,9 @@ volumeRange.addEventListener("input", () => {
   saveVolumeSetting();
 });
 volumeMuteToggle.addEventListener("click", toggleMuteVolume);
+avatarZoomRange.addEventListener("input", () => {
+  avatarDriver.setZoomPercentage(Number(avatarZoomRange.value));
+});
 voiceChatOutputToggle.addEventListener("change", () => {
   if (voiceChatOutputToggle.checked) {
     void askToOpenVoicemeeter();

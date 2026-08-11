@@ -61,7 +61,18 @@
           </aside>
           <canvas id="canvas"></canvas>
           <div id="avatarStatus" class="avatar-status" role="status" hidden></div>
-          <div id="avatarZoomHint" class="avatar-zoom-hint" aria-hidden="true">半身 · 滚轮缩放</div>
+          <label class="avatar-zoom-control" aria-label="模型缩放">
+            <output id="avatarZoomValue" for="avatarZoomRange">68%</output>
+            <input
+              id="avatarZoomRange"
+              type="range"
+              min="0"
+              max="100"
+              step="1"
+              value="68"
+              aria-label="模型缩放百分比"
+            />
+          </label>
           <button id="proactiveSpeakButton" class="proactive-speak-button" type="button" disabled>
             让ta说句话
           </button>
@@ -150,8 +161,6 @@
               <button id="clearApiKey" class="clear-secret-button" type="button" disabled>清除</button>
             </div>
           </label>
-          <p id="apiKeyHint" class="field-hint">Key 不会写入浏览器；应用后由 Windows 当前用户加密保存。</p>
-
           <div class="settings-divider" aria-hidden="true"></div>
 
           <label class="field toggle-field collapsible-toggle" data-toggle-group="screen-vision">
@@ -180,10 +189,6 @@
               <button id="clearScreenVisionApiKey" class="clear-secret-button" type="button" disabled>清除</button>
             </div>
           </label>
-          <p id="screenVisionApiKeyHint" class="field-hint collapsible-field" data-collapse="screen-vision">
-            Key 不会写入浏览器；应用后由 Windows 当前用户加密保存。
-          </p>
-
           <label class="field collapsible-field" data-collapse="screen-vision">
             <span>定时截图间隔（秒）</span>
             <input id="screenVisionInterval" type="number" min="1" max="60" step="1" value="5" />

@@ -32,7 +32,7 @@ from .conversations.conversation_handler import (
     handle_conversation_trigger,
     handle_individual_interrupt,
 )
-from .conversations.conversation_utils import speak_text_response
+from .conversations.single_conversation import process_workspace_agent_turn
 from .workspace_controller import WorkspaceController
 from .workspace_security import normalize_workspace_event
 from .secure_credentials import (
@@ -711,43 +711,45 @@ class WebSocketHandler:
     ) -> WorkspaceController:
         controller = self.workspace_controllers.get(client_uid)
         if controller is None:
-            async def speak_reply(text: str, page_id: str, version: int) -> bool:
+            async def run_agent_turn(runtime: dict) -> dict:
                 lock = self.conversation_locks.setdefault(client_uid, asyncio.Lock())
                 async with lock:
                     active = self.current_conversation_tasks.get(client_uid)
                     if active and not active.done():
-                        return False
+                        return {"acted": False, "response": ""}
                     if self.client_connections.get(client_uid) is not websocket:
-                        return False
-
-                turn_id = f"workspace-{page_id}-{version}-{int(time.time() * 1000)}"
-                response = await speak_text_response(
-                    context,
-                    websocket.send_text,
-                    client_uid,
-                    text,
-                    turn_id,
-                )
-                if response:
-                    add_external = getattr(
-                        context.agent_engine, "add_external_assistant_message", None
+                        return {"acted": False, "response": ""}
+                    page_id = str(runtime.get("page_id") or "")[:128]
+                    version = max(0, int(runtime.get("state_version") or 0))
+                    turn_id = (
+                        f"workspace-{page_id}-{version}-{int(time.time() * 1000)}"
                     )
-                    if callable(add_external):
-                        add_external(response)
-                    if context.history_uid:
-                        store_message(
-                            conf_uid=context.character_config.conf_uid,
-                            history_uid=context.history_uid,
-                            role="ai",
-                            content=response,
-                            name=context.character_config.character_name,
+                    task = asyncio.create_task(
+                        process_workspace_agent_turn(
+                            context,
+                            websocket.send_text,
+                            client_uid,
+                            runtime,
+                            turn_id,
                         )
-                return True
+                    )
+                    self.current_conversation_tasks[client_uid] = task
+                    self.reply_started_flags[client_uid] = True
+                    self.workspace_work_flags[client_uid] = False
+                try:
+                    return await task
+                finally:
+                    current = self.current_conversation_tasks.get(client_uid)
+                    if current is task:
+                        self.current_conversation_tasks.pop(client_uid, None)
+                        self.reply_started_flags[client_uid] = False
+                    elif current is None:
+                        self.reply_started_flags[client_uid] = False
 
             controller = WorkspaceController(
                 context,
                 websocket.send_text,
-                speak_reply=speak_reply,
+                run_agent_turn=run_agent_turn,
             )
             self.workspace_controllers[client_uid] = controller
         return controller

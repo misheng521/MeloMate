@@ -87,6 +87,8 @@ adaptation 只能使用下列枚举：
 - affection: persona_default | reserved | warm | affectionate
 - humor: persona_default | low | gentle | playful
 
+adaptation 只是对用户长期、稳定沟通偏好的轻量记录，不能用来改写人设。只有用户明确表达或多次稳定表现同一偏好时才改变；一次情绪、一次短回复或某个临时话题不能改变 adaptation。不确定时保持 previous_memory 的值。
+
 recent_messages 中每条消息有 id。remember 操作必须引用真实存在的 human 消息 id 作为 evidence_message_ids；不得引用 ai 消息，不得编造 id。用户身份、喜好、事实和沟通偏好只有在两条独立 human 证据支持后才会成为正式记忆，单次推断会先进入候选区。共同经历和未结束话题也至少需要一条 human 证据。
 
 只能使用这些操作：

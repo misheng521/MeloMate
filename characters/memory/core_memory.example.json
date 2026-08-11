@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 5,
   "revision": 0,
   "updated_at": "",
   "profile": {
@@ -16,6 +16,18 @@
     "relationship_summary_source": "manual",
     "episodes": [],
     "open_threads": []
+  },
+  "character_self": {
+    "preferences": [],
+    "dislikes": [],
+    "values": [],
+    "boundaries": [],
+    "habits": []
+  },
+  "relationship": {
+    "shared_meanings": [],
+    "rituals": [],
+    "agreements": []
   },
   "adaptation": {
     "response_length": "adaptive",

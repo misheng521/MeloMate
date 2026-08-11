@@ -207,6 +207,29 @@ class ToolExecutor:
                         "TOOL_POLICY_DENIED: page_id, positive state_version, and "
                         "one advertised action_id are required."
                     )
+                if tool_policy.get("source") == "workspace_runtime":
+                    expected_page_id = str(
+                        tool_policy.get("expected_page_id") or ""
+                    )[:128]
+                    try:
+                        expected_state_version = max(
+                            0, int(tool_policy.get("expected_state_version") or 0)
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        expected_state_version = 0
+                    allowed_action_ids = {
+                        str(value)[:128]
+                        for value in tool_policy.get("allowed_action_ids") or ()
+                    }
+                    if (
+                        page_id != expected_page_id
+                        or state_version != expected_state_version
+                        or action_id not in allowed_action_ids
+                    ):
+                        return tool_input, (
+                            "TOOL_POLICY_DENIED: the page action must match the exact "
+                            "verified runtime page revision and advertised action id."
+                        )
                 tool_input = {
                     "persona": expected_persona or supplied_persona,
                     "page_id": page_id,

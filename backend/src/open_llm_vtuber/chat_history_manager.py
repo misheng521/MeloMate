@@ -1897,13 +1897,26 @@ def get_core_memory_prompt(conf_uid: str, query: str = "") -> str:
             "playful": "可以更俏皮",
         },
     }
+    adaptation_defaults = {
+        "response_length": "adaptive",
+        "initiative": "balanced",
+        "question_frequency": "balanced",
+        "advice_style": "ask_first",
+        "affection": "persona_default",
+        "humor": "persona_default",
+    }
     adaptation_values = []
     for key, labels in adaptation_labels.items():
         value = adaptation.get(key)
+        if value == adaptation_defaults.get(key):
+            continue
         label = labels.get(value)
         if label:
             adaptation_values.append(label)
     if adaptation_values:
-        lines.append("当前相处方式：" + "；".join(adaptation_values))
+        lines.append(
+            "观察到的长期沟通偏好（仅在当前语境合适时轻量参考，不得覆盖人设）："
+            + "；".join(adaptation_values)
+        )
 
     return "\n".join(lines) if len(lines) > 2 else ""

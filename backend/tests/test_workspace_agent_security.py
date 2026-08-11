@@ -24,12 +24,9 @@ from src.open_llm_vtuber.workspace_controller import (  # noqa: E402
     _agent_should_act,
     _compact_action_choices,
 )
-from src.open_llm_vtuber.workspace_agent import (  # noqa: E402
-    WorkspaceAgentSession,
-    _natural_reply,
-)
+from src.open_llm_vtuber.workspace_agent import WorkspaceAgentSession  # noqa: E402
 from src.open_llm_vtuber.workspace_intent import (  # noqa: E402
-    workspace_fast_ack_text,
+    WORKSPACE_READ_TOOLS,
     workspace_message_relevant,
     workspace_user_authorized_tools,
 )
@@ -41,13 +38,6 @@ from src.open_llm_vtuber.workspace_security import (  # noqa: E402
 
 
 class WorkspaceBoundaryTests(unittest.TestCase):
-    def test_workspace_build_request_gets_immediate_honest_ack(self):
-        self.assertEqual(
-            workspace_fast_ack_text("帮我做一个五子棋，我们两个对战"),
-            "好，我现在就准备，做好我们马上开始。",
-        )
-        self.assertEqual(workspace_fast_ack_text("今天天气怎么样"), "")
-
     def test_actual_user_followup_can_continue_a_workspace_task(self):
         inherited = workspace_user_authorized_tools("做一个通用网页编辑器")
         continued = workspace_user_authorized_tools("继续，把样式也改好", inherited)
@@ -302,7 +292,10 @@ class WorkspaceBoundaryTests(unittest.TestCase):
         self.assertEqual(context.workspace_user_guidance, [])
         self.assertEqual(metadata["workspace_tool_policy"]["source"], "user_turn")
         self.assertTrue(metadata["workspace_tool_policy"]["enforce"])
-        self.assertEqual(metadata["workspace_tool_policy"]["allowed_tool_names"], frozenset())
+        self.assertEqual(
+            metadata["workspace_tool_policy"]["allowed_tool_names"],
+            WORKSPACE_READ_TOOLS,
+        )
 
     def test_plain_file_task_does_not_import_untrusted_live_page_state(self):
         class Character:
@@ -326,13 +319,6 @@ class WorkspaceBoundaryTests(unittest.TestCase):
         read_state.assert_not_called()
         self.assertNotIn("workspace_awareness", metadata)
         self.assertFalse(metadata["workspace_tool_policy"]["enforce"])
-
-    def test_spoken_reply_filter_rejects_protocol_leaks(self):
-        self.assertEqual(_natural_reply("这步挺有意思，到你啦"), "这步挺有意思，到你啦")
-        self.assertEqual(_natural_reply('{"selectedActionId":"move-1"}'), "")
-        self.assertEqual(_natural_reply("工具已经执行，我下好了"), "")
-        self.assertEqual(_natural_reply("move complete"), "")
-
 
 class ToolExecutorBoundaryTests(unittest.TestCase):
     def test_exact_page_action_drops_model_supplied_payload_and_action(self):
@@ -389,6 +375,54 @@ class ToolExecutorBoundaryTests(unittest.TestCase):
         self.assertEqual(set(normalized), {"persona", "page_id"})
         self.assertEqual(normalized["persona"], "XiaoKe")
         self.assertLessEqual(len(normalized["page_id"]), 128)
+
+    def test_runtime_page_action_must_match_the_exact_reported_grant(self):
+        executor = ToolExecutor(object(), object())
+        policy = {
+            "source": "workspace_runtime",
+            "enforce": True,
+            "workspace_persona": "XiaoKe",
+            "allowed_tool_names": {"act_workspace_page"},
+            "expected_page_id": "board-1",
+            "expected_state_version": 9,
+            "allowed_action_ids": {"move-9"},
+            "remaining_tool_calls": {"act_workspace_page": 1},
+        }
+        _, error = executor.apply_tool_policy(
+            "act_workspace_page",
+            {
+                "persona": "XiaoKe",
+                "page_id": "board-2",
+                "state_version": 9,
+                "action_id": "move-9",
+            },
+            policy,
+        )
+        self.assertIn("exact verified runtime", error)
+
+        normalized, error = executor.apply_tool_policy(
+            "act_workspace_page",
+            {
+                "persona": "XiaoKe",
+                "page_id": "board-1",
+                "state_version": 9,
+                "action_id": "move-9",
+                "action": "forged-action",
+                "payload": {"forged": True},
+            },
+            policy,
+        )
+        self.assertIsNone(error)
+        self.assertEqual(
+            normalized,
+            {
+                "persona": "XiaoKe",
+                "page_id": "board-1",
+                "state_version": 9,
+                "action_id": "move-9",
+                "wait_ms": 1200,
+            },
+        )
 
     def test_normal_turn_cannot_cross_persona_even_without_restricted_mode(self):
         executor = ToolExecutor(object(), object())
@@ -743,16 +777,12 @@ class WorkspaceControllerTests(unittest.IsolatedAsyncioTestCase):
         )
 
     @staticmethod
-    def context(llm=None, user_text="我们一起操作这个应用"):
+    def context(user_text="我们一起操作这个应用"):
         class Character:
             persona_prompt = "你是自然、简短的游戏伙伴。"
 
-        class Agent:
-            _llm = llm
-
         class Context:
             character_config = Character()
-            agent_engine = Agent() if llm is not None else None
 
         context = Context()
         context.workspace_agent = WorkspaceAgentSession(context)
@@ -762,78 +792,78 @@ class WorkspaceControllerTests(unittest.IsolatedAsyncioTestCase):
         return context
 
     async def test_page_cannot_act_without_a_current_trusted_user_task(self):
-        sent_actions = []
+        agent_turns = []
 
         async def read_state(_persona, _page_id):
             return self.state_result(1, 1)
 
-        async def send_action(*args):
-            sent_actions.append(args)
-            return json.dumps({"confirmed": True})
+        async def run_agent_turn(runtime):
+            agent_turns.append(runtime)
+            return {"acted": True, "response": "完成了。"}
 
         controller = WorkspaceController(
             self.context(user_text="今天天气很好"),
             self._noop_send,
             read_state,
-            send_action,
+            run_agent_turn,
             debounce_seconds=0,
         )
         controller.submit(self.event(1, 1))
         await controller.wait_idle()
-        self.assertEqual(sent_actions, [])
+        self.assertEqual(agent_turns, [])
         await controller.close()
 
     async def test_rapid_updates_are_coalesced_to_latest_state(self):
-        sent_actions = []
+        agent_turns = []
         statuses = []
 
         async def read_state(_persona, page_id):
             self.assertEqual(page_id, "board-1")
             return self.state_result(2, 2)
 
-        async def send_action(persona, action, payload, wait_ms, page_id, version, action_id):
-            sent_actions.append((persona, action, payload, wait_ms, page_id, version, action_id))
-            return json.dumps({"confirmed": True})
+        async def run_agent_turn(runtime):
+            agent_turns.append(runtime)
+            return {"acted": True, "response": "这一步走好了。"}
 
         async def send_text(text):
             statuses.append(json.loads(text))
 
         controller = WorkspaceController(
-            self.context(), send_text, read_state, send_action, debounce_seconds=0.01
+            self.context(), send_text, read_state, run_agent_turn, debounce_seconds=0.01
         )
         controller.submit(self.event(1, 1))
         controller.submit(self.event(2, 2))
         await controller.wait_idle()
 
-        self.assertEqual(len(sent_actions), 1)
-        self.assertEqual(sent_actions[0][2], {"to": 2})
-        self.assertEqual(sent_actions[0][5], 2)
-        self.assertEqual(sent_actions[0][6], "move-2")
+        self.assertEqual(len(agent_turns), 1)
+        self.assertEqual(agent_turns[0]["state_version"], 2)
+        self.assertEqual(agent_turns[0]["available_actions"][0]["payload"], {"to": 2})
+        self.assertEqual(agent_turns[0]["available_actions"][0]["id"], "move-2")
         self.assertTrue(any(item["status"] == "acted" for item in statuses))
         await controller.close()
 
     async def test_page_does_not_act_when_agent_turn_is_false(self):
-        sent_actions = []
+        agent_turns = []
 
         async def read_state(_persona, _page_id):
             return self.state_result(1, 1, should_act=False)
 
-        async def send_action(*args):
-            sent_actions.append(args)
-            return json.dumps({"confirmed": True})
+        async def run_agent_turn(runtime):
+            agent_turns.append(runtime)
+            return {"acted": True, "response": "不该发生"}
 
         async def send_text(_text):
             return None
 
         controller = WorkspaceController(
-            self.context(), send_text, read_state, send_action, debounce_seconds=0
+            self.context(), send_text, read_state, run_agent_turn, debounce_seconds=0
         )
         controller.submit(self.event(1, 1, should_act=False))
         await controller.wait_idle()
-        self.assertEqual(sent_actions, [])
+        self.assertEqual(agent_turns, [])
         await controller.close()
 
-    async def test_action_exception_is_reported_without_killing_page_controller(self):
+    async def test_agent_turn_exception_is_reported_without_killing_page_controller(self):
         current = {"version": 1, "destination": 1}
         attempts = []
         statuses = []
@@ -841,17 +871,17 @@ class WorkspaceControllerTests(unittest.IsolatedAsyncioTestCase):
         async def read_state(_persona, _page_id):
             return self.state_result(current["version"], current["destination"])
 
-        async def send_action(*args):
-            attempts.append(args)
+        async def run_agent_turn(runtime):
+            attempts.append(runtime)
             if len(attempts) == 1:
-                raise ValueError("page action changed")
-            return json.dumps({"confirmed": True})
+                raise ValueError("agent turn failed")
+            return {"acted": True, "response": "这次完成了。"}
 
         async def send_text(text):
             statuses.append(json.loads(text))
 
         controller = WorkspaceController(
-            self.context(), send_text, read_state, send_action, debounce_seconds=0
+            self.context(), send_text, read_state, run_agent_turn, debounce_seconds=0
         )
         controller.submit(self.event(1, 1))
         await controller.wait_idle()
@@ -864,27 +894,9 @@ class WorkspaceControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(item["status"] == "acted" for item in statuses))
         await controller.close()
 
-    async def test_model_selects_each_turn_and_confirmed_reply_is_spoken(self):
-        class FakeLLM:
-            def __init__(self):
-                self.selected_ids = ["move-12", "move-24"]
-                self.calls = 0
-
-            async def chat_completion(self, _messages, _system_prompt):
-                selected = self.selected_ids[self.calls]
-                self.calls += 1
-                yield json.dumps(
-                    {
-                        "selectedActionId": selected,
-                        "spokenReply": "这一步我自己选，到你啦。",
-                    },
-                    ensure_ascii=False,
-                )
-
-        llm = FakeLLM()
+    async def test_each_page_event_is_routed_through_the_shared_agent_turn(self):
         current = {"version": 1, "destination": 2}
-        sent_actions = []
-        spoken = []
+        agent_turns = []
 
         def options(destination):
             return [
@@ -904,23 +916,18 @@ class WorkspaceControllerTests(unittest.IsolatedAsyncioTestCase):
             payload["state"]["state"]["appState"]["availableActions"] = options(destination)
             return json.dumps(payload)
 
-        async def send_action(*args):
-            sent_actions.append(args)
-            return json.dumps({"confirmed": True})
+        async def run_agent_turn(runtime):
+            agent_turns.append(runtime)
+            return {"acted": True, "response": "我走这里。"}
 
         async def send_text(_text):
             return None
 
-        async def speak_reply(text, page_id, version):
-            spoken.append((text, page_id, version))
-            return True
-
         controller = WorkspaceController(
-            self.context(llm),
+            self.context(),
             send_text,
             read_state,
-            send_action,
-            speak_reply=speak_reply,
+            run_agent_turn,
             debounce_seconds=0,
         )
         controller.submit(event(1, 2))
@@ -929,62 +936,34 @@ class WorkspaceControllerTests(unittest.IsolatedAsyncioTestCase):
         controller.submit(event(2, 14))
         await controller.wait_idle()
 
-        self.assertEqual(llm.calls, 2)
-        self.assertEqual([item[2] for item in sent_actions], [{"to": 12}, {"to": 24}])
-        self.assertEqual([item[6] for item in sent_actions], ["move-12", "move-24"])
-        self.assertEqual([item[2] for item in spoken], [1, 2])
+        self.assertEqual(len(agent_turns), 2)
+        self.assertEqual(
+            [[action["id"] for action in turn["available_actions"]] for turn in agent_turns],
+            [["move-2", "move-12"], ["move-14", "move-24"]],
+        )
+        self.assertEqual([turn["state_version"] for turn in agent_turns], [1, 2])
+        self.assertTrue(all(turn["user_goal"] for turn in agent_turns))
         await controller.close()
 
-    async def test_single_action_still_uses_model_for_natural_reply(self):
-        class FakeLLM:
-            calls = 0
+    async def test_agent_may_naturally_wait_without_forcing_an_action(self):
+        statuses = []
 
-            async def chat_completion(self, _messages, _system_prompt):
-                self.calls += 1
-                yield json.dumps(
-                    {
-                        "selectedActionId": "move-3",
-                        "spokenReply": "好，这里交给我。",
-                    },
-                    ensure_ascii=False,
-                )
+        async def read_state(_persona, _page_id):
+            return self.state_result(1, 3)
 
-        llm = FakeLLM()
-        controller = WorkspaceController(self.context(llm), self._noop_send)
-        selected, spoken = await controller._choose_action(
-            "XiaoKe",
-            {"agentShouldAct": True},
-            [{"id": "move-3", "action": "move", "payload": {"to": 3}}],
+        async def run_agent_turn(_runtime):
+            return {"acted": False, "response": "我想先等等看。"}
+
+        async def send_text(text):
+            statuses.append(json.loads(text))
+
+        controller = WorkspaceController(
+            self.context(), send_text, read_state, run_agent_turn, debounce_seconds=0
         )
-        self.assertEqual(selected, "move-3")
-        self.assertEqual(spoken, "好，这里交给我")
-        self.assertEqual(llm.calls, 1)
-        await controller.close()
-
-    async def test_invalid_first_model_answer_is_retried(self):
-        class FakeLLM:
-            calls = 0
-
-            async def chat_completion(self, _messages, _system_prompt):
-                self.calls += 1
-                if self.calls == 1:
-                    yield "not valid JSON"
-                else:
-                    yield '{"selectedActionId":"move-8","spokenReply":"我走这里。"}'
-
-        llm = FakeLLM()
-        controller = WorkspaceController(self.context(llm), self._noop_send)
-        selected, spoken = await controller._choose_action(
-            "XiaoKe",
-            {"board": [[0]]},
-            [
-                {"id": "move-7", "action": "move", "payload": {"to": 7}},
-                {"id": "move-8", "action": "move", "payload": {"to": 8}},
-            ],
-        )
-        self.assertEqual(selected, "move-8")
-        self.assertEqual(spoken, "我走这里")
-        self.assertEqual(llm.calls, 2)
+        controller.submit(self.event(1, 3))
+        await controller.wait_idle()
+        waiting = [item for item in statuses if item["status"] == "waiting"]
+        self.assertEqual(waiting[-1]["message"], "我想先等等看。")
         await controller.close()
 
     @staticmethod

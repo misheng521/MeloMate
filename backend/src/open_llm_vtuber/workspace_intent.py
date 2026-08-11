@@ -5,14 +5,6 @@ from __future__ import annotations
 import re
 
 
-_BUILD_VERB = re.compile(
-    r"(?:做(?:一|1)?个|制作|创建|生成|开发|搭建|写|撰写|画|绘制|设计|实现|新建|"
-    r"修改|更新|重做|改造|增加|添加|删除|编辑|整理|优化|完善|修复|调整|补充|补全|"
-    r"重构|转换|翻译|合并|拆分|格式化|换成|换为|build|create|make|generate|develop|"
-    r"design|draw|write|implement|update|modify|revise|edit|fix|refactor|format|"
-    r"optimize|convert|translate|merge|split|add|remove)",
-    re.IGNORECASE,
-)
 _ARTIFACT = re.compile(
     r"(?:工作区|游戏|对战|棋|应用|网页|页面|网站|工具|文件|文档|项目|程序|代码|"
     r"表格|图表|计划|笔记|日记|清单|列表|草稿|文章|诗|故事|小说|配方|菜谱|"
@@ -24,17 +16,6 @@ _ARTIFACT = re.compile(
     r"audio|video|data|config)",
     re.IGNORECASE,
 )
-_REVISION = re.compile(
-    r"(?:修改|更新|重做|改造|增加|添加|删除|编辑|整理|优化|完善|修复|调整|补充|补全|"
-    r"重构|转换|翻译|合并|拆分|格式化|换成|换为|update|modify|revise|edit|fix|"
-    r"refactor|format|optimize|convert|translate|merge|split|add|remove)",
-    re.IGNORECASE,
-)
-_GAME = re.compile(
-    r"(?:游戏|对战|棋|五子棋|象棋|围棋|扑克|game|play|chess|gomoku|go\s*game)",
-    re.IGNORECASE,
-)
-
 _WRITE_VERB = re.compile(
     r"(?:做(?:一|1)?个|制作|创建|生成|开发|搭建|写|撰写|画|绘制|设计|实现|新建|"
     r"修改|更新|重做|改造|增加|添加|保存|记录|记下|写下|导出|编辑|整理|优化|完善|"
@@ -259,15 +240,3 @@ def workspace_turn_continues(user_text: str) -> bool:
 def workspace_task_stop_requested(user_text: str) -> bool:
     """Allow an actual user message to revoke background workspace control."""
     return bool(_STOP_TASK.search(str(user_text or "")[:4_000]))
-
-
-def workspace_fast_ack_text(user_text: str) -> str:
-    """Return an immediate acknowledgement only for explicit artifact work."""
-    text = str(user_text or "").strip()[:2_000]
-    if not text or not _BUILD_VERB.search(text) or not _ARTIFACT.search(text):
-        return ""
-    if _REVISION.search(text):
-        return "好，我马上改。"
-    if _GAME.search(text):
-        return "好，我现在就准备，做好我们马上开始。"
-    return "好，我现在就做，完成后马上告诉你。"

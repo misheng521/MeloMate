@@ -67,7 +67,7 @@ def _attach_live_workspace_context(
         input_text, policy.get("user_authorized_workspace_tools")
     ):
         next_metadata["workspace_awareness"] = awareness
-        allowed = frozenset(policy.get("user_authorized_workspace_tools") or ())
+        allowed = frozenset(policy.get("available_workspace_tools") or ())
         policy.update(
             {
                 "enforce": True,
@@ -142,8 +142,15 @@ async def process_single_conversation(
                 metadata.get("proactive_speak") and images and screen_vision
             ),
         )
+        return_context = metadata.pop("proactive_return", None)
+        trusted_return_utterances = (
+            return_context.get("recent_utterances")
+            if isinstance(return_context, dict)
+            else None
+        )
         return_context_prompt = build_return_context_prompt(
-            metadata.pop("proactive_return", None)
+            return_context,
+            trusted_recent_utterances=trusted_return_utterances,
         )
         if return_context_prompt:
             augmented_input_text = (
@@ -324,6 +331,81 @@ async def process_single_conversation(
         raise
     finally:
         await cleanup_conversation(tts_manager, session_emoji)
+
+
+async def process_workspace_agent_turn(
+    context: ServiceContext,
+    websocket_send: WebSocketSend,
+    client_uid: str,
+    runtime: Dict[str, Any],
+    turn_id: str,
+) -> Dict[str, Any]:
+    """Run a page event through the same agent stream used by user conversations."""
+    run_workspace_turn = getattr(context.agent_engine, "run_workspace_turn", None)
+    if not callable(run_workspace_turn):
+        return {"acted": False, "response": ""}
+
+    manager = TTSTaskManager()
+    send = with_turn_id(websocket_send, turn_id)
+    full_response = ""
+    acted = False
+    try:
+        await send_conversation_start_signals(send)
+        async for output_item in run_workspace_turn(runtime):
+            if (
+                isinstance(output_item, dict)
+                and output_item.get("type") == "tool_call_status"
+            ):
+                output_item["name"] = context.character_config.character_name
+                if (
+                    output_item.get("tool_name") == "act_workspace_page"
+                    and output_item.get("status") == "completed"
+                ):
+                    try:
+                        action_result = json.loads(
+                            str(output_item.get("content") or "")
+                        )
+                    except (json.JSONDecodeError, TypeError):
+                        action_result = {}
+                    acted = (
+                        isinstance(action_result, dict)
+                        and action_result.get("confirmed") is True
+                    )
+                await send(json.dumps(output_item))
+            elif isinstance(output_item, (SentenceOutput, AudioOutput)):
+                response_part = await process_agent_output(
+                    output=output_item,
+                    character_config=context.character_config,
+                    avatar_model=context.avatar_model,
+                    tts_engine=context.get_current_tts_engine(),
+                    websocket_send=send,
+                    tts_manager=manager,
+                    translate_engine=context.translate_engine,
+                )
+                full_response += str(response_part or "")
+            else:
+                logger.warning(
+                    "Unexpected workspace agent stream item: {}", type(output_item)
+                )
+        await finalize_conversation_turn(manager, send, client_uid)
+
+        if full_response:
+            add_external = getattr(
+                context.agent_engine, "add_external_assistant_message", None
+            )
+            if callable(add_external):
+                add_external(full_response)
+            if context.history_uid:
+                store_message(
+                    conf_uid=context.character_config.conf_uid,
+                    history_uid=context.history_uid,
+                    role="ai",
+                    content=full_response,
+                    name=context.character_config.character_name,
+                )
+        return {"acted": acted, "response": full_response}
+    finally:
+        await cleanup_conversation(manager, f"workspace-{turn_id}")
 
 
 async def process_queued_user_inputs(

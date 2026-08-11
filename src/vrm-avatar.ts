@@ -314,7 +314,7 @@ export class VrmAvatar {
   private readonly gazeTarget = new THREE.Object3D();
   private readonly headWorldPosition = new THREE.Vector3();
   private readonly onStatus: (message: string, tone?: "loading" | "ready" | "error") => void;
-  private readonly onZoom: (label: string) => void;
+  private readonly onZoom: (percentage: number) => void;
   private vrm: VRM | null = null;
   private loadVersion = 0;
   private elapsed = 0;
@@ -347,7 +347,7 @@ export class VrmAvatar {
   constructor(
     canvas: HTMLCanvasElement,
     onStatus: (message: string, tone?: "loading" | "ready" | "error") => void,
-    onZoom: (label: string) => void,
+    onZoom: (percentage: number) => void,
   ) {
     this.canvas = canvas;
     this.onStatus = onStatus;
@@ -435,6 +435,14 @@ export class VrmAvatar {
       authors,
       mouthExpressions: mouthNames.filter((expression) => Boolean(expressionMap[expression])),
     };
+  }
+
+  setZoomPercentage(percentage: number) {
+    const nextZoom = clamp01(percentage / 100);
+    if (Math.abs(nextZoom - this.zoom) < 0.001) return;
+    this.zoom = nextZoom;
+    this.frameModel();
+    this.reportZoom();
   }
 
   private async loadWithCompatibleTextures(url: string) {
@@ -628,8 +636,7 @@ export class VrmAvatar {
   }
 
   private reportZoom() {
-    const framing = this.zoom < 0.18 ? "全身" : this.zoom > 0.86 ? "肩部以上" : "半身";
-    this.onZoom(`${framing} · 滚轮缩放`);
+    this.onZoom(Math.round(this.zoom * 100));
   }
 
   private render(time: number) {

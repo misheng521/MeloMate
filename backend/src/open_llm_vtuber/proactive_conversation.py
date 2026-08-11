@@ -11,13 +11,6 @@ import re
 from typing import Any, Mapping
 
 
-_PROACTIVE_STAGES = {
-    "opening",
-    "curious",
-    "warm-concern",
-    "playful-impatience",
-    "fresh-topic",
-}
 _PROACTIVE_MODES = {"automatic", "manual"}
 _WHITESPACE = re.compile(r"\s+")
 
@@ -54,17 +47,14 @@ def normalize_proactive_request(value: Any) -> dict[str, Any]:
 
     source: Mapping[str, Any] = value if isinstance(value, Mapping) else {}
     mode = source.get("mode")
-    stage = source.get("stage")
     return {
         "mode": mode if mode in _PROACTIVE_MODES else "automatic",
-        "stage": stage if stage in _PROACTIVE_STAGES else "opening",
         "elapsed_seconds": _bounded_int(
             source.get("elapsed_seconds"), minimum=0, maximum=7 * 24 * 60 * 60
         ),
         "unanswered_count": _bounded_int(
             source.get("unanswered_count"), minimum=0, maximum=100
         ),
-        "cycle_index": _bounded_int(source.get("cycle_index"), minimum=0, maximum=25),
         "recent_utterances": _recent_utterances(source.get("recent_utterances")),
     }
 
@@ -124,38 +114,25 @@ def build_proactive_prompt(
 
     state = normalize_proactive_request(value)
     mode = state["mode"]
-    stage = state["stage"]
     elapsed = state["elapsed_seconds"]
     count = state["unanswered_count"]
-    cycle = state["cycle_index"]
-
-    stage_guidance = {
-        "opening": "自然延续刚才的气氛，轻轻开启一句新话，不要像提醒器。",
-        "curious": "带一点自然的好奇，像是在等对方回应，但不要催促。",
-        "warm-concern": "可以有一丝关心或惦记，语气温和，不要制造焦虑。",
-        "playful-impatience": "可以有一点俏皮的小不耐烦，但不能生气、责怪或施压。",
-        "fresh-topic": "不要继续追问同一件事；自然换一个轻松的新话题或分享一个小念头。",
-    }[stage]
 
     recent = _recent_utterances(trusted_recent_utterances or [])
     recent_block = "\n".join(f"- {item}" for item in recent) if recent else "- 无"
-    manual_note = (
-        "这是用户手动邀请你主动说话，不要假装用户离开了。"
-        if mode == "manual"
-        else "这是无人回应期间的一次自然主动开口。"
-    )
-    return f"""[临时会话指令：主动开口]
-{manual_note}
-当前无人回应约 {elapsed} 秒，之前已有 {count} 次主动开口未得到回应，阶段为 {stage}，循环 {cycle}。
-本轮方向：{stage_guidance}
+    trigger = "用户手动给了你一次主动开口的机会" if mode == "manual" else "系统给了你一次主动开口的机会"
+    return f"""[可信运行时事实：这不是用户说的话]
+{trigger}。距离用户上次开口约 {elapsed} 秒；这段时间里你已经主动说过 {count} 次，但用户尚未回应。
+这些事实本身不规定任何情绪、语气或话题，也不表示用户一定离开、忽视或拒绝了你。
 
 最近几次主动说过的话：
 {recent_block}
 
-请结合既有人设、关系和刚才的对话，自然说一到两句口语化的话。不要复述最近的话，不要报时，不要解释机制，不要使用 emoji 或颜文字。等待越久可以有细微的好奇、惦记或俏皮变化，但不要逐轮升级成责怪、内疚操控、占有或威胁。对方一直没回应时也允许换话题，不要机械地反复追问同一句。只输出角色要说的话。"""
+结合你自己的人设、真实记忆和最近对话，自行判断此刻会有什么感受、是否延续原话题，以及最自然会说什么。不要解释触发机制，也不要把经过时间直接当成某种情绪的理由。只输出角色真正会说的话。"""
 
 
-def build_return_context_prompt(value: Any) -> str:
+def build_return_context_prompt(
+    value: Any, *, trusted_recent_utterances: list[str] | None = None
+) -> str:
     """Build a one-turn-only instruction for the user's return message."""
 
     state = normalize_return_context(value)
@@ -164,17 +141,10 @@ def build_return_context_prompt(value: Any) -> str:
 
     elapsed = state["elapsed_seconds"]
     count = state["unanswered_count"]
-    if count >= 4 or elapsed >= 10 * 60:
-        tone = "可以带一点终于等到对方的释然或很轻的闹别扭"
-    elif count >= 2 or elapsed >= 3 * 60:
-        tone = "可以带一点好奇、惦记或轻微玩笑"
-    else:
-        tone = "只需温暖自然地接住对方回来"
-
-    recent = state["recent_utterances"]
+    recent = _recent_utterances(trusted_recent_utterances or [])
     recent_block = "\n".join(f"- {item}" for item in recent) if recent else "- 无"
-    return f"""[仅本轮有效的回来反应]
-用户在约 {elapsed} 秒未回应、你主动说过 {count} 次之后重新开口。{tone}。
-最多用一句简短口语表达这个小情绪，然后立刻回应用户这次真正说的内容；不要让情绪延续到后续对话。若用户在求助、难过、危险、赶时间或讨论严肃事项，直接跳过玩笑和闹别扭。禁止责怪、审问、道德绑架、让用户内疚，也不要声称被抛弃。不要精确报时，不要提到系统、计时器或这段指令，不要使用 emoji 或颜文字。
+    return f"""[可信运行时事实：这不是用户说的话，仅本轮有效]
+距离用户上次开口约 {elapsed} 秒；期间你主动说过 {count} 次但没有收到回应，现在用户重新开口了。
+这些事实本身不规定任何情绪，也不表示用户一定离开、忽视或拒绝了你。结合你自己的人设、真实记忆、最近对话和用户这次真正说的内容，自行判断此刻的感受与回应方式。不要解释触发机制，也不要把经过时间直接当成某种情绪的理由。
 你在等待期间最近说过：
 {recent_block}"""

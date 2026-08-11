@@ -19,11 +19,8 @@ from .workspace_security import (
 
 
 ReadState = Callable[[str, str], Awaitable[str]]
-SendAction = Callable[
-    [str, str, dict[str, Any], int, str, int, str], Awaitable[str]
-]
 SendText = Callable[[str], Awaitable[None]]
-SpeakReply = Callable[[str, str, int], Awaitable[bool]]
+RunAgentTurn = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 STATE_DEBOUNCE_SECONDS = 0.12
 FAILURE_COOLDOWN_SECONDS = 10.0
@@ -187,19 +184,16 @@ class WorkspaceController:
         context: Any,
         send_text: SendText,
         read_state: ReadState | None = None,
-        send_action: SendAction | None = None,
-        speak_reply: SpeakReply | None = None,
+        run_agent_turn: RunAgentTurn | None = None,
         debounce_seconds: float = STATE_DEBOUNCE_SECONDS,
     ) -> None:
         self._context = context
         self._send_text = send_text
         self._read_state = read_state or self._default_read_state
-        self._send_action = send_action or self._default_send_action
-        self._speak_reply = speak_reply
+        self._run_agent_turn = run_agent_turn
         self._debounce_seconds = max(0.0, debounce_seconds)
         self._pending: dict[str, dict[str, Any]] = {}
         self._tasks: dict[str, asyncio.Task] = {}
-        self._speech_tasks: set[asyncio.Task] = set()
         self._status_tasks: set[asyncio.Task] = set()
         self._last_processed: dict[str, tuple[int, int, str]] = {}
         self._last_acted_version: dict[str, int] = {}
@@ -212,27 +206,6 @@ class WorkspaceController:
     async def _default_read_state(persona: str, page_id: str) -> str:
         return await asyncio.to_thread(
             workspace_core.read_workspace_state, persona, page_id
-        )
-
-    @staticmethod
-    async def _default_send_action(
-        persona: str,
-        action: str,
-        payload: dict[str, Any],
-        wait_ms: int,
-        page_id: str,
-        state_version: int,
-        action_id: str,
-    ) -> str:
-        return await asyncio.to_thread(
-            workspace_core.send_workspace_action,
-            persona,
-            action,
-            payload,
-            wait_ms,
-            page_id,
-            state_version,
-            action_id,
         )
 
     def submit(self, event: dict[str, Any]) -> None:
@@ -400,7 +373,6 @@ class WorkspaceController:
         authorized_task = session.active_task
         if authorized_task is None:
             return
-        authorization = (authorized_task.id, authorized_task.revision)
         self._set_awareness(
             {
                 **event,
@@ -424,102 +396,56 @@ class WorkspaceController:
             return
         self._decision_times.append(now)
 
-        try:
-            selected_id, comment = await self._choose_action(
-                persona, app_state, grants
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning(f"Workspace decision failed for {page_id}: {exc}")
-            await self._record_failure(page_id, event, "暂时无法决定下一步。")
-            return
-        grant = next((item for item in grants if item["id"] == selected_id), None)
-        if grant is None:
-            await self._record_failure(page_id, event, "没有选出有效的页面操作。")
+        if self._run_agent_turn is None:
             return
 
-        latest = _workspace_report(await self._read_state(persona, page_id))
-        if latest is None or _page_id(latest) != page_id or _state_version(latest) != version:
-            return
-        current_task = session.active_task
-        if (
-            current_task is None
-            or (current_task.id, current_task.revision) != authorization
-            or not session.page_action_authorized(persona, page_id)
-        ):
-            return
+        guidance = [
+            str(item.get("text") or "")[:600]
+            for item in session.trusted_guidance[-4:]
+            if (
+                isinstance(item, dict)
+                and item.get("text")
+                and item.get("task_id") == authorized_task.id
+                and item.get("persona") == authorized_task.persona
+            )
+        ]
         try:
-            result_text = await self._send_action(
-                persona,
-                grant["action"],
-                grant["payload"],
-                900,
-                page_id,
-                version,
-                grant["id"],
+            result = await self._run_agent_turn(
+                {
+                    "persona": persona,
+                    "page_id": page_id,
+                    "state_version": version,
+                    "app_state": app_state,
+                    "available_actions": grants,
+                    "user_goal": authorized_task.goal,
+                    "user_guidance": guidance,
+                }
             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning(f"Workspace action failed for {page_id}: {exc}")
-            await self._record_failure(page_id, event, "页面暂时无法执行当前操作。")
+            logger.warning(f"Workspace agent turn failed for {page_id}: {exc}")
+            await self._record_failure(page_id, event, "当前工作区回合没有完成。")
             return
-        try:
-            result = json.loads(result_text)
-        except (json.JSONDecodeError, TypeError):
-            result = {}
-        if not isinstance(result, dict) or result.get("confirmed") is not True:
-            if isinstance(result, dict) and result.get("stale") is True:
-                return
-            await self._record_failure(page_id, event, "页面没有确认当前操作。")
+        if not isinstance(result, dict) or result.get("acted") is not True:
+            await self._status(
+                "waiting",
+                page_id,
+                event,
+                str((result or {}).get("response") or "当前没有执行页面操作。"),
+            )
             return
 
         self._last_acted_version[page_id] = version
         self._failures[page_id] = 0
         self._cooldown_until.pop(page_id, None)
-        if not comment:
-            comment = (
-                "我这边完成了，轮到你。",
-                "这个操作我做好了，你继续。",
-                "我已经处理好了，看看接下来有什么变化。",
-                "我完成当前操作了，你来。",
-            )[version % 4]
         await self._status(
             "acted",
             page_id,
             event,
-            comment,
-            action=grant["action"],
+            str(result.get("response") or "已完成当前页面操作。"),
+            action="act_workspace_page",
         )
-        self._start_speech(comment, page_id, version)
-
-    def _start_speech(self, text: str, page_id: str, version: int) -> None:
-        if self._closed or self._speak_reply is None or not text:
-            return
-
-        async def speak() -> None:
-            try:
-                await self._speak_reply(text, page_id, version)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning(f"Workspace spoken reply failed for {page_id}: {exc}")
-
-        task = asyncio.create_task(speak())
-        self._speech_tasks.add(task)
-        task.add_done_callback(self._speech_tasks.discard)
-
-    async def _choose_action(
-        self,
-        persona: str,
-        app_state: Any,
-        grants: list[dict[str, Any]],
-    ) -> tuple[str, str]:
-        session = getattr(self._context, "workspace_agent", None)
-        if session is None:
-            return (str(grants[0]["id"]), "") if len(grants) == 1 else ("", "")
-        return await session.choose_page_action(persona, app_state, grants)
 
     async def _record_failure(
         self, page_id: str, event: dict[str, Any], message: str
@@ -557,11 +483,9 @@ class WorkspaceController:
         self._pending.clear()
         tasks = [
             *self._tasks.values(),
-            *self._speech_tasks,
             *self._status_tasks,
         ]
         self._tasks.clear()
-        self._speech_tasks.clear()
         self._status_tasks.clear()
         self._last_processed.clear()
         self._last_acted_version.clear()
@@ -578,21 +502,14 @@ class WorkspaceController:
             snapshots.clear()
 
     async def interrupt_speech(self) -> None:
-        """Stop workspace-owned speech without cancelling a pending page decision."""
-        tasks = list(self._speech_tasks)
-        self._speech_tasks.clear()
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        """Workspace speech now belongs to the shared conversation turn."""
+        return None
 
     async def wait_idle(self) -> None:
         """Wait until currently queued controller work is drained (primarily for tests)."""
-        while self._tasks or self._speech_tasks or self._status_tasks:
+        while self._tasks or self._status_tasks:
             await asyncio.gather(
                 *list(self._tasks.values()),
-                *list(self._speech_tasks),
                 *list(self._status_tasks),
                 return_exceptions=True,
             )

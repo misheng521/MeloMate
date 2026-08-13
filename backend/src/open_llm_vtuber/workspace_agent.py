@@ -12,6 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from .workspace_intent import (
+    WORKSPACE_ALWAYS_AVAILABLE_TOOLS,
     WORKSPACE_READ_TOOLS,
     WORKSPACE_SIDE_EFFECT_TOOLS,
     workspace_message_relevant,
@@ -136,7 +137,9 @@ class WorkspaceAgentSession:
             "workspace_persona": persona_name,
             "user_authorized_workspace_tools": frozenset(allowed),
             "available_workspace_tools": frozenset(
-                set(WORKSPACE_READ_TOOLS) | set(allowed)
+                set(WORKSPACE_READ_TOOLS)
+                | set(WORKSPACE_ALWAYS_AVAILABLE_TOOLS)
+                | set(allowed)
             ),
             "workspace_relevant": relevant,
             "workspace_task_id": self.active_task.id if self.active_task else "",

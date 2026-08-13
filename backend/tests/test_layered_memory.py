@@ -82,6 +82,20 @@ class LayeredMemoryTests(unittest.TestCase):
         self.assertEqual(core["character_self"]["preferences"], [])
         self.assertEqual(core["relationship"]["agreements"], [])
 
+    def test_old_question_fragment_name_is_ignored_when_loaded(self):
+        core_path = Path(self.temporary.name) / "persona" / history.CORE_MEMORY_FILE
+        raw = history.get_core_memory("persona")
+        raw["profile"]["preferred_name"] = "什么吗"
+        raw["profile"]["preferred_name_source"] = "user_explicit"
+        core_path.write_text(
+            json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        core = history.get_core_memory("persona")
+        self.assertEqual(core["profile"]["preferred_name"], "")
+        self.assertNotIn(
+            "用户希望被称为", history.get_core_memory_prompt("persona", "名字")
+        )
+
     def test_manual_json_string_is_hot_reloaded_with_highest_priority(self):
         core_path = Path(self.temporary.name) / "persona" / history.CORE_MEMORY_FILE
         raw = json.loads(core_path.read_text(encoding="utf-8"))
@@ -199,6 +213,55 @@ class LayeredMemoryTests(unittest.TestCase):
         prompt = history.get_core_memory_prompt("persona", "聊聊苹果")
         self.assertIn("苹果", prompt)
         self.assertNotIn("篮球", prompt)
+
+    def test_explicit_name_statements_update_preferred_name(self):
+        for message in (
+            "我叫源酱。",
+            "叫我源酱。",
+            "以后你叫我源酱。",
+            "你可以叫我源酱。",
+            "我的名字是源酱。",
+        ):
+            with self.subTest(message=message):
+                other = tempfile.TemporaryDirectory()
+                try:
+                    history.CHAT_HISTORY_DIR = Path(other.name)
+                    uid = history.create_new_history("name-test")
+                    history.store_message(
+                        "name-test", uid, "human", message
+                    )
+                    core = history.get_core_memory("name-test")
+                    self.assertEqual(core["profile"]["preferred_name"], "源酱")
+                    self.assertEqual(
+                        core["profile"]["preferred_name_source"],
+                        "user_explicit",
+                    )
+                finally:
+                    other.cleanup()
+                    history.CHAT_HISTORY_DIR = Path(self.temporary.name)
+
+    def test_name_questions_do_not_become_preferred_name(self):
+        for message in (
+            "知道我叫什么吗？",
+            "你到底知道我叫什么吗？",
+            "我叫什么？",
+            "我叫啥？",
+            "你叫我什么？",
+            "为什么叫我源酱？",
+        ):
+            with self.subTest(message=message):
+                other = tempfile.TemporaryDirectory()
+                try:
+                    history.CHAT_HISTORY_DIR = Path(other.name)
+                    uid = history.create_new_history("question-test")
+                    history.store_message(
+                        "question-test", uid, "human", message
+                    )
+                    core = history.get_core_memory("question-test")
+                    self.assertEqual(core["profile"]["preferred_name"], "")
+                finally:
+                    other.cleanup()
+                    history.CHAT_HISTORY_DIR = Path(self.temporary.name)
 
     def _store_character_review_window(
         self,

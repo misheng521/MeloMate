@@ -9,10 +9,13 @@ import test from "node:test";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-test("settings remain actionable while the backend reconnects", () => {
+test("settings load safely, then remain actionable while the backend reconnects", () => {
   const mainSource = readFileSync(resolve(projectRoot, "src", "main.ts"), "utf8");
+  const indexSource = readFileSync(resolve(projectRoot, "index.html"), "utf8");
 
-  assert.match(mainSource, /const shouldDisable = isSettingsReadOnly \|\| isApplyingSettings;/);
+  assert.match(mainSource, /const shouldDisable = isSettingsReadOnly \|\| isLoading;/);
+  assert.match(mainSource, /isAppInitializing\s*\?\s*applySettingsLoadingText/);
+  assert.match(indexSource, /id="applySettings"[^>]*disabled[^>]*aria-busy="true"[^>]*>正在加载中…<\/button>/);
   assert.match(mainSource, /async function waitForWebSocketReady\(/);
   assert.match(mainSource, /后端未连接，点击重试/);
 });

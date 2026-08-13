@@ -8,11 +8,15 @@ sys.path.insert(0, str(BACKEND_ROOT))
 
 from src.open_llm_vtuber.conversations.conversation_utils import (  # noqa: E402
     clean_response_fragment,
+    remove_stage_directions,
 )
 from src.open_llm_vtuber.utils.sentence_divider import (  # noqa: E402
     SentenceDivider,
     SentenceWithTags,
     segment_text_by_regex,
+)
+from src.open_llm_vtuber.utils.tts_preprocessor import (  # noqa: E402
+    filter_asterisks,
 )
 
 
@@ -21,6 +25,32 @@ class ResponseTextQualityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             clean_response_fragment("好呀😄，我下在这里😊。棋子是♟。"),
             "好呀，我下在这里。棋子是♟。",
+        )
+
+    def test_markdown_bold_names_keep_their_text(self):
+        self.assertEqual(
+            remove_stage_directions("我叫 **小可**，你是 **源酱**。"),
+            "我叫 小可，你是 源酱。",
+        )
+        self.assertEqual(
+            remove_stage_directions("我叫 ***小可***。"),
+            "我叫 小可。",
+        )
+
+    def test_single_asterisk_stage_direction_is_still_removed(self):
+        self.assertEqual(
+            remove_stage_directions("*轻轻笑了一下*我叫小可。"),
+            "我叫小可。",
+        )
+
+    def test_tts_speaks_markdown_bold_names_but_not_stage_directions(self):
+        self.assertEqual(
+            filter_asterisks("我叫 **小可**，你是 **源酱**。"),
+            "我叫 小可，你是 源酱。",
+        )
+        self.assertEqual(
+            filter_asterisks("*轻轻笑了一下*我叫小可。"),
+            "我叫小可。",
         )
 
     def test_numbered_items_decimals_and_abbreviations_do_not_split_early(self):

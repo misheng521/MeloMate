@@ -625,10 +625,10 @@ def _load_core_unlocked(safe_uid: str) -> dict:
     ):
         preferred_name = raw.get("nickname")
         if isinstance(preferred_name, str):
-            core["profile"]["preferred_name"] = _sanitize_memory_text(
-                preferred_name, 80
-            )
-            core["profile"]["preferred_name_source"] = "legacy"
+            clean_preferred_name = _sanitize_memory_text(preferred_name, 80)
+            if _is_plausible_preferred_name(clean_preferred_name):
+                core["profile"]["preferred_name"] = clean_preferred_name
+                core["profile"]["preferred_name_source"] = "legacy"
         for old_key, new_key in (
             ("likes", "likes"),
             ("dislikes", "dislikes"),
@@ -663,9 +663,9 @@ def _load_core_unlocked(safe_uid: str) -> dict:
     if isinstance(profile, dict):
         preferred_name = profile.get("preferred_name")
         if isinstance(preferred_name, str):
-            core["profile"]["preferred_name"] = _sanitize_memory_text(
-                preferred_name, 80
-            )
+            clean_preferred_name = _sanitize_memory_text(preferred_name, 80)
+            if _is_plausible_preferred_name(clean_preferred_name):
+                core["profile"]["preferred_name"] = clean_preferred_name
         preferred_name_source = profile.get("preferred_name_source")
         if preferred_name_source in _MEMORY_SOURCES:
             core["profile"]["preferred_name_source"] = preferred_name_source
@@ -901,6 +901,78 @@ def _is_stable_memory_value(value: object) -> bool:
     return not any(marker in clean for marker in unstable)
 
 
+def _is_plausible_preferred_name(value: object) -> bool:
+    """Reject question fragments and placeholders created by old name parsing."""
+    candidate = _normalize_item(value)
+    if not candidate or len(candidate) > 80:
+        return False
+    invalid_names = {
+        "你",
+        "我",
+        "他",
+        "她",
+        "它",
+        "大家",
+        "随便",
+        "都行",
+        "不知道",
+        "不记得",
+    }
+    question_words = (
+        "什么",
+        "啥",
+        "谁",
+        "哪个",
+        "哪一个",
+        "怎么叫",
+        "叫什么",
+    )
+    return (
+        candidate not in invalid_names
+        and not any(word in candidate for word in question_words)
+        and not candidate.startswith(("你", "不", "没"))
+        and not candidate.endswith(("吗", "嘛", "么"))
+    )
+
+
+_EXPLICIT_NAME_PATTERNS = (
+    re.compile(
+        r"(?:^|[，。！？；;,.!?\n])\s*"
+        r"(?:以后|之后|往后)\s*(?:你\s*)?"
+        r"(?:叫我|喊我|称呼我)(?:为|叫)?\s*[:：]?\s*"
+        r"(?P<name>[^，。！？；;,.!?\n]{1,20})"
+    ),
+    re.compile(
+        r"(?:^|[，。！？；;,.!?\n])\s*"
+        r"(?:你\s*(?:可以|就|还是)?\s*)?"
+        r"(?:请\s*)?(?:叫我|喊我|称呼我)(?:为|叫)?\s*[:：]?\s*"
+        r"(?P<name>[^，。！？；;,.!?\n]{1,20})"
+    ),
+    re.compile(
+        r"(?:^|[，。！？；;,.!?\n])\s*"
+        r"(?:我的名字(?:是|叫)|我叫)\s*[:：]?\s*"
+        r"(?P<name>[^，。！？；;,.!?\n]{1,20})"
+    ),
+)
+
+
+def _explicit_preferred_name(message: str) -> str:
+    """Extract only a direct self-introduction or an explicit form of address."""
+    text = unicodedata.normalize("NFKC", str(message or ""))
+    text = re.sub(r"[\t\r ]+", " ", text).strip()
+    if not text:
+        return ""
+
+    for pattern in _EXPLICIT_NAME_PATTERNS:
+        for match in pattern.finditer(text):
+            candidate = _normalize_item(match.group("name")).strip(
+                "\"'“”‘’「」『』【】[] "
+            )
+            if _is_plausible_preferred_name(candidate):
+                return candidate
+    return ""
+
+
 def _extract_core_updates(message: str) -> dict:
     text = _normalize_item(message)
     updates: dict[str, object] = {
@@ -914,14 +986,7 @@ def _extract_core_updates(message: str) -> dict:
     if not text:
         return updates
 
-    for pattern in (
-        r"(?:以后|之后|往后)(?:叫我|喊我|称呼我)(?:为|叫)?[:： ]*([^，。！？；;,.!?\n]{1,20})",
-        r"(?:我的名字是|我叫)[:： ]*([^，。！？；;,.!?\n]{1,20})",
-    ):
-        match = re.search(pattern, text)
-        if match:
-            updates["nickname"] = _normalize_item(match.group(1))
-            break
+    updates["nickname"] = _explicit_preferred_name(message)
 
     for target, pattern in (
         ("likes", r"我(?:很|最|特别|非常)?喜欢[:： ]*([^。！？；;\n]{1,80})"),

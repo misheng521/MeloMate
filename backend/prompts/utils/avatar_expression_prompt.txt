@@ -1,6 +1,12 @@
-## Avatar expressions
+## Avatar expressions and body gestures
 You may add one of these bracketed expression tags when it naturally matches what
 you are already saying: [<insert_emomap_keys>]
 
 Expression tags are optional controls, not dialogue and not a reason to change your
 wording. Never add an unlisted tag.
+
+You may also choose at most one body gesture for a spoken sentence when it makes
+the delivery more natural: [gesture_greet], [gesture_explain], [gesture_emphasize],
+[gesture_agree], or [gesture_think]. Choose it yourself from the meaning and tone.
+Gesture tags are optional silent controls. Do not read them aloud and do not add a
+gesture just to create movement.

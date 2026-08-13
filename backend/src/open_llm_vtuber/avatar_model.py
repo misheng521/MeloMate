@@ -7,6 +7,14 @@ from loguru import logger
 class AvatarModel:
     """Expression profile shared by the conversation pipeline and VRM frontend."""
 
+    gesture_map = {
+        "gesture_greet": "greet",
+        "gesture_explain": "explain",
+        "gesture_emphasize": "emphasize",
+        "gesture_agree": "agree",
+        "gesture_think": "think",
+    }
+
     def __init__(
         self,
         avatar_model_name: str,
@@ -80,9 +88,31 @@ class AvatarModel:
             index += 1
         return expression_list
 
+    def extract_gestures(self, text: str) -> list[str]:
+        """Return body-only gestures selected by the language model."""
+        lowered = text.lower()
+        return [
+            gesture
+            for tag, gesture in self.gesture_map.items()
+            if f"[{tag}]" in lowered
+        ]
+
     def remove_emotion_keywords(self, text: str) -> str:
         lowered = text.lower()
         for key in self.emo_map:
+            tag = f"[{key}]"
+            while tag in lowered:
+                start = lowered.find(tag)
+                end = start + len(tag)
+                text = text[:start] + text[end:]
+                lowered = lowered[:start] + lowered[end:]
+        return text
+
+    def remove_action_keywords(self, text: str) -> str:
+        """Remove non-spoken expression and gesture controls from a response."""
+        text = self.remove_emotion_keywords(text)
+        lowered = text.lower()
+        for key in self.gesture_map:
             tag = f"[{key}]"
             while tag in lowered:
                 start = lowered.find(tag)

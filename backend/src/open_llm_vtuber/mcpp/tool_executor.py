@@ -18,9 +18,20 @@ from ..workspace_security import (
     harden_workspace_tool_result,
 )
 from ..workspace_intent import WORKSPACE_SIDE_EFFECT_TOOLS
+from ..daily_tool_policy import (
+    DAILY_PERSONA_TOOLS,
+    DAILY_READ_TOOLS,
+    DAILY_SIDE_EFFECT_TOOLS,
+    DAILY_TOOL_NAMES,
+)
+from ..network_security import (
+    READ_ONLY_NETWORK_TOOLS,
+    harden_network_tool_result,
+)
 
 
 WORKSPACE_TOOL_NAMES = {
+    "create_workspace_artifact_bundle",
     "create_workspace_folder",
     "write_workspace_file",
     "append_workspace_file",
@@ -166,6 +177,10 @@ class ToolExecutor:
         )
         return is_error or result_error, hardened_content
 
+    @staticmethod
+    def harden_network_result(tool_name: str, text_content: str) -> str:
+        return harden_network_tool_result(tool_name, text_content)
+
     def apply_tool_policy(
         self,
         tool_name: str,
@@ -174,6 +189,26 @@ class ToolExecutor:
         consume: bool = False,
     ) -> tuple[Any, str | None]:
         """Enforce the current turn's server-owned workspace capability policy."""
+        if tool_name in DAILY_TOOL_NAMES and tool_policy is not None:
+            if not isinstance(tool_input, dict):
+                return tool_input, "TOOL_POLICY_DENIED: tool arguments must be an object."
+            if tool_name in DAILY_PERSONA_TOOLS:
+                expected_persona = str(tool_policy.get("workspace_persona") or "")
+                supplied_persona = str(tool_input.get("persona") or "")
+                if expected_persona and supplied_persona != expected_persona:
+                    return tool_input, (
+                        "TOOL_POLICY_DENIED: reminder tools may only access the "
+                        "current client persona."
+                    )
+            if (
+                tool_name in DAILY_SIDE_EFFECT_TOOLS
+                and tool_name
+                not in set(tool_policy.get("user_authorized_daily_tools") or ())
+            ):
+                return tool_input, (
+                    "TOOL_POLICY_DENIED: this reminder change was not authorized "
+                    "by the user's message for this turn."
+                )
         if tool_name in WORKSPACE_TOOL_NAMES and tool_policy is not None:
             if not isinstance(tool_input, dict):
                 return tool_input, "TOOL_POLICY_DENIED: tool arguments must be an object."
@@ -247,12 +282,14 @@ class ToolExecutor:
             )
         if not isinstance(tool_input, dict):
             return tool_input, "TOOL_POLICY_DENIED: tool arguments must be an object."
-        expected_persona = str(tool_policy.get("workspace_persona") or "")
-        supplied_persona = str(tool_input.get("persona") or "")
-        if not expected_persona or supplied_persona != expected_persona:
-            return tool_input, (
-                "TOOL_POLICY_DENIED: workspace events may only access their matching persona."
-            )
+        if tool_name in WORKSPACE_TOOL_NAMES or tool_name in DAILY_PERSONA_TOOLS:
+            expected_persona = str(tool_policy.get("workspace_persona") or "")
+            supplied_persona = str(tool_input.get("persona") or "")
+            if not expected_persona or supplied_persona != expected_persona:
+                return tool_input, (
+                    "TOOL_POLICY_DENIED: scoped tools may only access their "
+                    "matching persona."
+                )
         if tool_name == "read_workspace_state":
             normalized_input = {"persona": expected_persona}
             page_id = str(tool_input.get("page_id") or "").strip()[:128]
@@ -263,6 +300,39 @@ class ToolExecutor:
             )
         return tool_input, self._consume_tool_policy_call(
             tool_name, tool_policy, consume
+        )
+
+    @staticmethod
+    def _restrict_after_network_result(
+        tool_name: str,
+        tool_policy: Dict[str, Any] | None,
+    ) -> None:
+        """A webpage or search result can never authorize a follow-up mutation."""
+        if tool_policy is None or tool_name not in READ_ONLY_NETWORK_TOOLS:
+            return
+        preauthorized_daily = set(
+            tool_policy.get("user_authorized_daily_tools") or ()
+        )
+        preauthorized_workspace = set(
+            tool_policy.get("user_authorized_workspace_tools") or ()
+        )
+        allowed = frozenset(
+            set(READ_ONLY_NETWORK_TOOLS)
+            | set(DAILY_READ_TOOLS)
+            | preauthorized_daily
+            | {
+                name
+                for name in preauthorized_workspace
+                if name in WORKSPACE_SIDE_EFFECT_TOOLS
+            }
+        )
+        tool_policy.update(
+            {
+                "enforce": True,
+                "allowed_tool_names": allowed,
+                "remaining_tool_calls": {name: 16 for name in allowed},
+                "network_state_tainted": True,
+            }
         )
 
     @staticmethod
@@ -478,6 +548,7 @@ class ToolExecutor:
             self._restrict_after_workspace_state(
                 tool_name, tool_input, text_content, tool_policy
             )
+            self._restrict_after_network_result(tool_name, tool_policy)
 
             # Determine content for status update and LLM result format
             status_content = text_content  # Default to text content
@@ -523,6 +594,9 @@ class ToolExecutor:
 
             is_error, llm_formatted_content = self.harden_workspace_result(
                 tool_name, is_error, str(llm_formatted_content)
+            )
+            llm_formatted_content = self.harden_network_result(
+                tool_name, str(llm_formatted_content)
             )
             if llm_formatted_content != text_content:
                 text_content = str(llm_formatted_content)

@@ -121,6 +121,14 @@ WORKSPACE_READ_TOOLS = frozenset(
         "list_workspace_trash",
     }
 )
+WORKSPACE_ALWAYS_AVAILABLE_TOOLS = frozenset(
+    {
+        # This tool only creates a new uniquely named bundle and cannot overwrite
+        # an existing workspace item, so it is safe to expose as a general-purpose
+        # way for the agent to materialize useful intermediate work.
+        "create_workspace_artifact_bundle",
+    }
+)
 WORKSPACE_WRITE_TOOLS = frozenset(
     {
         "create_workspace_folder",

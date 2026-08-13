@@ -14,6 +14,7 @@ from .conversation_utils import (
     finalize_conversation_turn,
     cleanup_conversation,
     augment_text_with_screen_context,
+    describe_screen_image,
     with_turn_id,
     EMOJI_LIST,
 )
@@ -22,7 +23,11 @@ from .tts_manager import TTSTaskManager
 from ..chat_history_manager import store_message
 from ..proactive_conversation import build_return_context_prompt
 from ..service_context import ServiceContext
-from ..workspace_intent import workspace_live_page_relevant
+from ..workspace_intent import (
+    WORKSPACE_ALWAYS_AVAILABLE_TOOLS,
+    workspace_live_page_relevant,
+)
+from ..daily_tool_policy import daily_user_authorized_tools
 
 # Import necessary types from agent outputs
 from ..agent.output_types import SentenceOutput, AudioOutput
@@ -39,6 +44,7 @@ def _attach_live_workspace_context(
     persona = character.character_name or character.conf_name
     session = context.workspace_agent
     policy = session.begin_user_turn(input_text, persona)
+    policy["user_authorized_daily_tools"] = daily_user_authorized_tools(input_text)
     next_metadata["workspace_tool_policy"] = policy
     if workspace_live_page_relevant(
         input_text, policy.get("user_authorized_workspace_tools")
@@ -67,7 +73,12 @@ def _attach_live_workspace_context(
         input_text, policy.get("user_authorized_workspace_tools")
     ):
         next_metadata["workspace_awareness"] = awareness
-        allowed = frozenset(policy.get("available_workspace_tools") or ())
+        # Live page state is untrusted. It may inform read-only reasoning, but it
+        # must not unlock even the otherwise safe, non-overwriting artifact path.
+        allowed = frozenset(
+            set(policy.get("available_workspace_tools") or ())
+            - set(WORKSPACE_ALWAYS_AVAILABLE_TOOLS)
+        )
         policy.update(
             {
                 "enforce": True,
@@ -134,13 +145,14 @@ async def process_single_conversation(
             announced_transcription_ids=announced_transcription_ids,
         )
         metadata = dict(metadata or {})
+        proactive_screen_context = bool(
+            metadata.get("proactive_speak") and images and screen_vision
+        )
         augmented_input_text = await augment_text_with_screen_context(
             input_text,
             images,
             screen_vision,
-            force=bool(
-                metadata.get("proactive_speak") and images and screen_vision
-            ),
+            force=proactive_screen_context,
         )
         return_context = metadata.pop("proactive_return", None)
         trusted_return_utterances = (
@@ -183,6 +195,16 @@ async def process_single_conversation(
         metadata = _attach_live_workspace_context(
             context, input_text, metadata
         )
+
+        if images and screen_vision and not proactive_screen_context:
+            async def view_current_screen() -> Optional[str]:
+                return await describe_screen_image(
+                    images,
+                    screen_vision,
+                    user_question=input_text,
+                )
+
+            metadata["screen_vision_tool"] = view_current_screen
 
         # Create batch input
         batch_input = create_batch_input(
@@ -560,6 +582,7 @@ def is_workspace_tool_status(output_item: Dict[str, Any]) -> bool:
         "write_workspace_file",
         "append_workspace_file",
         "write_workspace_project",
+        "create_workspace_artifact_bundle",
         "read_workspace_file",
         "list_workspace",
         "replace_workspace_text",

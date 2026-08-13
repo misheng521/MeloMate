@@ -43,13 +43,21 @@ from ...workspace_security import (
     WORKSPACE_STATE_RESULT_SYSTEM_GUARD,
     sanitize_untrusted_value,
 )
+from ...network_security import NETWORK_RESULT_SYSTEM_GUARD
 from ...workspace_intent import (
+    WORKSPACE_ALWAYS_AVAILABLE_TOOLS,
     WORKSPACE_READ_TOOLS,
     workspace_user_authorized_tools,
+)
+from ...daily_tool_policy import (
+    DAILY_READ_TOOLS,
+    DAILY_TOOL_NAMES,
+    daily_user_authorized_tools,
 )
 
 
 WORKSPACE_TOOL_NAMES = {
+    "create_workspace_artifact_bundle",
     "create_workspace_folder",
     "write_workspace_file",
     "append_workspace_file",
@@ -89,6 +97,40 @@ MAX_TOOL_CALLS_PER_TURN = 16
 MAX_WORKSPACE_TOOL_CALLS_PER_TURN = 64
 TOOL_TURN_TIMEOUT_SECONDS = 600
 TOOL_LIMIT_MESSAGE = "这次工作量比较大，我已经保留了完成的部分，你说继续我就接着做。"
+SCREEN_VISION_TOOL_NAME = "view_current_screen"
+SCREEN_VISION_TOOL_DESCRIPTION = (
+    "查看用户当前共享屏幕的最新画面。仅当回答当前问题确实依赖画面中的"
+    "游戏状态、界面、窗口、网页、代码、报错或其他可见内容时调用。"
+    "不要因为用户在普通表达中说了‘看看’‘你看’或‘这个’就调用。"
+    "如果已有对话信息足以回答，不要调用。每轮最多调用一次。"
+)
+SCREEN_VISION_SYSTEM_GUIDANCE = (
+    "你可以按需调用 view_current_screen 查看当前共享屏幕。它是可选工具，不是每轮必用。"
+    "只有当当前回答需要实时视觉信息时才调用；普通聊天、观点判断、回忆和仅依赖用户文字"
+    "的问题不要调用。不要向用户解释工具选择过程。"
+)
+
+
+def _screen_vision_tool_schema(mode: str) -> Dict[str, Any]:
+    parameters = {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+    if mode == "Claude":
+        return {
+            "name": SCREEN_VISION_TOOL_NAME,
+            "description": SCREEN_VISION_TOOL_DESCRIPTION,
+            "input_schema": parameters,
+        }
+    return {
+        "type": "function",
+        "function": {
+            "name": SCREEN_VISION_TOOL_NAME,
+            "description": SCREEN_VISION_TOOL_DESCRIPTION,
+            "parameters": parameters,
+        },
+    }
 
 
 class BasicMemoryAgent(AgentInterface):
@@ -473,11 +515,20 @@ class BasicMemoryAgent(AgentInterface):
                 or tool_policy.get("user_authorized_workspace_tools")
                 or ()
             )
+            allowed_daily = set(DAILY_READ_TOOLS) | set(
+                tool_policy.get("user_authorized_daily_tools") or ()
+            )
             return [
                 tool
                 for tool in tools
-                if self._formatted_tool_name(tool, mode) not in WORKSPACE_TOOL_NAMES
-                or self._formatted_tool_name(tool, mode) in allowed_workspace
+                if (
+                    self._formatted_tool_name(tool, mode) not in WORKSPACE_TOOL_NAMES
+                    or self._formatted_tool_name(tool, mode) in allowed_workspace
+                )
+                and (
+                    self._formatted_tool_name(tool, mode) not in DAILY_TOOL_NAMES
+                    or self._formatted_tool_name(tool, mode) in allowed_daily
+                )
             ]
         return tools
 
@@ -489,7 +540,9 @@ class BasicMemoryAgent(AgentInterface):
             return system_prompt
         secured_prompt = system_prompt
         if tool_policy.get("workspace_state_tainted") is True:
-            return f"{secured_prompt}\n\n{WORKSPACE_STATE_RESULT_SYSTEM_GUARD}"
+            secured_prompt = f"{secured_prompt}\n\n{WORKSPACE_STATE_RESULT_SYSTEM_GUARD}"
+        if tool_policy.get("network_state_tainted") is True:
+            secured_prompt = f"{secured_prompt}\n\n{NETWORK_RESULT_SYSTEM_GUARD}"
         return secured_prompt
 
     @staticmethod
@@ -612,6 +665,7 @@ class BasicMemoryAgent(AgentInterface):
         max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
         max_tool_calls: int = MAX_TOOL_CALLS_PER_TURN,
         remember_turn: bool = True,
+        screen_vision_tool: Optional[Callable[[], Any]] = None,
     ) -> AsyncIterator[Union[str, Dict[str, Any]]]:
         """Handle Claude interaction loop with tool support."""
         messages = initial_messages.copy()
@@ -620,11 +674,19 @@ class BasicMemoryAgent(AgentInterface):
         current_assistant_message_content = []
         tool_rounds = 0
         total_tool_calls = 0
+        screen_vision_used = False
 
         while True:
             tools_for_api = self._filter_tools_for_policy(
                 tools, "Claude", tool_policy
             )
+            if screen_vision_used:
+                tools_for_api = [
+                    tool
+                    for tool in tools_for_api
+                    if self._formatted_tool_name(tool, "Claude")
+                    != SCREEN_VISION_TOOL_NAME
+                ]
             active_system_prompt = self._secure_system_prompt_for_policy(
                 system_prompt, tool_policy
             )
@@ -710,31 +772,56 @@ class BasicMemoryAgent(AgentInterface):
                     if assistant_text_for_memory and remember_turn:
                         self._add_message(assistant_text_for_memory, "assistant")
 
+                built_in_calls = [
+                    call
+                    for call in pending_tool_calls
+                    if str(call.get("name") or "") == SCREEN_VISION_TOOL_NAME
+                ]
+                external_calls = [
+                    call
+                    for call in pending_tool_calls
+                    if str(call.get("name") or "") != SCREEN_VISION_TOOL_NAME
+                ]
                 tool_results_for_llm = []
-                if not self._tool_executor:
+                for call in built_in_calls:
+                    if screen_vision_used:
+                        result = None
+                    else:
+                        screen_vision_used = True
+                        result = await screen_vision_tool() if screen_vision_tool else None
+                    tool_results_for_llm.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": call.get("id"),
+                            "content": result or "当前没有拿到可用的屏幕内容，请仅根据已有对话继续回答。",
+                            "is_error": not bool(result),
+                        }
+                    )
+                if external_calls and not self._tool_executor:
                     logger.error(
                         "Claude Tool interaction requested but ToolExecutor is not available."
                     )
                     yield "[Error: ToolExecutor not configured]"
                     return
 
-                tool_executor_iterator = self._tool_executor.execute_tools(
-                    tool_calls=pending_tool_calls,
-                    caller_mode="Claude",
-                    tool_policy=tool_policy,
-                )
-                try:
-                    while True:
-                        update = await anext(tool_executor_iterator)
-                        if update.get("type") == "final_tool_results":
-                            tool_results_for_llm = update.get("results", [])
-                            break
-                        else:
-                            yield update
-                except StopAsyncIteration:
-                    logger.warning(
-                        "Tool executor finished without final results marker."
+                if external_calls:
+                    tool_executor_iterator = self._tool_executor.execute_tools(
+                        tool_calls=external_calls,
+                        caller_mode="Claude",
+                        tool_policy=tool_policy,
                     )
+                    try:
+                        while True:
+                            update = await anext(tool_executor_iterator)
+                            if update.get("type") == "final_tool_results":
+                                tool_results_for_llm.extend(update.get("results", []))
+                                break
+                            else:
+                                yield update
+                    except StopAsyncIteration:
+                        logger.warning(
+                            "Tool executor finished without final results marker."
+                        )
 
                 if tool_results_for_llm:
                     messages.append({"role": "user", "content": tool_results_for_llm})
@@ -756,6 +843,7 @@ class BasicMemoryAgent(AgentInterface):
         max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
         max_tool_calls: int = MAX_TOOL_CALLS_PER_TURN,
         remember_turn: bool = True,
+        screen_vision_tool: Optional[Callable[[], Any]] = None,
     ) -> AsyncIterator[Union[str, Dict[str, Any]]]:
         """Handle OpenAI interaction with tool support."""
         messages = initial_messages.copy()
@@ -764,6 +852,7 @@ class BasicMemoryAgent(AgentInterface):
         current_system_prompt = system_prompt
         tool_rounds = 0
         total_tool_calls = 0
+        screen_vision_used = False
 
         while True:
             if self.prompt_mode_flag:
@@ -787,6 +876,13 @@ class BasicMemoryAgent(AgentInterface):
                 tools_for_api = self._filter_tools_for_policy(
                     tools, "OpenAI", tool_policy
                 )
+                if screen_vision_used:
+                    tools_for_api = [
+                        tool
+                        for tool in tools_for_api
+                        if self._formatted_tool_name(tool, "OpenAI")
+                        != SCREEN_VISION_TOOL_NAME
+                    ]
 
             stream = self._llm.chat_completion(
                 messages, current_system_prompt, tools=tools_for_api
@@ -932,31 +1028,55 @@ class BasicMemoryAgent(AgentInterface):
                 if current_turn_text and remember_turn:
                     self._add_message(current_turn_text, "assistant")
 
+                built_in_calls = [
+                    call
+                    for call in pending_tool_calls
+                    if self._tool_call_name(call) == SCREEN_VISION_TOOL_NAME
+                ]
+                external_calls = [
+                    call
+                    for call in pending_tool_calls
+                    if self._tool_call_name(call) != SCREEN_VISION_TOOL_NAME
+                ]
                 tool_results_for_llm = []
-                if not self._tool_executor:
+                for call in built_in_calls:
+                    if screen_vision_used:
+                        result = None
+                    else:
+                        screen_vision_used = True
+                        result = await screen_vision_tool() if screen_vision_tool else None
+                    tool_results_for_llm.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": result or "当前没有拿到可用的屏幕内容，请仅根据已有对话继续回答。",
+                        }
+                    )
+                if external_calls and not self._tool_executor:
                     logger.error(
                         "OpenAI Tool interaction requested but ToolExecutor/MCPClient is not available."
                     )
                     yield "[Error: ToolExecutor/MCPClient not configured for OpenAI mode]"
                     continue
 
-                tool_executor_iterator = self._tool_executor.execute_tools(
-                    tool_calls=pending_tool_calls,
-                    caller_mode="OpenAI",
-                    tool_policy=tool_policy,
-                )
-                try:
-                    while True:
-                        update = await anext(tool_executor_iterator)
-                        if update.get("type") == "final_tool_results":
-                            tool_results_for_llm = update.get("results", [])
-                            break
-                        else:
-                            yield update
-                except StopAsyncIteration:
-                    logger.warning(
-                        "OpenAI tool executor finished without final results marker."
+                if external_calls:
+                    tool_executor_iterator = self._tool_executor.execute_tools(
+                        tool_calls=external_calls,
+                        caller_mode="OpenAI",
+                        tool_policy=tool_policy,
                     )
+                    try:
+                        while True:
+                            update = await anext(tool_executor_iterator)
+                            if update.get("type") == "final_tool_results":
+                                tool_results_for_llm.extend(update.get("results", []))
+                                break
+                            else:
+                                yield update
+                    except StopAsyncIteration:
+                        logger.warning(
+                            "OpenAI tool executor finished without final results marker."
+                        )
 
                 if tool_results_for_llm:
                     messages.extend(tool_results_for_llm)
@@ -996,6 +1116,7 @@ class BasicMemoryAgent(AgentInterface):
                 tool_policy = provided_policy
             else:
                 authorized_workspace_tools = workspace_user_authorized_tools(user_text)
+                authorized_daily_tools = daily_user_authorized_tools(user_text)
                 tool_policy = {
                     "source": "user_turn",
                     "enforce": False,
@@ -1003,48 +1124,56 @@ class BasicMemoryAgent(AgentInterface):
                     "workspace_persona": str(metadata.get("workspace_persona") or ""),
                     "user_authorized_workspace_tools": authorized_workspace_tools,
                     "available_workspace_tools": frozenset(
-                        set(WORKSPACE_READ_TOOLS) | set(authorized_workspace_tools)
+                        set(WORKSPACE_READ_TOOLS)
+                        | set(WORKSPACE_ALWAYS_AVAILABLE_TOOLS)
+                        | set(authorized_workspace_tools)
                     ),
+                    "user_authorized_daily_tools": authorized_daily_tools,
                 }
             messages = self._to_messages(input_data, include_memory=True)
             tools = None
             tool_mode = None
-            llm_supports_native_tools = False
             remember_turn = not bool(
                 input_data.metadata and input_data.metadata.get("skip_memory", False)
             )
             system_prompt = self._system
             max_tool_rounds = DEFAULT_MAX_TOOL_ROUNDS
             max_tool_calls = MAX_TOOL_CALLS_PER_TURN
-            if self._use_mcpp and self._tool_manager:
-                tools = None
-                if isinstance(self._llm, ClaudeAsyncLLM):
-                    tool_mode = "Claude"
+            screen_vision_tool = metadata.get("screen_vision_tool")
+            if not callable(screen_vision_tool):
+                screen_vision_tool = None
+
+            if isinstance(self._llm, ClaudeAsyncLLM):
+                if self._use_mcpp and self._tool_manager:
                     tools = self._filter_tools_for_policy(
                         self._formatted_tools_claude, "Claude", tool_policy
                     )
-                    llm_supports_native_tools = True
-                elif isinstance(self._llm, OpenAICompatibleAsyncLLM):
-                    tool_mode = "OpenAI"
+                else:
+                    tools = []
+                if screen_vision_tool:
+                    tools.append(_screen_vision_tool_schema("Claude"))
+                if tools:
+                    tool_mode = "Claude"
+            elif isinstance(self._llm, OpenAICompatibleAsyncLLM):
+                if self._use_mcpp and self._tool_manager:
                     tools = self._filter_tools_for_policy(
                         self._formatted_tools_openai, "OpenAI", tool_policy
                     )
-                    llm_supports_native_tools = True
                 else:
-                    logger.warning(
-                        f"LLM type {type(self._llm)} not explicitly handled for tool mode determination."
-                    )
+                    tools = []
+                if screen_vision_tool:
+                    tools.append(_screen_vision_tool_schema("OpenAI"))
+                if tools:
+                    tool_mode = "OpenAI"
 
-                if llm_supports_native_tools and not tools:
-                    logger.warning(
-                        f"No tools available/formatted for '{tool_mode}' mode, despite MCP being enabled."
-                    )
+            if screen_vision_tool:
+                system_prompt = f"{system_prompt}\n\n{SCREEN_VISION_SYSTEM_GUIDANCE}"
 
             if set(tool_policy.get("user_authorized_workspace_tools") or ()) & WORKSPACE_WRITE_TOOL_NAMES:
                 max_tool_rounds = WORKSPACE_MAX_TOOL_ROUNDS
                 max_tool_calls = MAX_WORKSPACE_TOOL_CALLS_PER_TURN
 
-            if self._use_mcpp and tool_mode == "Claude":
+            if tool_mode == "Claude":
                 logger.debug(
                     f"Starting Claude tool interaction loop with {len(tools)} tools."
                 )
@@ -1058,13 +1187,14 @@ class BasicMemoryAgent(AgentInterface):
                             max_tool_rounds=max_tool_rounds,
                             max_tool_calls=max_tool_calls,
                             remember_turn=remember_turn,
+                            screen_vision_tool=screen_vision_tool,
                         ):
                             yield output
                 except TimeoutError:
                     logger.warning("Claude tool turn reached its time limit")
                     yield TOOL_LIMIT_MESSAGE
                 return
-            elif self._use_mcpp and tool_mode == "OpenAI":
+            elif tool_mode == "OpenAI":
                 logger.debug(
                     f"Starting OpenAI tool interaction loop with {len(tools)} tools."
                 )
@@ -1078,6 +1208,7 @@ class BasicMemoryAgent(AgentInterface):
                             max_tool_rounds=max_tool_rounds,
                             max_tool_calls=max_tool_calls,
                             remember_turn=remember_turn,
+                            screen_vision_tool=screen_vision_tool,
                         ):
                             yield output
                 except TimeoutError:

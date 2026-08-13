@@ -35,6 +35,8 @@ from .conversations.conversation_handler import (
 from .conversations.single_conversation import process_workspace_agent_turn
 from .workspace_controller import WorkspaceController
 from .workspace_security import normalize_workspace_event
+from . import reminder_store
+from .conversations.conversation_utils import speak_text_response
 from .secure_credentials import (
     CHAT_API_KEY,
     SCREEN_VISION_API_KEY,
@@ -190,6 +192,7 @@ class WebSocketHandler:
         self.voice_clone_reference_dirs: Dict[str, Path] = {}
         self.voice_clone_upload_times: Dict[str, deque[float]] = {}
         self.workspace_controllers: Dict[str, WorkspaceController] = {}
+        self.reminder_delivery_tasks: Dict[str, asyncio.Task] = {}
         self.credential_store = SecureCredentialStore()
         self.default_context_cache = default_context_cache
         self.received_data_buffers: Dict[str, np.ndarray] = {}
@@ -284,6 +287,11 @@ class WebSocketHandler:
 
             await self._send_initial_messages(
                 websocket, client_uid, session_service_context
+            )
+
+            self.reminder_delivery_tasks[client_uid] = asyncio.create_task(
+                self._deliver_reminders(websocket, client_uid),
+                name=f"reminders-{client_uid}",
             )
 
             logger.info(f"Connection established for client {client_uid}")
@@ -472,6 +480,13 @@ class WebSocketHandler:
         lock = self.conversation_locks.setdefault(client_uid, asyncio.Lock())
         context = None
         voice_clone_reference_dir = None
+        reminder_task = self.reminder_delivery_tasks.pop(client_uid, None)
+        if reminder_task:
+            reminder_task.cancel()
+            try:
+                await reminder_task
+            except asyncio.CancelledError:
+                pass
         async with lock:
             try:
                 workspace_controller = self.workspace_controllers.pop(
@@ -514,6 +529,90 @@ class WebSocketHandler:
             message_handler.cleanup_client(client_uid)
             if self.conversation_locks.get(client_uid) is lock:
                 self.conversation_locks.pop(client_uid, None)
+
+    async def _deliver_reminders(
+        self, websocket: WebSocket, client_uid: str
+    ) -> None:
+        """Speak due persistent reminders while this persona is connected."""
+        try:
+            while self.client_connections.get(client_uid) is websocket:
+                context = self.client_contexts.get(client_uid)
+                character = getattr(context, "character_config", None)
+                persona = str(
+                    getattr(character, "character_name", "")
+                    or getattr(character, "conf_name", "")
+                    or ""
+                )
+                active = self.current_conversation_tasks.get(client_uid)
+                if not persona or (active and not active.done()):
+                    await asyncio.sleep(1)
+                    continue
+
+                claimed = await asyncio.to_thread(
+                    reminder_store.claim_due_reminders, persona, 1
+                )
+                if not claimed:
+                    await asyncio.sleep(1)
+                    continue
+
+                for reminder in claimed:
+                    delivered = False
+                    delivery_task = None
+                    reminder_id = str(reminder.get("id") or "")
+                    claim_token = str(reminder.get("claim_token") or "")
+                    try:
+                        if self.client_connections.get(client_uid) is not websocket:
+                            break
+                        lock = self.conversation_locks.setdefault(
+                            client_uid, asyncio.Lock()
+                        )
+                        async with lock:
+                            active = self.current_conversation_tasks.get(client_uid)
+                            if active and not active.done():
+                                break
+                            delivery_task = asyncio.create_task(
+                                speak_text_response(
+                                    context=context,
+                                    websocket_send=websocket.send_text,
+                                    client_uid=client_uid,
+                                    text=f"提醒时间到了：{reminder.get('message', '')}",
+                                    turn_id=f"reminder-{reminder_id}",
+                                ),
+                                name=f"reminder-delivery-{reminder_id}",
+                            )
+                            self.current_conversation_tasks[client_uid] = delivery_task
+                        delivered = bool(await delivery_task)
+                    except asyncio.CancelledError:
+                        # A user turn may interrupt only the active reminder speech.
+                        # Keep the long-lived scheduler alive in that case; propagate
+                        # cancellation only when the scheduler itself is closing.
+                        current_task = asyncio.current_task()
+                        if current_task is not None and current_task.cancelling():
+                            raise
+                        # The normal conversation interrupt path cancelled this
+                        # speech intentionally. Mark it consumed so a reminder the
+                        # user already heard part of is not replayed on reconnect.
+                        delivered = delivery_task is not None
+                    except Exception as exc:
+                        logger.warning(
+                            f"Failed to deliver reminder {reminder_id}: {exc}"
+                        )
+                    finally:
+                        current = self.current_conversation_tasks.get(client_uid)
+                        if delivery_task is not None and current is delivery_task:
+                            self.current_conversation_tasks.pop(client_uid, None)
+                        await asyncio.to_thread(
+                            reminder_store.finish_delivery,
+                            reminder_id,
+                            claim_token,
+                            delivered,
+                        )
+                    if not delivered:
+                        break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"Reminder delivery loop stopped for {client_uid}: {exc}")
 
     @staticmethod
     def _remove_voice_clone_reference_dir(reference_dir: Path | None) -> None:

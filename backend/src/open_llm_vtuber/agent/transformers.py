@@ -88,6 +88,9 @@ def actions_extractor(avatar_model: AvatarModel):
                         expressions = avatar_model.extract_emotion(sentence.text)
                         if expressions:
                             actions.expressions = expressions
+                        gestures = avatar_model.extract_gestures(sentence.text)
+                        if gestures:
+                            actions.gestures = gestures
                     yield sentence, actions  # Yield the tuple
                 elif isinstance(item, dict):
                     # Pass through dictionaries

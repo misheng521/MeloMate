@@ -9,6 +9,11 @@
         "command": ".venv\\Scripts\\python.exe",
         "args": ["mcp_workspace.py"],
         "cwd": "."
+      },
+      "daily-tools": {
+        "command": ".venv\\Scripts\\python.exe",
+        "args": ["mcp_daily_tools.py"],
+        "cwd": "."
       }
     }
 }

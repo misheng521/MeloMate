@@ -9,11 +9,46 @@ import {
 
 const mouthNames = ["aa", "ih", "ou", "ee", "oh"] as const;
 const emotionNames = ["neutral", "happy", "angry", "sad", "relaxed", "surprised"] as const;
+const gestureNames = ["greet", "explain", "emphasize", "agree", "think"] as const;
 const analysisFrequencies = [300, 350, 500, 700, 850, 1000, 1200, 1900, 2400] as const;
 const targetFrameRate = 30;
 
 type MouthName = (typeof mouthNames)[number];
 type MouthWeights = Record<MouthName, number>;
+type GestureName = (typeof gestureNames)[number];
+
+type GesturePose = {
+  bodyLean: number;
+  bodyTurn: number;
+  bodyTilt: number;
+  headPitch: number;
+  headYaw: number;
+  headRoll: number;
+  leftShoulderX: number;
+  leftShoulderY: number;
+  leftShoulderZ: number;
+  rightShoulderX: number;
+  rightShoulderY: number;
+  rightShoulderZ: number;
+  leftUpperArmX: number;
+  leftUpperArmY: number;
+  leftUpperArmZ: number;
+  rightUpperArmX: number;
+  rightUpperArmY: number;
+  rightUpperArmZ: number;
+  leftLowerArmX: number;
+  leftLowerArmY: number;
+  leftLowerArmZ: number;
+  rightLowerArmX: number;
+  rightLowerArmY: number;
+  rightLowerArmZ: number;
+  leftHandX: number;
+  leftHandY: number;
+  leftHandZ: number;
+  rightHandX: number;
+  rightHandY: number;
+  rightHandZ: number;
+};
 
 type LipSyncFrame = {
   time: number;
@@ -64,6 +99,41 @@ function randomBetween(min: number, max: number) {
 
 function emptyMouthWeights(): MouthWeights {
   return { aa: 0, ih: 0, ou: 0, ee: 0, oh: 0 };
+}
+
+function emptyGesturePose(): GesturePose {
+  return {
+    bodyLean: 0,
+    bodyTurn: 0,
+    bodyTilt: 0,
+    headPitch: 0,
+    headYaw: 0,
+    headRoll: 0,
+    leftShoulderX: 0,
+    leftShoulderY: 0,
+    leftShoulderZ: 0,
+    rightShoulderX: 0,
+    rightShoulderY: 0,
+    rightShoulderZ: 0,
+    leftUpperArmX: 0,
+    leftUpperArmY: 0,
+    leftUpperArmZ: 0,
+    rightUpperArmX: 0,
+    rightUpperArmY: 0,
+    rightUpperArmZ: 0,
+    leftLowerArmX: 0,
+    leftLowerArmY: 0,
+    leftLowerArmZ: 0,
+    rightLowerArmX: 0,
+    rightLowerArmY: 0,
+    rightLowerArmZ: 0,
+    leftHandX: 0,
+    leftHandY: 0,
+    leftHandZ: 0,
+    rightHandX: 0,
+    rightHandY: 0,
+    rightHandZ: 0,
+  };
 }
 
 function decodeBase64(base64: string) {
@@ -342,6 +412,12 @@ export class VrmAvatar {
   private bodyTilt = 0;
   private speechEnergy = 0;
   private speechAccent = 0;
+  private activeGesture: GestureName | null = null;
+  private pendingGesture: GestureName | null = null;
+  private gestureStartedAt = -1;
+  private gestureDuration = 0;
+  private gestureIntensity = 0;
+  private nextAutoGestureAt = 0;
   private zoom = 0.68;
 
   constructor(
@@ -489,11 +565,18 @@ export class VrmAvatar {
     this.lipAudio = audio;
     this.lipTrack = track;
     this.setConversationState("speaking");
+    if (this.pendingGesture) {
+      this.beginGesture(this.pendingGesture, 1);
+      this.pendingGesture = null;
+    } else if (!this.activeGesture) {
+      this.nextAutoGestureAt = this.elapsed + randomBetween(0.75, 1.45);
+    }
   }
 
   stopLipSync() {
     this.lipAudio = null;
     this.lipTrack = null;
+    this.pendingGesture = null;
     mouthNames.forEach((name) => {
       this.mouthState[name] = 0;
       this.vrm?.expressionManager?.setValue(name, 0);
@@ -538,6 +621,15 @@ export class VrmAvatar {
     };
     this.emotionStrength = naturalStrength[name as (typeof emotionNames)[number]];
     this.emotionUntil = performance.now() + 4200;
+  }
+
+  setGesture(gestures?: string[], _spokenText = "") {
+    const selected = [...(gestures || [])]
+      .reverse()
+      .find((gesture) => gestureNames.includes(gesture.toLowerCase() as GestureName));
+    // Audio analysis happens after the websocket payload is received. Queue the
+    // semantic gesture so its attack lands on speech playback, not during prep.
+    this.pendingGesture = selected ? selected.toLowerCase() as GestureName : null;
   }
 
   resize() {
@@ -750,7 +842,124 @@ export class VrmAvatar {
     bone.node.quaternion.copy(bone.rest).multiply(this.rotation);
   }
 
+  private beginGesture(name: GestureName, intensity: number) {
+    const durations: Record<GestureName, number> = {
+      greet: 2.35,
+      explain: 2.8,
+      emphasize: 1.45,
+      agree: 1.25,
+      think: 2.7,
+    };
+    this.activeGesture = name;
+    this.gestureStartedAt = this.elapsed;
+    this.gestureDuration = durations[name] * randomBetween(0.92, 1.08);
+    this.gestureIntensity = clamp01(intensity);
+  }
+
+  private maybeStartAutonomousGesture() {
+    if (this.conversationState !== "speaking" || this.activeGesture) return;
+    if (this.elapsed < this.nextAutoGestureAt) return;
+    if (this.speechEnergy < 0.24) {
+      this.nextAutoGestureAt = this.elapsed + 0.4;
+      return;
+    }
+
+    const roll = Math.random();
+    const name: GestureName = roll < 0.52
+      ? "explain"
+      : roll < 0.82
+        ? "emphasize"
+        : "agree";
+    this.beginGesture(name, randomBetween(0.38, 0.52));
+  }
+
+  private gesturePose(): GesturePose {
+    const pose = emptyGesturePose();
+    if (!this.activeGesture || this.gestureStartedAt < 0 || this.gestureDuration <= 0) {
+      return pose;
+    }
+
+    const progress = (this.elapsed - this.gestureStartedAt) / this.gestureDuration;
+    if (progress >= 1) {
+      this.activeGesture = null;
+      this.gestureStartedAt = -1;
+      this.nextAutoGestureAt = this.elapsed + randomBetween(3.8, 6.4);
+      return pose;
+    }
+
+    const attack = THREE.MathUtils.smoothstep(progress, 0, 0.18);
+    const release = 1 - THREE.MathUtils.smoothstep(progress, 0.7, 1);
+    const weight = attack * release * this.gestureIntensity;
+    const phase = progress * Math.PI * 2;
+
+    if (this.activeGesture === "greet") {
+      const wave = Math.sin(phase * 3.2) * weight;
+      pose.bodyTurn = -0.018 * weight;
+      pose.headRoll = -0.018 * weight;
+      pose.rightShoulderZ = -0.08 * weight;
+      pose.rightUpperArmX = -0.1 * weight;
+      pose.rightUpperArmY = 0.16 * weight;
+      pose.rightUpperArmZ = -0.5 * weight;
+      pose.rightLowerArmY = 0.18 * weight;
+      pose.rightLowerArmZ = 0.48 * weight;
+      pose.rightHandX = -0.08 * weight;
+      pose.rightHandY = 0.08 * weight;
+      pose.rightHandZ = wave * 0.2;
+    } else if (this.activeGesture === "explain") {
+      const handLead = Math.sin(phase - 0.65) * 0.5 + 0.5;
+      pose.bodyLean = -0.012 * weight;
+      pose.bodyTurn = Math.sin(phase * 0.5) * 0.012 * weight;
+      pose.leftShoulderZ = 0.035 * weight;
+      pose.rightShoulderZ = -0.035 * weight;
+      pose.leftUpperArmX = 0.055 * weight;
+      pose.leftUpperArmY = -0.1 * weight;
+      pose.leftUpperArmZ = 0.24 * weight;
+      pose.rightUpperArmX = -0.055 * weight;
+      pose.rightUpperArmY = 0.1 * weight;
+      pose.rightUpperArmZ = -0.24 * weight;
+      pose.leftLowerArmY = -0.16 * weight;
+      pose.leftLowerArmZ = -0.08 * weight * handLead;
+      pose.rightLowerArmY = 0.16 * weight;
+      pose.rightLowerArmZ = 0.08 * weight * (1 - handLead);
+      pose.leftHandY = -0.08 * weight;
+      pose.leftHandZ = -0.06 * weight;
+      pose.rightHandY = 0.08 * weight;
+      pose.rightHandZ = 0.06 * weight;
+    } else if (this.activeGesture === "emphasize") {
+      const beat = Math.sin(Math.min(1, progress / 0.58) * Math.PI);
+      pose.bodyLean = 0.022 * weight * beat;
+      pose.headPitch = 0.026 * weight * beat;
+      pose.leftUpperArmZ = 0.15 * weight;
+      pose.rightUpperArmZ = -0.15 * weight;
+      pose.leftLowerArmY = -0.13 * weight;
+      pose.rightLowerArmY = 0.13 * weight;
+      pose.leftHandX = 0.07 * weight;
+      pose.rightHandX = -0.07 * weight;
+    } else if (this.activeGesture === "agree") {
+      const nod = Math.sin(progress * Math.PI * 4) * Math.sin(progress * Math.PI);
+      pose.headPitch = nod * 0.038 * this.gestureIntensity;
+      pose.bodyLean = 0.012 * weight;
+      pose.rightUpperArmZ = -0.1 * weight;
+      pose.rightLowerArmY = 0.1 * weight;
+    } else if (this.activeGesture === "think") {
+      pose.bodyTurn = 0.018 * weight;
+      pose.bodyTilt = 0.018 * weight;
+      pose.headYaw = 0.025 * weight;
+      pose.headRoll = 0.035 * weight;
+      pose.rightUpperArmX = -0.06 * weight;
+      pose.rightUpperArmY = 0.08 * weight;
+      pose.rightUpperArmZ = -0.16 * weight;
+      pose.rightLowerArmY = 0.18 * weight;
+      pose.rightLowerArmZ = 0.12 * weight;
+      pose.rightHandX = -0.07 * weight;
+    }
+
+    return pose;
+  }
+
   private updateBodyMotion(delta: number) {
+    this.maybeStartAutonomousGesture();
+    const gesture = this.gesturePose();
     const breath = Math.sin(this.elapsed * 1.36);
     const slowSway = Math.sin(this.elapsed * 0.31);
     const counterSway = Math.sin(this.elapsed * 0.43 + 1.1);
@@ -775,10 +984,17 @@ export class VrmAvatar {
 
     const nod = this.listeningNod();
     const speechBeat = speaking
-      ? (Math.sin(this.elapsed * 5.1) * 0.009 + Math.sin(this.elapsed * 8.3 + 0.7) * 0.004)
-        * this.speechEnergy
+      ? (Math.sin(this.elapsed * 4.7) * 0.016 + Math.sin(this.elapsed * 7.6 + 0.7) * 0.0065)
+        * (0.18 + this.speechEnergy * 0.92)
       : 0;
-    const accentNod = speaking ? this.speechAccent * 0.028 : 0;
+    const accentNod = speaking ? this.speechAccent * 0.044 : 0;
+    const speechTurn = speaking
+      ? Math.sin(this.elapsed * 0.72 + 0.45) * this.speechEnergy * 0.009
+      : 0;
+    const speechShoulder = speaking
+      ? (Math.sin(this.elapsed * 3.35 + 0.3) * this.speechEnergy * 0.007)
+        + this.speechAccent * 0.018
+      : 0;
     const emotionPitch = this.emotionName === "sad"
       ? 0.035 * this.emotionStrength
       : this.emotionName === "surprised"
@@ -795,73 +1011,95 @@ export class VrmAvatar {
     // Keep relaxed arms anchored to the torso. Audio envelopes change quickly and
     // look like tremors when applied to both arms, so speech motion stays above
     // the shoulders while the arms only inherit an almost imperceptible breath.
-    const armBreath = breath * 0.0012;
+    const armBreath = breath * 0.0018;
+    const speechLift = speaking ? this.speechEnergy * 0.03 + this.speechAccent * 0.068 : 0;
 
     this.setBoneRotation(
       VRMHumanBoneName.Hips,
-      this.bodyLean * 0.18,
-      this.bodyTurn * 0.35,
-      this.bodyTilt * 0.25 + slowSway * 0.003,
+      this.bodyLean * 0.18 + gesture.bodyLean * 0.2,
+      this.bodyTurn * 0.35 + gesture.bodyTurn * 0.3,
+      this.bodyTilt * 0.25 + slowSway * 0.003 + gesture.bodyTilt * 0.28,
     );
     this.setBoneRotation(
       VRMHumanBoneName.Spine,
-      breath * 0.004 + this.bodyLean * 0.28,
-      this.bodyTurn * 0.45,
-      this.bodyTilt * 0.42,
+      breath * 0.004 + this.bodyLean * 0.28 + speechBeat * 0.12 + gesture.bodyLean * 0.3,
+      this.bodyTurn * 0.45 + speechTurn * 0.35 + gesture.bodyTurn * 0.45,
+      this.bodyTilt * 0.42 + gesture.bodyTilt * 0.4,
     );
     this.setBoneRotation(
       VRMHumanBoneName.Chest,
-      breath * 0.009 + this.bodyLean * 0.34,
-      this.bodyTurn * 0.55,
-      this.bodyTilt * 0.5 + counterSway * 0.0025,
+      breath * 0.009 + this.bodyLean * 0.34 + speechBeat * 0.24 + gesture.bodyLean * 0.42,
+      this.bodyTurn * 0.55 + speechTurn * 0.55 + gesture.bodyTurn * 0.58,
+      this.bodyTilt * 0.5 + counterSway * 0.0025 + gesture.bodyTilt * 0.5,
     );
     this.setBoneRotation(
       VRMHumanBoneName.UpperChest,
-      breath * 0.006 + this.bodyLean * 0.2,
-      this.bodyTurn * 0.38,
-      this.bodyTilt * 0.3,
+      breath * 0.006 + this.bodyLean * 0.2 + speechBeat * 0.18 + gesture.bodyLean * 0.28,
+      this.bodyTurn * 0.38 + speechTurn * 0.42 + gesture.bodyTurn * 0.42,
+      this.bodyTilt * 0.3 + gesture.bodyTilt * 0.38,
     );
     this.setBoneRotation(
       VRMHumanBoneName.Neck,
-      -this.headGazePitch * 0.38 + nod * 0.28 + speechBeat * 0.22,
-      this.headGazeYaw * 0.34,
-      -this.headGazeYaw * 0.08 + emotionTilt * 0.35,
+      -this.headGazePitch * 0.38 + nod * 0.28 + speechBeat * 0.22 + gesture.headPitch * 0.35,
+      this.headGazeYaw * 0.34 + speechTurn * 0.4 + gesture.headYaw * 0.3,
+      -this.headGazeYaw * 0.08 + emotionTilt * 0.35 + gesture.headRoll * 0.28,
     );
     this.setBoneRotation(
       VRMHumanBoneName.Head,
-      -this.headGazePitch + nod + speechBeat + accentNod + emotionPitch,
-      this.headGazeYaw + (speaking ? Math.sin(this.elapsed * 0.53) * 0.004 : 0),
-      -this.headGazeYaw * 0.1 + emotionTilt + slowSway * 0.003,
+      -this.headGazePitch + nod + speechBeat + accentNod + emotionPitch + gesture.headPitch,
+      this.headGazeYaw + (speaking ? Math.sin(this.elapsed * 0.53) * 0.006 : 0)
+        + speechTurn + gesture.headYaw,
+      -this.headGazeYaw * 0.1 + emotionTilt + slowSway * 0.003 + gesture.headRoll,
     );
 
-    this.setBoneRotation(VRMHumanBoneName.LeftShoulder, 0, -0.025, -0.055 + armBreath);
-    this.setBoneRotation(VRMHumanBoneName.RightShoulder, 0, 0.025, 0.055 - armBreath);
+    this.setBoneRotation(
+      VRMHumanBoneName.LeftShoulder,
+      gesture.leftShoulderX,
+      -0.025 + gesture.leftShoulderY,
+      -0.055 + armBreath + speechShoulder + gesture.leftShoulderZ,
+    );
+    this.setBoneRotation(
+      VRMHumanBoneName.RightShoulder,
+      gesture.rightShoulderX,
+      0.025 + gesture.rightShoulderY,
+      0.055 - armBreath - speechShoulder * 0.62 + gesture.rightShoulderZ,
+    );
     this.setBoneRotation(
       VRMHumanBoneName.LeftUpperArm,
-      0.035,
-      -0.075,
-      -1.19 + armBreath,
+      0.035 + gesture.leftUpperArmX,
+      -0.075 + gesture.leftUpperArmY,
+      -1.19 + armBreath + speechLift + gesture.leftUpperArmZ,
     );
     this.setBoneRotation(
       VRMHumanBoneName.RightUpperArm,
-      -0.035,
-      0.075,
-      1.19 - armBreath,
+      -0.035 + gesture.rightUpperArmX,
+      0.075 + gesture.rightUpperArmY,
+      1.19 - armBreath - speechLift + gesture.rightUpperArmZ,
     );
     this.setBoneRotation(
       VRMHumanBoneName.LeftLowerArm,
-      -0.02,
-      -0.11,
-      -0.16,
+      -0.02 + gesture.leftLowerArmX,
+      -0.11 + gesture.leftLowerArmY,
+      -0.16 + gesture.leftLowerArmZ,
     );
     this.setBoneRotation(
       VRMHumanBoneName.RightLowerArm,
-      0.02,
-      0.11,
-      0.16,
+      0.02 + gesture.rightLowerArmX,
+      0.11 + gesture.rightLowerArmY,
+      0.16 + gesture.rightLowerArmZ,
     );
-    this.setBoneRotation(VRMHumanBoneName.LeftHand, 0.03, -0.015, -0.045);
-    this.setBoneRotation(VRMHumanBoneName.RightHand, -0.03, 0.015, 0.045);
+    this.setBoneRotation(
+      VRMHumanBoneName.LeftHand,
+      0.03 + gesture.leftHandX,
+      -0.015 + gesture.leftHandY,
+      -0.045 + gesture.leftHandZ,
+    );
+    this.setBoneRotation(
+      VRMHumanBoneName.RightHand,
+      -0.03 + gesture.rightHandX,
+      0.015 + gesture.rightHandY,
+      0.045 + gesture.rightHandZ,
+    );
   }
 
   private updateBlink() {

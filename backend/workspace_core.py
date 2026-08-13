@@ -283,6 +283,20 @@ def write_workspace_project(persona: str, folder: str, files: list[dict[str, Any
     )
 
 
+@_locked_workspace_mutation
+def create_workspace_artifact_bundle(
+    persona: str, title: str, files: list[dict[str, Any]]
+) -> str:
+    """Create a new, non-overwriting bundle for useful agent-produced work."""
+    clean_title = safe_name(str(title or "artifact"), "artifact")[:64]
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    for _ in range(8):
+        folder = f"artifacts/{stamp}-{clean_title}-{uuid4().hex[:8]}"
+        if not workspace_path(persona, folder).exists():
+            return write_workspace_project(persona, folder, files)
+    raise RuntimeError("Could not allocate a unique workspace artifact bundle.")
+
+
 def read_workspace_file(persona: str, path: str) -> str:
     target = workspace_path(persona, path)
     if not target.is_file():

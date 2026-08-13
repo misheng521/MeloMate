@@ -38,6 +38,19 @@ def write_workspace_project(persona: str, folder: str, files: list[dict]) -> str
 
 
 @mcp.tool()
+def create_workspace_artifact_bundle(
+    persona: str, title: str, files: list[dict]
+) -> str:
+    """Create a new uniquely named, non-overwriting workspace bundle when materializing useful work would help complete the user's goal. Decide freely whether that should be a draft, plan, data file, runnable prototype, integration package, or something else; do not call this merely to narrate an answer. files is a list like {"path":"README.md","content":"..."}."""
+    return safe_call(
+        workspace_core.create_workspace_artifact_bundle,
+        persona,
+        title,
+        files,
+    )
+
+
+@mcp.tool()
 def read_workspace_file(persona: str, path: str) -> str:
     """Read a UTF-8 text file from workspace/{persona}. Never read another persona's workspace."""
     return safe_call(workspace_core.read_workspace_file, persona, path)

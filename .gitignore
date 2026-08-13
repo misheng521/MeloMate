@@ -10,6 +10,7 @@ backend/.voice_clone_ready
 
 # Runtime state
 backend/cache/
+backend/reminders.sqlite3*
 backend/logs/
 backend/chat_history/
 # Per-persona conversation memory is editable local runtime data.  Keep only

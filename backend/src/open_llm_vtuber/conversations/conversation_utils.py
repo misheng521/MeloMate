@@ -85,55 +85,19 @@ def remove_game_control_narration(text: str) -> str:
 
 
 def remove_stage_directions(text: str) -> str:
-    """Remove parenthesized/asterisk action descriptions from visible chat text."""
+    """Remove stage directions without deleting Markdown-emphasized dialogue."""
     text = re.sub(r"（[^（）]*）", "", text)
     text = re.sub(r"\([^()]*\)", "", text)
-    text = re.sub(r"\*+[^*]*\*+", "", text)
+    # Models commonly emphasize names with Markdown (for example ``**小可**``).
+    # Two or more asterisks are formatting, so keep their contents.  A single
+    # pair remains the app's stage-direction convention and is removed.
+    text = re.sub(r"\*{2,}([^*\n]+?)\*{2,}", r"\1", text)
+    text = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", "", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
 def is_dot_only_fragment(text: str) -> bool:
     return bool(re.fullmatch(r"[\s.\u3002\u2026]+", text or ""))
-
-
-SCREEN_VISION_INTENT_PATTERN = re.compile(
-    r"(\u770b(\u4e00\u4e0b|\u4e0b|\u770b)?"
-    r"(\u8fd9\u4e2a|\u8fd9\u8fb9|\u8fd9\u91cc|\u5c4f\u5e55|\u753b\u9762|\u6e38\u620f|\u7a97\u53e3|\u7f51\u9875|\u4ee3\u7801|\u754c\u9762)|"
-    r"\u5e2e\u6211\u770b|\u5e2e\u5fd9\u770b|\u770b\u770b|\u7785\u7785|"
-    r"\u8bc6\u522b(\u4e00\u4e0b|\u4e0b)?(\u5c4f\u5e55|\u753b\u9762|\u56fe\u7247|\u8fd9\u4e2a)|"
-    r"\u5c4f\u5e55\u4e0a|\u753b\u9762\u91cc|\u6e38\u620f\u91cc|\u8fd9\u4e2a\u753b\u9762|\u5f53\u524d\u753b\u9762|"
-    r"current screen|look at|see this)",
-    re.IGNORECASE,
-)
-
-
-def wants_screen_vision(text: str) -> bool:
-    normalized = (text or "").strip().lower()
-    if not normalized:
-        return False
-
-    if SCREEN_VISION_INTENT_PATTERN.search(normalized):
-        return True
-
-    intent_keywords = (
-        "\u8bc6\u522b\u5c4f\u5e55",
-        "\u770b\u5c4f\u5e55",
-        "\u770b\u770b\u5c4f\u5e55",
-        "\u770b\u4e00\u4e0b\u5c4f\u5e55",
-        "\u770b\u753b\u9762",
-        "\u770b\u770b\u753b\u9762",
-        "\u770b\u6e38\u620f",
-        "\u770b\u770b\u6e38\u620f",
-        "\u770b\u8fd9\u4e2a",
-        "\u770b\u770b\u8fd9\u4e2a",
-        "\u770b\u8fd9\u91cc",
-        "\u5f53\u524d\u753b\u9762",
-        "\u5c4f\u5e55\u4e0a",
-        "current screen",
-        "look at my screen",
-        "see my screen",
-    )
-    return any(keyword in normalized for keyword in intent_keywords)
 
 
 SCREEN_VISION_PROMPT = (
@@ -151,21 +115,10 @@ SCREEN_CONTEXT_INSTRUCTION = (
     "\u8bf7\u7ed3\u5408\u7528\u6237\u7684\u8bdd\u548c\u5c4f\u5e55"
     "\u8bc6\u522b\u7ed3\u679c\u56de\u7b54\u3002"
 )
-SCREEN_VISION_FAILED_MESSAGE = (
-    "\u7528\u6237\u60f3\u8ba9\u4f60\u770b\u5c4f\u5e55\uff0c\u4f46"
-    "\u8fd9\u6b21\u5c4f\u5e55\u8bc6\u522b\u6ca1\u6709\u6210\u529f\u3002"
-    "\u8bf7\u76f4\u63a5\u544a\u8bc9\u7528\u6237\uff1a\u5df2\u89e6\u53d1"
-    "\u5c4f\u5e55\u8bc6\u522b\uff0c\u4f46\u6ca1\u62ff\u5230\u53ef\u7528"
-    "\u7684\u8bc6\u56fe\u7ed3\u679c\uff1b\u8ba9\u7528\u6237\u68c0\u67e5"
-    "\u8bc6\u56fe API \u5730\u5740\u3001\u8bc6\u56fe\u6a21\u578b\u662f"
-    "\u5426\u652f\u6301\u56fe\u7247\u3001API Key \u548c\u5c4f\u5e55"
-    "\u5171\u4eab\u6743\u9650\u3002\u4e0d\u8981\u518d\u8bf4\u4f60"
-    "\u6ca1\u6709\u88ab\u6388\u6743\u770b\u5c4f\u5e55\u3002"
-)
-
 async def describe_screen_image(
     images: Optional[List[Dict[str, Any]]],
     screen_vision: Optional[Dict[str, Any]],
+    user_question: str = "",
 ) -> Optional[str]:
     if not images or not screen_vision:
         return None
@@ -183,6 +136,11 @@ async def describe_screen_image(
         logger.warning("Screen vision skipped: missing image data")
         return None
 
+    question = re.sub(r"\s+", " ", str(user_question or "")).strip()[:1200]
+    prompt = SCREEN_VISION_PROMPT
+    if question:
+        prompt = f"{prompt}\n用户当前问题：{question}"
+
     payload = {
         "model": model,
         "max_tokens": 512,
@@ -190,7 +148,7 @@ async def describe_screen_image(
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": SCREEN_VISION_PROMPT},
+                    {"type": "text", "text": prompt},
                     {"type": "image_url", "image_url": {"url": image_url}},
                 ],
             }
@@ -251,18 +209,19 @@ async def augment_text_with_screen_context(
     *,
     force: bool = False,
 ) -> str:
-    if not force and not wants_screen_vision(input_text):
+    # Ordinary turns expose a model-controlled built-in screen tool instead.
+    # This path remains only for the existing forced proactive-speech behavior.
+    if not force:
         return input_text
 
-    if not images:
-        return f"{input_text}\n\n[{SCREEN_CONTEXT_LABEL}]\n{SCREEN_VISION_FAILED_MESSAGE}"
+    if not images or not screen_vision:
+        return input_text
 
-    if not screen_vision:
-        return f"{input_text}\n\n[{SCREEN_CONTEXT_LABEL}]\n{SCREEN_VISION_FAILED_MESSAGE}"
-
-    screen_description = await describe_screen_image(images, screen_vision)
+    screen_description = await describe_screen_image(
+        images, screen_vision, user_question=input_text
+    )
     if not screen_description:
-        return f"{input_text}\n\n[{SCREEN_CONTEXT_LABEL}]\n{SCREEN_VISION_FAILED_MESSAGE}"
+        return input_text
 
     return (
         f"{input_text}\n\n"
@@ -352,7 +311,8 @@ async def handle_sentence_output(
     async for display_text, tts_text, actions in output:
         logger.debug(f"Processing agent sentence (tts_chars={len(tts_text)})")
 
-        display_text.text = avatar_model.remove_emotion_keywords(display_text.text)
+        display_text.text = avatar_model.remove_action_keywords(display_text.text)
+        tts_text = avatar_model.remove_action_keywords(tts_text)
         display_text.text = remove_stage_directions(display_text.text)
         tts_text = remove_stage_directions(tts_text)
         display_text.text = clean_response_fragment(display_text.text)

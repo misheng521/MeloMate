@@ -174,7 +174,7 @@ def filter_angle_brackets(text: str) -> str:
 
 def filter_asterisks(text: str) -> str:
     """
-    Removes text enclosed within asterisks of any length (*, **, ***, etc.) from a string.
+    Remove single-asterisk stage directions while preserving Markdown emphasis.
 
     Args:
         text: The input string.
@@ -182,8 +182,13 @@ def filter_asterisks(text: str) -> str:
     Returns:
         The string with asterisk-enclosed text removed.
     """
-    # Handle asterisks of any length (*, **, ***, etc.)
-    filtered_text = re.sub(r"\*{1,}((?!\*).)*?\*{1,}", "", text)
+    # Double/triple asterisks are commonly used to emphasize names and other
+    # spoken words.  Strip only their markup.  A single pair remains the
+    # application's convention for an unspoken stage direction.
+    filtered_text = re.sub(r"\*{2,}([^*\n]+?)\*{2,}", r"\1", text)
+    filtered_text = re.sub(
+        r"(?<!\*)\*([^*\n]+?)\*(?!\*)", "", filtered_text
+    )
 
     # Clean up any extra spaces
     filtered_text = re.sub(r"\s+", " ", filtered_text).strip()

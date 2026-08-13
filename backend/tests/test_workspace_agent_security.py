@@ -86,6 +86,34 @@ class WorkspaceBoundaryTests(unittest.TestCase):
             workspace_user_authorized_tools("不要修改这个文件"),
         )
 
+    def test_general_artifact_bundle_is_available_without_guessing_task_keywords(self):
+        class Context:
+            pass
+
+        session = WorkspaceAgentSession(Context())
+        for request in (
+            "帮我处理一下这件事",
+            "把客厅空调打开",
+            "替我联系一下小王",
+            "看看你能不能自己想办法完成",
+        ):
+            with self.subTest(request=request):
+                policy = session.begin_user_turn(request, "XiaoKe")
+                self.assertIn(
+                    "create_workspace_artifact_bundle",
+                    policy["available_workspace_tools"],
+                )
+                self.assertNotIn(
+                    "write_workspace_file",
+                    policy["user_authorized_workspace_tools"],
+                )
+
+        stopped = session.begin_user_turn("停止当前任务", "XiaoKe")
+        self.assertNotIn(
+            "create_workspace_artifact_bundle",
+            stopped["available_workspace_tools"],
+        )
+
     def test_dense_grid_candidates_are_bounded_and_still_advertised(self):
         board = [[0 for _ in range(15)] for _ in range(15)]
         board[7][7] = "black"
@@ -611,6 +639,24 @@ class WorkspaceCoreFileTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "too many files"):
             workspace_core.write_workspace_project("XiaoKe", "project", files)
         self.assertFalse((self.root / "XiaoKe" / "project").exists())
+
+    def test_general_artifact_bundles_are_unique_and_do_not_overwrite(self):
+        files = [{"path": "README.md", "content": "ready for review"}]
+        first = json.loads(
+            workspace_core.create_workspace_artifact_bundle(
+                "XiaoKe", "capability", files
+            )
+        )
+        second = json.loads(
+            workspace_core.create_workspace_artifact_bundle(
+                "XiaoKe", "capability", files
+            )
+        )
+
+        self.assertNotEqual(first["branch"], second["branch"])
+        for result in (first, second):
+            target = self.root / result["paths"][0]
+            self.assertEqual(target.read_text(encoding="utf-8"), "ready for review")
 
     def test_checked_patch_rejects_a_stale_file_version(self):
         workspace_core.write_workspace_file(

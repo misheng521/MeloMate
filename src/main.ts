@@ -67,6 +67,7 @@ type WsMessage = {
   display_text?: DisplayText;
   actions?: {
     expressions?: Array<number | string>;
+    gestures?: string[];
   };
   conf_name?: string;
   character_name?: string;
@@ -234,7 +235,8 @@ const referenceAudioInput = document.querySelector<HTMLInputElement>("#reference
 const referenceAudioPlayer = document.querySelector<HTMLAudioElement>("#referenceAudioPlayer")!;
 const referenceAudioName = document.querySelector<HTMLSpanElement>("#referenceAudioName")!;
 const applySettings = document.querySelector<HTMLButtonElement>("#applySettings")!;
-const applySettingsDefaultText = applySettings.textContent?.trim() || "应用配置";
+const applySettingsDefaultText = "应用配置";
+const applySettingsLoadingText = "正在加载中…";
 const applySettingsOfflineText = "后端未连接，点击重试";
 const applySettingsApplyingText = "正在连接并应用…";
 const subtitle = document.querySelector<HTMLDivElement>("#subtitle")!;
@@ -269,10 +271,26 @@ function setAvatarStatus(message: string, tone: "loading" | "ready" | "error" = 
 }
 
 const avatarDriver = new VrmAvatar(avatarCanvas, setAvatarStatus, (percentage) => {
-  const value = String(percentage);
-  avatarZoomRange.value = value;
-  avatarZoomValue.value = `${value}%`;
+  avatarZoomRange.value = String(percentage);
+  avatarZoomValue.value = `${percentage}%`;
 });
+
+let avatarZoomPointerActive = false;
+let avatarZoomHideTimer = 0;
+
+function showAvatarZoomValue() {
+  if (avatarZoomHideTimer) window.clearTimeout(avatarZoomHideTimer);
+  avatarZoomHideTimer = 0;
+  avatarZoomValue.classList.add("visible");
+}
+
+function hideAvatarZoomValue(delay = 0) {
+  if (avatarZoomHideTimer) window.clearTimeout(avatarZoomHideTimer);
+  avatarZoomHideTimer = window.setTimeout(() => {
+    avatarZoomValue.classList.remove("visible");
+    avatarZoomHideTimer = 0;
+  }, delay);
+}
 
 type SinkAudioElement = HTMLAudioElement & {
   setSinkId?: (sinkId: string) => Promise<void>;
@@ -285,6 +303,7 @@ let isCapturing = false;
 let isCaptureStarting = false;
 let isWsReady = false;
 let isApplyingSettings = false;
+let isAppInitializing = true;
 let websocketReconnectTimer = 0;
 let websocketReconnectAttempt = 0;
 let pendingUserLine: HTMLParagraphElement | null = null;
@@ -476,7 +495,44 @@ function normalizeScreenVisionModel(value: string | undefined) {
   return value?.trim() || defaultScreenVisionModel;
 }
 
-function syncSecretToggle(input: HTMLInputElement, button: HTMLButtonElement) {
+const savedCredentialMask = "••••••••••••";
+
+function syncSecretField(
+  input: HTMLInputElement,
+  button: HTMLButtonElement,
+  savedAvailable: boolean,
+  emptyPlaceholder: string,
+) {
+  if (savedAvailable && !input.value) {
+    const statusVisible = button.dataset.savedStatusVisible === "true";
+    input.type = "password";
+    input.placeholder = statusVisible ? "已保存" : savedCredentialMask;
+    button.textContent = statusVisible ? "隐藏" : "显示";
+    button.setAttribute("aria-label", statusVisible ? "隐藏 API Key 保存状态" : "显示 API Key 保存状态");
+    return;
+  }
+
+  const wasShowingSavedStatus = button.dataset.savedStatusVisible === "true";
+  delete button.dataset.savedStatusVisible;
+  if (wasShowingSavedStatus) input.type = "password";
+  input.placeholder = emptyPlaceholder;
+  const isVisible = input.type === "text";
+  button.textContent = isVisible ? "隐藏" : "显示";
+  button.setAttribute("aria-label", isVisible ? "隐藏 API Key" : "显示 API Key");
+}
+
+function syncSecretToggle(
+  input: HTMLInputElement,
+  button: HTMLButtonElement,
+  savedAvailable: boolean,
+  emptyPlaceholder: string,
+) {
+  if (savedAvailable && !input.value) {
+    button.dataset.savedStatusVisible = String(button.dataset.savedStatusVisible !== "true");
+    syncSecretField(input, button, savedAvailable, emptyPlaceholder);
+    return;
+  }
+
   const shouldShow = input.type === "password";
   input.type = shouldShow ? "text" : "password";
   button.textContent = shouldShow ? "隐藏" : "显示";
@@ -484,12 +540,13 @@ function syncSecretToggle(input: HTMLInputElement, button: HTMLButtonElement) {
 }
 
 function syncCredentialUi() {
-  apiKeyInput.placeholder = savedChatApiKeyAvailable
-    ? "留空继续使用已保存的 Key"
-    : "请输入 API Key";
-  screenVisionApiKeyInput.placeholder = savedScreenVisionApiKeyAvailable
-    ? "留空继续使用已保存的 Key"
-    : "请输入识图 API Key";
+  syncSecretField(apiKeyInput, toggleApiKey, savedChatApiKeyAvailable, "请输入 API Key");
+  syncSecretField(
+    screenVisionApiKeyInput,
+    toggleScreenVisionApiKey,
+    savedScreenVisionApiKeyAvailable,
+    "请输入识图 API Key",
+  );
   clearApiKey.disabled = isSettingsReadOnly || !savedChatApiKeyAvailable;
   clearScreenVisionApiKey.disabled = isSettingsReadOnly || !savedScreenVisionApiKeyAvailable;
 }
@@ -1545,12 +1602,16 @@ function syncSettingsPanelMode() {
 
 function syncApplySettingsButtonState() {
   const isBackendLoading = !isWsReady;
-  const shouldDisable = isSettingsReadOnly || isApplyingSettings;
+  const isLoading = isAppInitializing || isApplyingSettings;
+  const shouldDisable = isSettingsReadOnly || isLoading;
   applySettings.disabled = shouldDisable;
   applySettings.setAttribute("aria-disabled", String(shouldDisable));
-  applySettings.classList.toggle("is-loading", isApplyingSettings);
-  applySettings.textContent = isApplyingSettings
-    ? applySettingsApplyingText
+  applySettings.setAttribute("aria-busy", String(isLoading));
+  applySettings.classList.toggle("is-loading", isLoading);
+  applySettings.textContent = isAppInitializing
+    ? applySettingsLoadingText
+    : isApplyingSettings
+      ? applySettingsApplyingText
     : isBackendLoading
       ? applySettingsOfflineText
       : applySettingsDefaultText;
@@ -2595,7 +2656,6 @@ function handleWsMessage(message: WsMessage) {
   if (message.type === "credential-status") {
     savedChatApiKeyAvailable = Boolean(message.chat_api_key_saved);
     savedScreenVisionApiKeyAvailable = Boolean(message.screen_vision_api_key_saved);
-    syncCredentialUi();
 
     if (message.success && message.chat_config_applied) {
       apiKeyInput.value = "";
@@ -2606,6 +2666,7 @@ function handleWsMessage(message: WsMessage) {
         persistSavedSettings();
       }
     }
+    syncCredentialUi();
 
     const pending = message.request_id
       ? pendingCredentialRequests.get(message.request_id)
@@ -2811,6 +2872,7 @@ function queueAudioMessage(message: WsMessage) {
 
       if (message.audio) {
         avatarDriver.setExpression(message.actions?.expressions);
+        avatarDriver.setGesture(message.actions?.gestures, text);
         await playBackendAudio(message.audio, queueVersion, text, turnId);
       }
     })
@@ -3498,10 +3560,19 @@ backgroundTab.addEventListener("click", () => setAssetPanelTab("background"));
 characterTab.addEventListener("click", () => setAssetPanelTab("character"));
 workspaceTab.addEventListener("click", () => setAssetPanelTab("workspace"));
 
-toggleApiKey.addEventListener("click", () => syncSecretToggle(apiKeyInput, toggleApiKey));
-toggleScreenVisionApiKey.addEventListener("click", () =>
-  syncSecretToggle(screenVisionApiKeyInput, toggleScreenVisionApiKey),
+toggleApiKey.addEventListener("click", () =>
+  syncSecretToggle(apiKeyInput, toggleApiKey, savedChatApiKeyAvailable, "请输入 API Key"),
 );
+toggleScreenVisionApiKey.addEventListener("click", () =>
+  syncSecretToggle(
+    screenVisionApiKeyInput,
+    toggleScreenVisionApiKey,
+    savedScreenVisionApiKeyAvailable,
+    "请输入识图 API Key",
+  ),
+);
+apiKeyInput.addEventListener("input", syncCredentialUi);
+screenVisionApiKeyInput.addEventListener("input", syncCredentialUi);
 clearApiKey.addEventListener("click", () => clearSavedCredential("chat"));
 clearScreenVisionApiKey.addEventListener("click", () => clearSavedCredential("screen_vision"));
 
@@ -3510,9 +3581,23 @@ volumeRange.addEventListener("input", () => {
   saveVolumeSetting();
 });
 volumeMuteToggle.addEventListener("click", toggleMuteVolume);
+avatarZoomRange.addEventListener("pointerdown", () => {
+  avatarZoomPointerActive = true;
+  showAvatarZoomValue();
+});
 avatarZoomRange.addEventListener("input", () => {
   avatarDriver.setZoomPercentage(Number(avatarZoomRange.value));
+  showAvatarZoomValue();
+  if (!avatarZoomPointerActive) hideAvatarZoomValue(700);
 });
+const finishAvatarZoomDrag = () => {
+  if (!avatarZoomPointerActive) return;
+  avatarZoomPointerActive = false;
+  hideAvatarZoomValue();
+};
+avatarZoomRange.addEventListener("pointerup", finishAvatarZoomDrag);
+avatarZoomRange.addEventListener("pointercancel", finishAvatarZoomDrag);
+avatarZoomRange.addEventListener("blur", finishAvatarZoomDrag);
 voiceChatOutputToggle.addEventListener("change", () => {
   if (voiceChatOutputToggle.checked) {
     void askToOpenVoicemeeter();
@@ -3600,22 +3685,27 @@ if (savedSettings) {
 }
 
 async function startup() {
-  openSettingsPanel();
-  connectWebSocket();
-  setAssetPanelTab(activeAssetPanelTab, false);
-  await setupBackgroundPicker();
-  vrmModelOptions = await readVrmModelOptions();
-  renderVrmModelOptions();
-  await purgeLegacyReferenceAudioStorage();
-  await refreshDevices();
-  setCaptureUi(false);
-  syncVolume(volumeNumber.value);
-  syncVoiceChatOutputHint();
-  syncScreenVisionControls();
-  syncProactiveSpeakControls();
-  syncProactiveSpeakButton();
-  restartProactiveSpeakLoop();
-  await bootVrmAvatar();
+  try {
+    openSettingsPanel();
+    connectWebSocket();
+    setAssetPanelTab(activeAssetPanelTab, false);
+    await setupBackgroundPicker();
+    vrmModelOptions = await readVrmModelOptions();
+    renderVrmModelOptions();
+    await purgeLegacyReferenceAudioStorage();
+    await refreshDevices();
+    setCaptureUi(false);
+    syncVolume(volumeNumber.value);
+    syncVoiceChatOutputHint();
+    syncScreenVisionControls();
+    syncProactiveSpeakControls();
+    syncProactiveSpeakButton();
+    restartProactiveSpeakLoop();
+    await bootVrmAvatar();
+  } finally {
+    isAppInitializing = false;
+    syncApplySettingsButtonState();
+  }
 }
 
 void startup();

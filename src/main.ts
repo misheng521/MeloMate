@@ -1,5 +1,6 @@
 import { VrmAvatar } from "./vrm-avatar";
 import "./styles.css";
+import { RuntimePanel } from "./runtime-panel";
 
 type LineRole = "user" | "assistant" | "system";
 
@@ -299,6 +300,7 @@ type SinkAudioElement = HTMLAudioElement & {
 let micStream: MediaStream | null = null;
 let vadInstance: MicVadInstance | null = null;
 let ws: WebSocket | null = null;
+const runtimePanel = new RuntimePanel(sendWs);
 let isCapturing = false;
 let isCaptureStarting = false;
 let isWsReady = false;
@@ -2653,6 +2655,7 @@ function cancelUserInputPriority() {
 }
 
 function handleWsMessage(message: WsMessage) {
+  if (runtimePanel.handle(message)) return;
   if (message.type === "credential-status") {
     savedChatApiKeyAvailable = Boolean(message.chat_api_key_saved);
     savedScreenVisionApiKeyAvailable = Boolean(message.screen_vision_api_key_saved);
@@ -2830,6 +2833,7 @@ function handleWsMessage(message: WsMessage) {
   }
 
   if (message.type === "set-model-and-conf") {
+    runtimePanel.connect(message.character_name || message.conf_name || "default");
     setCurrentAssistantName(message.character_name || message.conf_name);
     if (typeof message.capabilities?.voice_clone === "boolean") {
       updateVoiceCloneCapability(message.capabilities.voice_clone);

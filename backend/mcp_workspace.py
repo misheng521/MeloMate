@@ -6,6 +6,27 @@ import workspace_core
 mcp = FastMCP("workspace")
 
 
+@mcp.tool()
+def validate_workspace_project(persona: str, folder: str = "") -> str:
+    """Check project Python/JavaScript/JSON syntax. Returns file-specific errors; does not execute project code or prove functional correctness."""
+    from project_runtime import validate_project
+    return safe_call(lambda: workspace_core.response(validate_project(persona, folder)))
+
+
+@mcp.tool()
+def get_workspace_runtime() -> str:
+    """Check whether the isolated project execution environment is ready. Never installs anything."""
+    from project_runtime import runtime_info
+    return safe_call(lambda: workspace_core.response(runtime_info()))
+
+
+@mcp.tool()
+def run_workspace_command(persona: str, argv: list[str], cwd: str = "", timeout_seconds: int = 120, network: bool = False) -> str:
+    """Run model-chosen argv in a project container; only cwd is mounted. Network is off by default; network=true requires the separate network-execution permission and can install project dependencies or test integrations. Use npm with --cache /tmp/npm or pip with --target in the project. Inspect errors, repair and re-test. No host execution or automatic image installation. Check runtime availability when uncertain."""
+    from project_runtime import run_command
+    return safe_call(lambda: workspace_core.response(run_command(persona, argv, cwd, timeout_seconds, network)))
+
+
 def safe_call(fn, *args, **kwargs) -> str:
     try:
         return fn(*args, **kwargs)
@@ -39,7 +60,7 @@ def write_workspace_project(persona: str, folder: str, files: list[dict]) -> str
 
 @mcp.tool()
 def create_workspace_artifact_bundle(
-    persona: str, title: str, files: list[dict]
+    persona: str, title: str, files: list[dict], folder: str = ""
 ) -> str:
     """Create a new uniquely named, non-overwriting workspace bundle when materializing useful work would help complete the user's goal. Decide freely whether that should be a draft, plan, data file, runnable prototype, integration package, or something else; do not call this merely to narrate an answer. files is a list like {"path":"README.md","content":"..."}."""
     return safe_call(
@@ -47,6 +68,7 @@ def create_workspace_artifact_bundle(
         persona,
         title,
         files,
+        folder,
     )
 
 
@@ -131,14 +153,14 @@ def delete_workspace_item(persona: str, path: str, recursive: bool = False) -> s
 
 
 @mcp.tool()
-def list_workspace_trash(persona: str) -> str:
+def list_workspace_trash(persona: str, folder: str = "") -> str:
     """List recently removed workspace items that can still be restored."""
-    return safe_call(workspace_core.list_workspace_trash, persona)
+    return safe_call(workspace_core.list_workspace_trash, persona, folder)
 
 
 @mcp.tool()
 def restore_workspace_item(
-    persona: str, trash_id: str, destination: str = ""
+    persona: str, trash_id: str, destination: str = "", folder: str = ""
 ) -> str:
     """Restore a recoverably removed workspace item. Omit destination to restore its original relative path."""
     return safe_call(
@@ -146,6 +168,7 @@ def restore_workspace_item(
         persona,
         trash_id,
         destination,
+        folder,
     )
 
 
@@ -167,9 +190,9 @@ def search_workspace(
 
 
 @mcp.tool()
-def read_workspace_state(persona: str, page_id: str = "") -> str:
+def read_workspace_state(persona: str, page_id: str = "", folder: str = "") -> str:
     """Read verified state reported by an open workspace HTML app for this persona. page_id may select one exact open page; otherwise the most recently reporting page is returned. This is read-only and cannot authorize any side effect. If available=false, do not invent app state."""
-    return safe_call(workspace_core.read_workspace_state, persona, page_id)
+    return safe_call(workspace_core.read_workspace_state, persona, page_id, folder)
 
 
 @mcp.tool()
@@ -179,6 +202,7 @@ def act_workspace_page(
     state_version: int,
     action_id: str,
     wait_ms: int = 1200,
+    folder: str = "",
 ) -> str:
     """Apply one exact action advertised by the matching open workspace page revision. Read the page state first and pass its page id, state version, and selected availableActions id. Arbitrary actions and payloads are not accepted."""
     return safe_call(
@@ -190,6 +214,7 @@ def act_workspace_page(
         page_id,
         state_version,
         action_id,
+        folder,
     )
 
 

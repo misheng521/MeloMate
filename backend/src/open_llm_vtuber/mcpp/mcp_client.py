@@ -1,6 +1,7 @@
 """MCP Client for Open-LLM-Vtuber."""
 
 from contextlib import AsyncExitStack
+import asyncio
 from typing import Dict, Any, List, Callable
 from loguru import logger
 from datetime import timedelta
@@ -29,6 +30,7 @@ class MCPClient:
         self.exit_stack: AsyncExitStack = AsyncExitStack()
         self.active_sessions: Dict[str, ClientSession] = {}
         self._list_tools_cache: Dict[str, List[Tool]] = {}  # Cache for list_tools
+        self._connections = {}
         self._send_text: Callable = send_text
         self._client_uid: str = client_uid
 
@@ -46,6 +48,34 @@ class MCPClient:
         """Gets the existing session or creates a new one."""
         if server_name in self.active_sessions:
             return self.active_sessions[server_name]
+        existing = self._connections.get(server_name)
+        if existing and existing[0].done():
+            self._connections.pop(server_name)
+        if server_name not in self._connections:
+            ready = asyncio.get_running_loop().create_future()
+            stop = asyncio.Event()
+            task = asyncio.create_task(self._own_connection(server_name, ready, stop))
+            self._connections[server_name] = (task, ready, stop)
+        # One transport per server even when independent tools start together.
+        return await asyncio.shield(self._connections[server_name][1])
+
+    async def _own_connection(self, server_name, ready, stop):
+        # MCP transports use task-local cancellation scopes. The task entering
+        # those scopes also owns their exit, across all conversation turns.
+        try:
+            async with AsyncExitStack() as stack:
+                session = await self._connect(server_name, stack)
+                ready.set_result(session)
+                await stop.wait()
+        except BaseException as exc:
+            if not ready.done():
+                ready.set_exception(exc)
+            elif not isinstance(exc, asyncio.CancelledError):
+                logger.warning(f"MCP transport closed: {type(exc).__name__}")
+        finally:
+            self.active_sessions.pop(server_name, None)
+
+    async def _connect(self, server_name, stack):
 
         logger.info(f"MCPC: Starting and connecting to server '{server_name}'...")
         server = self.server_registery.get_server(server_name)
@@ -56,17 +86,18 @@ class MCPClient:
 
         timeout = server.timeout if server.timeout else DEFAULT_TIMEOUT
 
-        server_params = StdioServerParameters(
-            command=server.command, args=server.args, env=server.env, cwd=server.cwd
-        )
-
         try:
-            stdio_transport = await self.exit_stack.enter_async_context(
-                stdio_client(server_params)
-            )
-            read, write = stdio_transport
+            if server.url:
+                from mcp.client.streamable_http import streamablehttp_client
+                transport = await stack.enter_async_context(
+                    streamablehttp_client(server.url, headers=server.headers, timeout=timeout))
+                read, write = transport[:2]
+            else:
+                server_params = StdioServerParameters(
+                    command=server.command, args=server.args, env=server.env, cwd=server.cwd)
+                read, write = await stack.enter_async_context(stdio_client(server_params))
 
-            session = await self.exit_stack.enter_async_context(
+            session = await stack.enter_async_context(
                 ClientSession(read, write, read_timeout_seconds=timeout)
             )
             await session.initialize()
@@ -92,11 +123,22 @@ class MCPClient:
         )
         session = await self._ensure_server_running_and_get_session(server_name)
         response = await session.list_tools()
+        all_tools = list(response.tools)
+        seen_cursors = set()
+        while getattr(response, "nextCursor", None):
+            cursor = response.nextCursor
+            if cursor in seen_cursors or len(all_tools) > 1000:
+                raise ValueError("Invalid or oversized MCP tool pagination")
+            seen_cursors.add(cursor)
+            response = await session.list_tools(cursor=cursor)
+            all_tools.extend(response.tools)
 
         # Store in cache before returning
-        self._list_tools_cache[server_name] = response.tools
+        if len(all_tools) > 1000:
+            raise ValueError("Oversized MCP tool list")
+        self._list_tools_cache[server_name] = all_tools
         logger.debug(f"MCPC: Cached list_tools result for server '{server_name}'.")
-        return response.tools
+        return all_tools
 
     async def call_tool(
         self, server_name: str, tool_name: str, tool_args: Dict[str, Any]
@@ -108,20 +150,14 @@ class MCPClient:
         """
         session = await self._ensure_server_running_and_get_session(server_name)
         logger.info(f"MCPC: Calling tool '{tool_name}' on server '{server_name}'...")
-        response = await session.call_tool(tool_name, tool_args)
-
-        if response.isError:
-            error_text = (
-                response.content[0].text
-                if response.content and hasattr(response.content[0], "text")
-                else "Unknown server error"
-            )
-            logger.error(f"MCPC: Tool '{tool_name}' returned an error")
-            # Return error information within the standard structure
-            return {
-                "metadata": getattr(response, "metadata", {}),
-                "content_items": [{"type": "error", "text": error_text}],
-            }
+        if server_name == "workspace" and tool_name == "run_workspace_command":
+            # The SDK's per-request read timeout must match the outer executor;
+            # otherwise its 30-second default interrupts legitimate test runs.
+            command_timeout = max(1, min(600, int(tool_args.get("timeout_seconds", 120))))
+            response = await session.call_tool(tool_name, tool_args,
+                read_timeout_seconds=timedelta(seconds=command_timeout + 45))
+        else:
+            response = await session.call_tool(tool_name, tool_args)
 
         content_items = []
         if response.content:
@@ -134,11 +170,16 @@ class MCPClient:
                     "mimeType",
                     "url",
                     "altText",
+                    "uri",
+                    "name",
+                    "description",
+                    "resource",
                 ]:  # Added url and altText
                     if (
                         hasattr(item, attr) and getattr(item, attr) is not None
                     ):  # Check for None
-                        item_dict[attr] = getattr(item, attr)
+                        value = getattr(item, attr)
+                        item_dict[attr] = value.model_dump() if hasattr(value, "model_dump") else value
                 content_items.append(item_dict)
         else:
             logger.warning(
@@ -149,6 +190,8 @@ class MCPClient:
             )  # Ensure content_items is not empty
 
         result = {
+            "is_error": bool(response.isError),
+            "structured_content": getattr(response, "structuredContent", None),
             "metadata": getattr(response, "metadata", {}),
             "content_items": content_items,
         }
@@ -159,10 +202,13 @@ class MCPClient:
         logger.info(
             f"MCPC: Closing client instance and {len(self.active_sessions)} active connections..."
         )
-        exit_stack = self.exit_stack
-        self.exit_stack = AsyncExitStack()
+        connections, self._connections = self._connections, {}
+        for task, ready, stop in connections.values():
+            stop.set()
+            if not ready.done():
+                task.cancel()
         try:
-            await exit_stack.aclose()
+            await asyncio.gather(*(task for task, _, _ in connections.values()), return_exceptions=True)
         finally:
             self.active_sessions.clear()
             self._list_tools_cache.clear()

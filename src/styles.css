@@ -6,6 +6,11 @@
   background: #f7f5f2;
 }
 
+.runtime-plan { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.6; }
+.runtime-panel > details { margin: 12px 0; padding: 10px; border: 1px solid #ddd4ce; border-radius: 10px; }
+.runtime-panel > details button { margin: 4px 6px 4px 0; }
+.runtime-panel > details input[type="password"] { width: 100%; margin: 8px 0; }
+
 * {
   box-sizing: border-box;
 }
@@ -1103,3 +1108,11 @@ audio {
     border-left: 0;
   }
 }
+ .runtime-panel { margin: 12px 0; padding: 10px; border: 1px solid #8885; border-radius: 8px; }
+ .runtime-panel summary { cursor: pointer; font-weight: 600; }
+ .runtime-panel .field { margin: 8px 0; }
+ .runtime-panel button { margin: 5px; }
+ .runtime-log { max-height: 220px; overflow: auto; }
+ .runtime-log pre, .tool-approval pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+ .tool-approval { padding: 12px; border: 2px solid #9275cc; border-radius: 10px; background: var(--panel-bg, #252434); color: #fff; }
+ .tool-approval button { margin: 6px; padding: 6px 16px; cursor: pointer; }

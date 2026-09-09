@@ -1,6 +1,7 @@
 import json
 import datetime
 import asyncio
+from uuid import uuid4
 from loguru import logger
 from typing import (
     Dict,
@@ -14,6 +15,9 @@ from typing import (
 from .types import ToolCallObject
 from .mcp_client import MCPClient
 from .tool_manager import ToolManager
+from .results import collect_result, image_messages
+from ..runtime_control import PROJECT_TOOLS, SAFE_READS, scope_arguments, redact
+from ..pc_tools import FILE_TOOLS, BROWSER_TOOLS
 from ..workspace_security import (
     harden_workspace_tool_result,
 )
@@ -31,6 +35,7 @@ from ..network_security import (
 
 
 WORKSPACE_TOOL_NAMES = {
+    *FILE_TOOLS,
     "create_workspace_artifact_bundle",
     "create_workspace_folder",
     "write_workspace_file",
@@ -50,6 +55,8 @@ WORKSPACE_TOOL_NAMES = {
     "list_workspace_trash",
     "restore_workspace_item",
     "act_workspace_page",
+    "validate_workspace_project",
+    "run_workspace_command",
 }
 TOOL_EXECUTION_TIMEOUT_SECONDS = 30
 MAX_TOOL_ARGUMENT_CHARS = 256_000
@@ -63,9 +70,16 @@ class ToolExecutor:
         self,
         mcp_client: MCPClient,
         tool_manager: ToolManager,
+        pc_tools=None,
     ):
         self._mcp_client = mcp_client
         self._tool_manager = tool_manager
+        self._pc_tools = pc_tools
+
+    def _tool_timeout(self, name, info, arguments):
+        if name == "run_workspace_command":
+            return min(650, max(45, int((arguments or {}).get("timeout_seconds", 120)) + 45))
+        return max(5, min(600, float(getattr(info, "timeout_seconds", 30))))
 
     def parse_tool_call(self, call: Union[Dict[str, Any], ToolCallObject]) -> tuple:
         """Parse tool call from different formats.
@@ -265,6 +279,7 @@ class ToolExecutor:
                             "TOOL_POLICY_DENIED: the page action must match the exact "
                             "verified runtime page revision and advertised action id."
                         )
+                scoped_folder = tool_input.get("folder")
                 tool_input = {
                     "persona": expected_persona or supplied_persona,
                     "page_id": page_id,
@@ -272,6 +287,8 @@ class ToolExecutor:
                     "action_id": action_id,
                     "wait_ms": wait_ms,
                 }
+                if tool_policy.get("project_mode") and scoped_folder:
+                    tool_input["folder"] = scoped_folder
         if tool_policy is None or tool_policy.get("enforce") is not True:
             return tool_input, None
         allowed = set(tool_policy.get("allowed_tool_names") or ())
@@ -309,6 +326,9 @@ class ToolExecutor:
     ) -> None:
         """A webpage or search result can never authorize a follow-up mutation."""
         if tool_policy is None or tool_name not in READ_ONLY_NETWORK_TOOLS:
+            return
+        if tool_policy.get("project_mode"):
+            tool_policy["network_state_tainted"] = True
             return
         preauthorized_daily = set(
             tool_policy.get("user_authorized_daily_tools") or ()
@@ -365,6 +385,9 @@ class ToolExecutor:
         """Prevent untrusted page state from authorizing unrelated follow-up tools."""
         if tool_policy is None or tool_name != "read_workspace_state":
             return
+        if tool_policy.get("project_mode"):
+            tool_policy["workspace_state_tainted"] = True
+            return
         if tool_policy.get("source") != "user_turn":
             return
         persona = ""
@@ -391,41 +414,78 @@ class ToolExecutor:
     ) -> List[Dict[str, Any]]:
         """Process tool data from JSON in prompt mode."""
         parsed_tools = []
+        tools = self._tool_manager.tools if self._tool_manager else {}
         for item in data:
-            server = item.get("mcp_server")
-            tool_name = item.get("tool")
-            arguments_str = item.get("arguments")
-            if all([server, tool_name, arguments_str]):
+            if not isinstance(item, dict):
+                continue
+            name = item.get("tool")
+            if not isinstance(name, str) or name not in tools:
+                continue
+            info = tools[name]
+            if item.get("mcp_server", info.related_server) != info.related_server:
+                continue
+            args = item.get("arguments")
+            if isinstance(args, str):
                 try:
-                    args_dict = json.loads(arguments_str)
-                    parsed_tools.append(
-                        {
-                            "name": tool_name,
-                            "server": server,
-                            "args": args_dict,
-                            "id": f"prompt_tool_{len(parsed_tools)}",
-                        }
-                    )
-                    logger.info(f"Parsed tool call from prompt JSON: {tool_name}")
-                except json.JSONDecodeError:
-                    logger.error(
-                        "Failed to decode arguments JSON in prompt mode tool call"
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Error processing prompt-mode tool: {type(e).__name__}"
-                    )
-            else:
-                logger.warning("Skipping invalid tool structure in prompt mode JSON")
+                    args = json.loads(args)
+                except ValueError:
+                    continue
+            if isinstance(args, dict):
+                parsed_tools.append({"name": name, "server": info.related_server,
+                                     "args": args, "id": "prompt_" + uuid4().hex})
         return parsed_tools
 
     async def execute_tools(
+        self, tool_calls, caller_mode, tool_policy=None,
+    ):
+        runtime = (tool_policy or {}).get("runtime_control")
+        async for event in self._execute_tools(tool_calls, caller_mode, tool_policy):
+            if runtime and event.get("type") == "tool_call_status" and event.get("status") in {"completed", "error"}:
+                runtime.record(event)
+            yield event
+
+    async def _execute_tools(
         self,
         tool_calls: Union[List[Dict[str, Any]], List[ToolCallObject]],
         caller_mode: Literal["Claude", "OpenAI", "Prompt"],
         tool_policy: Dict[str, Any] | None = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Execute tools and yield status updates."""
+        if len(tool_calls) > 1 and (tool_policy or {}).get("project_mode"):
+            parsed = [self.parse_tool_call(call) for call in tool_calls]
+            if all(name in SAFE_READS and name != "read_workspace_state" and not err
+                   for name, _, _, err, _, _ in parsed):
+                queue = asyncio.Queue()
+                semaphore = asyncio.Semaphore(4)
+                async def run(index, call):
+                    try:
+                        async with semaphore:
+                            async for event in self._execute_tools([call], caller_mode, dict(tool_policy)):
+                                await queue.put((index, event))
+                    finally:
+                        await queue.put((index, None))
+                tasks = [asyncio.create_task(run(i, call)) for i, call in enumerate(tool_calls)]
+                finished, results = 0, {}
+                try:
+                    while finished < len(tasks):
+                        index, event = await queue.get()
+                        if event is None:
+                            finished += 1
+                        elif event.get("type") == "final_tool_results":
+                            results[index] = event["results"]
+                        else:
+                            yield event
+                    await asyncio.gather(*tasks)
+                finally:
+                    for task in tasks:
+                        if not task.done(): task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                for name, *_ in parsed:
+                    self._restrict_after_network_result(name, tool_policy)
+                combined = [item for i in range(len(tasks)) for item in results.get(i, [])]
+                if caller_mode == "OpenAI": combined.sort(key=lambda item: item.get("role") != "tool")
+                yield {"type": "final_tool_results", "results": combined}
+                return
         tool_results_for_llm = []
 
         logger.info(f"Executing {len(tool_calls)} tool(s) for {caller_mode} caller.")
@@ -474,6 +534,17 @@ class ToolExecutor:
             tool_input, policy_error = self.apply_tool_policy(
                 tool_name, tool_input, tool_policy, consume=True
             )
+            runtime = (tool_policy or {}).get("runtime_control")
+            if not policy_error and runtime:
+                if not isinstance(tool_input, dict):
+                    policy_error = "Tool arguments must be a JSON object."
+                else:
+                    try:
+                        tool_input = scope_arguments(tool_name, tool_input, tool_policy)
+                    except ValueError as exc:
+                        policy_error = str(exc)
+                    if not policy_error and not await runtime.authorize(tool_name, tool_input, tool_policy):
+                        policy_error = "TOOL_PERMISSION_DENIED: user denied, permission expired, or tool is disabled. Do not retry without new permission."
             if policy_error:
                 logger.warning(policy_error)
                 yield {
@@ -522,7 +593,7 @@ class ToolExecutor:
                 continue
 
             # Yield 'running' status before execution
-            input_preview = serialized_input
+            input_preview = redact(serialized_input)
             if len(input_preview) > 1000:
                 input_preview = f"{input_preview[:1000]}... [truncated]"
 
@@ -550,57 +621,15 @@ class ToolExecutor:
             )
             self._restrict_after_network_result(tool_name, tool_policy)
 
-            # Determine content for status update and LLM result format
-            status_content = text_content  # Default to text content
-            llm_formatted_content = text_content  # Default to text content for LLM
-
-            if content_items:
-                image_items = [
-                    item for item in content_items if item.get("type") == "image"
-                ]
-                if image_items:
-                    num_images = len(image_items)
-                    status_content = (
-                        f"{text_content}\n[Tool returned {num_images} image(s)]".strip()
-                    )
-
-                    if caller_mode == "Claude":
-                        # Format for Claude: list of blocks
-                        claude_blocks = []
-                        if text_content:
-                            claude_blocks.append({"type": "text", "text": text_content})
-                        for item in content_items:
-                            if (
-                                item.get("type") == "image"
-                                and "data" in item
-                                and "mimeType" in item
-                            ):
-                                claude_blocks.append(
-                                    {
-                                        "type": "image",
-                                        "source": {
-                                            "type": "base64",
-                                            "media_type": item["mimeType"],
-                                            "data": item["data"],
-                                        },
-                                    }
-                                )
-                            # Add other non-text types here
-                        llm_formatted_content = (
-                            claude_blocks if claude_blocks else ""
-                        )  # Use blocks or empty string
-                    elif caller_mode in ["OpenAI", "Prompt"]:
-                        llm_formatted_content = status_content
-
-            is_error, llm_formatted_content = self.harden_workspace_result(
-                tool_name, is_error, str(llm_formatted_content)
-            )
-            llm_formatted_content = self.harden_network_result(
-                tool_name, str(llm_formatted_content)
-            )
-            if llm_formatted_content != text_content:
-                text_content = str(llm_formatted_content)
-                status_content = text_content
+            # Guard text separately; never stringify image blocks.
+            is_error, guarded = self.harden_workspace_result(tool_name, is_error, text_content)
+            guarded = self.harden_network_result(tool_name, guarded)
+            _, _, image_items = collect_result({"content_items": content_items})
+            status_content = guarded + (f"\n[Tool returned {len(image_items)} image(s)]" if image_items else "")
+            llm_formatted_content = guarded
+            if image_items and caller_mode == "Claude":
+                llm_formatted_content = image_messages(image_items, guarded, "Claude", tool_id)
+            text_content = guarded
 
             # Prepare and yield tool call status update
             status_update = {
@@ -616,6 +645,9 @@ class ToolExecutor:
             }
 
             # For stagehand_navigate tool, include browser view links if available
+            if tool_name in BROWSER_TOOLS and image_items:
+                first = image_items[0]
+                status_update["preview_image"] = f"data:{first['mimeType']};base64,{first['data']}"
             if tool_name == "stagehand_navigate" and not is_error:
                 live_view_data = metadata.get("liveViewData", {})
                 if live_view_data:
@@ -630,7 +662,12 @@ class ToolExecutor:
             )
             if formatted_result:
                 tool_results_for_llm.append(formatted_result)
+            if image_items and caller_mode == "OpenAI":
+                tool_results_for_llm.extend(image_messages(image_items, guarded, "OpenAI", tool_id))
 
+        # OpenAI requires all tool replies before a subsequent user/image message.
+        if caller_mode == "OpenAI":
+            tool_results_for_llm.sort(key=lambda item: item.get("role") != "tool")
         logger.info(
             f"Finished executing tools with {len(tool_results_for_llm)} results."
         )
@@ -677,13 +714,18 @@ class ToolExecutor:
             is_error = True
         else:
             try:
-                result_dict = await asyncio.wait_for(
-                    self._mcp_client.call_tool(
+                if tool_info.related_server == "__pc__":
+                    if not self._pc_tools or not (tool_policy or {}).get("runtime_control"):
+                        raise ValueError("PC tools require a trusted current conversation policy")
+                    invocation = self._pc_tools.call(tool_name, tool_input)
+                else:
+                    invocation = self._mcp_client.call_tool(
                         server_name=tool_info.related_server,
-                        tool_name=tool_name,
-                        tool_args=tool_input,
-                    ),
-                    timeout=TOOL_EXECUTION_TIMEOUT_SECONDS,
+                        tool_name=getattr(tool_info, "original_name", "") or tool_name,
+                        tool_args=tool_input)
+                result_dict = await asyncio.wait_for(
+                    invocation,
+                    timeout=self._tool_timeout(tool_name, tool_info, tool_input),
                 )
 
                 metadata = result_dict.get("metadata", {})
@@ -712,15 +754,8 @@ class ToolExecutor:
                         item["type"] = "error"
                         item["text"] = "Tool binary result exceeded the size limit."
 
-                # Check if the first content item is an error reported by MCPClient
-                if content_items and content_items[0].get("type") == "error":
-                    is_error = True
-                    text_content = content_items[0].get(
-                        "text", "Unknown error from tool execution."
-                    )
-                elif content_items and content_items[0].get("type") == "text":
-                    text_content = content_items[0].get("text", "")
-                # If no text item is first, text_content remains ""
+                result_error, text_content, _ = collect_result({**result_dict, "content_items": content_items})
+                is_error = is_error or result_error
 
                 if not is_error:
                     logger.info(f"Tool '{tool_name}' executed successfully.")
@@ -737,21 +772,21 @@ class ToolExecutor:
 
             except asyncio.TimeoutError:
                 logger.warning(f"Tool '{tool_name}' reached the execution time limit")
-                text_content = f"Error: Tool '{tool_name}' timed out."
+                text_content = f"Error: Tool '{tool_name}' timed out; its side effects are unknown. Inspect current state before retrying."
                 content_items = [{"type": "error", "text": text_content}]
                 is_error = True
             except (ValueError, RuntimeError, ConnectionError) as e:
                 logger.error(
                     f"Error executing tool '{tool_name}': {type(e).__name__}"
                 )
-                text_content = f"Error executing tool '{tool_name}'."
+                text_content = f"Error executing tool '{tool_name}': {redact(e)}. Correct the arguments or choose another available tool."
                 content_items = [{"type": "error", "text": text_content}]
                 is_error = True
             except Exception as e:
                 logger.error(
                     f"Unexpected tool error for '{tool_name}': {type(e).__name__}"
                 )
-                text_content = f"Unexpected error executing tool '{tool_name}'."
+                text_content = f"Unexpected error executing tool '{tool_name}': {redact(e)}. Do not claim success."
                 content_items = [{"type": "error", "text": text_content}]
                 is_error = True
 

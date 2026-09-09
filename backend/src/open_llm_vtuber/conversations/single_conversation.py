@@ -43,10 +43,16 @@ def _attach_live_workspace_context(
     character = context.character_config
     persona = character.character_name or character.conf_name
     session = context.workspace_agent
-    policy = session.begin_user_turn(input_text, persona)
-    policy["user_authorized_daily_tools"] = daily_user_authorized_tools(input_text)
+    if next_metadata.get("skip_history"):
+        # A timer/proactive event is an observation, not fresh user authority.
+        policy = {"source": "proactive", "enforce": True,
+                  "allowed_tool_names": frozenset(), "workspace_persona": persona}
+    else:
+        policy = session.begin_user_turn(input_text, persona)
+    if not policy.get("project_mode"):
+        policy["user_authorized_daily_tools"] = daily_user_authorized_tools(input_text)
     next_metadata["workspace_tool_policy"] = policy
-    if workspace_live_page_relevant(
+    if not policy.get("project_mode") and workspace_live_page_relevant(
         input_text, policy.get("user_authorized_workspace_tools")
     ):
         try:
@@ -69,7 +75,7 @@ def _attach_live_workspace_context(
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pass
     awareness = session.awareness_for_turn(policy)
-    if awareness and workspace_live_page_relevant(
+    if awareness and not policy.get("project_mode") and workspace_live_page_relevant(
         input_text, policy.get("user_authorized_workspace_tools")
     ):
         next_metadata["workspace_awareness"] = awareness

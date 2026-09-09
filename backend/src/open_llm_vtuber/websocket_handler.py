@@ -170,6 +170,8 @@ class WSMessage(TypedDict, total=False):
     request_id: Optional[str]
     metadata: Optional[dict]
     event: Optional[dict]
+    settings: Optional[dict]
+    allow: Optional[bool]
 
 
 class WebSocketHandler:
@@ -261,7 +263,56 @@ class WebSocketHandler:
             "client-api-config": self._handle_client_api_config,
             "client-voice-clone-config": self._handle_client_voice_clone_config,
             "heartbeat": self._handle_heartbeat,
+            "runtime-settings": self._handle_runtime_settings,
+            "tool-approval-response": self._handle_tool_approval,
+            "pc-service-token": self._handle_pc_service_token,
         }
+
+    async def _handle_pc_service_token(self, websocket, client_uid, data):
+        context = self.client_contexts.get(client_uid)
+        if not context: return
+        try:
+            task = self.current_conversation_tasks.get(client_uid)
+            if task and not task.done(): raise ValueError("请先停止当前任务，再修改服务凭据。")
+            context.pc_tools.set_secret(str(data.get("service_id") or ""), str(data.get("secret") or ""), data.get("clear") is True)
+            await websocket.send_text(json.dumps({"type": "pc-service-token-result", "success": True, "message": "服务凭据已更新；明文不会返回聊天或保存到浏览器。"}, ensure_ascii=False))
+        except Exception:
+            await websocket.send_text(json.dumps({"type": "pc-service-token-result", "success": False, "message": "凭据保存失败。请确认服务已应用、当前没有任务运行，且 Windows 凭据存储组件可用。"}, ensure_ascii=False))
+
+    async def _handle_tool_approval(self, websocket, client_uid, data):
+        context = self.client_contexts.get(client_uid)
+        if context:
+            context.runtime_control.resolve(str(data.get("request_id") or ""), data.get("allow") is True)
+
+    async def _handle_runtime_settings(self, websocket, client_uid, data):
+        context = self.client_contexts.get(client_uid)
+        if not context:
+            return
+        runtime = context.runtime_control
+        runtime.send = websocket.send_text
+        try:
+            if isinstance(data.get("settings"), dict):
+                task = self.current_conversation_tasks.get(client_uid)
+                if task and not task.done():
+                    raise ValueError("请先停止当前任务，再修改项目或工具权限。")
+                runtime.configure(data["settings"])
+                await context.pc_tools.close()
+                runtime.load_progress(context.character_config.character_name or context.character_config.conf_name)
+                context.workspace_agent.reset()
+                llm = getattr(context.agent_engine, "_llm", None)
+                if llm:
+                    llm.temperature = runtime.settings["temperature"]
+                    llm.max_tokens = runtime.settings["max_tokens"]
+                if context.agent_engine:
+                    context.agent_engine._memory_model = runtime.settings["memory_model"]
+            tools = context.tool_manager.tools if context.tool_manager else {}
+            from .runtime_control import redact
+            await websocket.send_text(json.dumps({"type": "runtime-state", "success": True,
+                "settings": runtime.settings, "events": runtime.events, "plan": runtime.work_plan,
+                "tools": [{"name": name, "description": redact(info.description, 240),
+                           "permission": runtime.level(name)} for name, info in tools.items()]}, ensure_ascii=False))
+        except (ValueError, TypeError, OverflowError) as exc:
+            await websocket.send_text(json.dumps({"type": "runtime-state", "success": False, "message": str(exc)}, ensure_ascii=False))
 
     async def handle_new_connection(
         self, websocket: WebSocket, client_uid: str
@@ -312,6 +363,8 @@ class WebSocketHandler:
         """Store data owned by a connected client."""
         self.client_connections[client_uid] = websocket
         self.client_contexts[client_uid] = session_service_context
+        session_service_context.runtime_control.send = websocket.send_text
+        session_service_context.runtime_control.load_progress(session_service_context.character_config.character_name or session_service_context.character_config.conf_name)
         self.received_data_buffers[client_uid] = np.array([])
 
 
@@ -637,6 +690,9 @@ class WebSocketHandler:
         self, websocket: WebSocket, client_uid: str, data: WSMessage
     ) -> None:
         """Handle conversation interruption"""
+        context = self.client_contexts[client_uid]
+        context.runtime_control.cancel_pending()
+        context.workspace_agent.finish_task()
         lock = self.conversation_locks.setdefault(client_uid, asyncio.Lock())
         async with lock:
             controller = self.workspace_controllers.get(client_uid)

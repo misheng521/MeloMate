@@ -285,15 +285,15 @@ def write_workspace_project(persona: str, folder: str, files: list[dict[str, Any
 
 @_locked_workspace_mutation
 def create_workspace_artifact_bundle(
-    persona: str, title: str, files: list[dict[str, Any]]
+    persona: str, title: str, files: list[dict[str, Any]], folder: str = ""
 ) -> str:
     """Create a new, non-overwriting bundle for useful agent-produced work."""
     clean_title = safe_name(str(title or "artifact"), "artifact")[:64]
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     for _ in range(8):
-        folder = f"artifacts/{stamp}-{clean_title}-{uuid4().hex[:8]}"
-        if not workspace_path(persona, folder).exists():
-            return write_workspace_project(persona, folder, files)
+        bundle_folder = "/".join(filter(None, (folder, f"artifacts/{stamp}-{clean_title}-{uuid4().hex[:8]}")))
+        if not workspace_path(persona, bundle_folder).exists():
+            return write_workspace_project(persona, bundle_folder, files)
     raise RuntimeError("Could not allocate a unique workspace artifact bundle.")
 
 
@@ -621,7 +621,7 @@ def delete_workspace_item(
     )
 
 
-def list_workspace_trash(persona: str) -> str:
+def list_workspace_trash(persona: str, folder: str = "") -> str:
     _prune_trash(persona)
     entries: list[dict[str, Any]] = []
     for entry in reversed(_trash_entries(persona)):
@@ -632,9 +632,17 @@ def list_workspace_trash(persona: str) -> str:
             item = json.loads(metadata.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             continue
-        if isinstance(item, dict):
+        if isinstance(item, dict) and _recovery_in_folder(persona, item, folder):
             entries.append(item)
     return response({"ok": True, "persona": safe_name(persona), "entries": entries})
+
+
+def _recovery_in_folder(persona: str, item: dict, folder: str) -> bool:
+    if not folder:
+        return True
+    root = workspace_path(persona, folder)
+    original = workspace_path(persona, str(item.get("original_path") or ""))
+    return original == root or root in original.parents
 
 
 @_locked_workspace_mutation
@@ -642,6 +650,7 @@ def restore_workspace_item(
     persona: str,
     trash_id: str,
     destination: str = "",
+    folder: str = "",
 ) -> str:
     clean_id = str(trash_id or "").strip()
     if not re.fullmatch(r"[0-9]{10,16}-[0-9a-f]{32}", clean_id):
@@ -660,8 +669,14 @@ def restore_workspace_item(
         raise ValueError("recoverable workspace metadata is invalid.") from exc
     if not isinstance(metadata, dict) or metadata.get("id") != clean_id:
         raise ValueError("recoverable workspace metadata is invalid.")
+    if not _recovery_in_folder(persona, metadata, folder):
+        raise ValueError("Recovered item is outside the selected project.")
     restore_path = str(destination or metadata.get("original_path") or "")
     target = workspace_path(persona, restore_path)
+    if folder:
+        scope = workspace_path(persona, folder)
+        if target != scope and scope not in target.parents:
+            raise ValueError("Restore destination is outside the selected project.")
     if target.exists():
         raise FileExistsError("workspace restore destination already exists.")
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1058,9 +1073,12 @@ def send_workspace_action(
     expected_page_id: str = "",
     expected_state_version: int | None = None,
     action_id: str = "",
+    folder: str = "",
 ) -> str:
     """Serialize commands per page and revalidate inside the critical section."""
     with _workspace_action_lock(persona, expected_page_id):
+        if folder:
+            _check_page_folder(persona, read_workspace_state_file(persona, expected_page_id), folder)
         return _send_workspace_action_unlocked(
             persona,
             action,
@@ -1072,8 +1090,22 @@ def send_workspace_action(
         )
 
 
-def read_workspace_state(persona: str, page_id: str = "") -> str:
+def _check_page_folder(persona: str, state: dict | None, folder: str) -> None:
+    if not folder or state is None:
+        return
+    report = state.get("state") or {}
+    path = (report.get("page") or {}).get("path")
+    if not isinstance(path, str) or not path:
+        raise ValueError("The page has no verified project path. Open a page from the selected project.")
+    scope = workspace_path(persona, folder)
+    target = workspace_path(persona, path)
+    if target != scope and scope not in target.parents:
+        raise ValueError("This page is outside the selected project. Open a page from that project.")
+
+
+def read_workspace_state(persona: str, page_id: str = "", folder: str = "") -> str:
     state = read_workspace_state_file(persona, page_id)
+    _check_page_folder(persona, state, folder)
     if state is None:
         return response(
             {

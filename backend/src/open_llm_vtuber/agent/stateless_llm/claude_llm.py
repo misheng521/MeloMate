@@ -30,6 +30,8 @@ class AsyncLLM(StatelessLLMInterface):
             system (str): System prompt
         """
         self.model = model
+        self.max_tokens = 8192
+        self.temperature = 0.7
         self.system = system
         self.llm_api_key = llm_api_key or "melomate-placeholder-key"
 
@@ -126,7 +128,8 @@ class AsyncLLM(StatelessLLMInterface):
                 messages=converted_messages,
                 system=system if system else (self.system if self.system else ""),
                 model=self.model,
-                max_tokens=8192,
+                max_tokens=self.max_tokens,
+                temperature=min(1.0, self.temperature),
                 tools=tools if tools else NOT_GIVEN,
             ) as stream:
                 current_tool_call_info = None

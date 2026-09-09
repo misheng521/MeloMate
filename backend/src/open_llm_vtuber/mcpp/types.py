@@ -17,12 +17,14 @@ class MCPServer:
     """
 
     name: str
-    command: str
+    command: str = ""
     args: list[str] = field(default_factory=list)
     env: Optional[dict[str, str]] = None
     cwd: str | None = None
     timeout: Optional[timedelta] = timedelta(seconds=30)
     description: str = "No description available."
+    url: str = ""
+    headers: Optional[dict[str, str]] = None
 
 
 @dataclass
@@ -40,6 +42,8 @@ class FormattedTool:
     related_server: str
     generic_schema: Optional[dict[str, Any]] = None
     description: str = "No description available."
+    original_name: str = ""
+    timeout_seconds: float = 30
 
 
 @dataclass

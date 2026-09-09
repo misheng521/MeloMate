@@ -70,6 +70,25 @@ class WorkspaceAgentSession:
 
     def begin_user_turn(self, user_text: str, persona: str) -> dict[str, Any]:
         """Create an immutable policy from trusted user text before any page read."""
+        runtime = getattr(self.context, "runtime_control", None)
+        if runtime is not None:
+            policy = runtime.policy(persona)
+            if workspace_task_stop_requested(user_text):
+                self.finish_task()
+                runtime.cancel_pending()
+                policy["user_authorized_workspace_tools"] = WORKSPACE_READ_TOOLS
+                policy["available_workspace_tools"] = WORKSPACE_READ_TOOLS
+                policy["allowed_tool_names"] = WORKSPACE_READ_TOOLS
+                policy["enforce"] = True
+                return policy
+            now_ms = int(time.time() * 1000)
+            if self.active_task is None or self.active_task.completed or self.active_task.persona != persona:
+                self.active_task = TrustedWorkspaceTask(uuid4().hex, persona, str(user_text)[:4000],
+                                                       policy["available_workspace_tools"], now_ms, now_ms)
+            else:
+                self.active_task.updated_ms = now_ms
+            policy["workspace_task_id"] = self.active_task.id
+            return policy
         text = str(user_text or "").strip()[:4_000]
         now_ms = int(time.time() * 1000)
         if workspace_task_stop_requested(text):
@@ -150,7 +169,7 @@ class WorkspaceAgentSession:
         if task and (not task_id or task.id == task_id):
             task.completed = True
             task.revision += 1
-            task.updated_ms = _now_ms()
+            task.updated_ms = int(time.time() * 1000)
 
     def page_action_authorized(
         self, persona: str, page_id: str = "", claim: bool = False
@@ -158,6 +177,10 @@ class WorkspaceAgentSession:
         """Check and optionally bind a live page to a current trusted user task."""
         tools = self._active_tools(int(time.time() * 1000), str(persona or "")[:128])
         task = self.active_task
+        # Project chat uses explicit model tool invocations. Page observations
+        # must not independently start an autonomous action loop.
+        if getattr(self.context, "runtime_control", None) is not None:
+            return False
         if "act_workspace_page" not in tools or task is None:
             return False
         clean_page_id = str(page_id or "").strip()[:128]

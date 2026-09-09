@@ -4,6 +4,11 @@ MeloMate is a local AI voice companion app with lightweight VRM rendering, micro
 
 This repository is the **source edition**. It is intended for development, GitHub hosting, and reproducible setup. Generated folders such as `node_modules`, `dist`, `backend/.venv`, caches, logs, and large downloaded backend models are intentionally not part of the source tree.
 
+Project-scoped tools, invocation permissions, optional isolated code execution,
+and configurable chat/memory behavior are described in
+[项目与工具使用说明](docs/PROJECT_AGENT.md). Source-only checks do not require
+installing the full voice runtime.
+
 ## Requirements
 
 - Windows 10/11 is recommended for the bundled `start.bat`.

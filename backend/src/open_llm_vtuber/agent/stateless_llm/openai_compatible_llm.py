@@ -45,6 +45,7 @@ class AsyncLLM(StatelessLLMInterface):
         self.base_url = base_url
         self.model = model
         self.temperature = temperature
+        self.max_tokens = 8192
         # Allow the backend to start before the user fills an API key in the UI.
         # The real key can be applied later through the client-api-config message.
         self.llm_api_key = llm_api_key or "melomate-placeholder-key"
@@ -109,7 +110,7 @@ class AsyncLLM(StatelessLLMInterface):
                 model=self.model,
                 stream=True,
                 temperature=self.temperature,
-                max_tokens=8192,
+                max_tokens=self.max_tokens,
                 tools=available_tools,
             )
             logger.debug(
@@ -160,7 +161,7 @@ class AsyncLLM(StatelessLLMInterface):
                                 ):
                                     accumulated_tool_calls[index]["function"][
                                         "name"
-                                    ] = tool_call.function.name
+                                    ] += tool_call.function.name
                                 if (
                                     hasattr(tool_call.function, "arguments")
                                     and tool_call.function.arguments
@@ -172,7 +173,7 @@ class AsyncLLM(StatelessLLMInterface):
                         continue
 
                     # If we were in a tool call but now we're not, yield the tool call result
-                    elif in_tool_call and not has_tool_calls:
+                    elif in_tool_call and chunk.choices[0].finish_reason in {"tool_calls", "stop"}:
                         in_tool_call = False
                         # Convert accumulated tool calls to the required format and output
                         logger.info(
@@ -187,6 +188,12 @@ class AsyncLLM(StatelessLLMInterface):
 
                         yield complete_tool_calls
                         accumulated_tool_calls = {}  # Reset for potential future tool calls
+
+                if chunk.choices[0].finish_reason == "length":
+                    accumulated_tool_calls.clear()
+                    in_tool_call = False
+                    yield "\n[模型输出达到上限；未执行不完整的工具调用。请提高输出上限或缩小本次修改范围。]"
+                    return
 
                 # Process regular content chunks
                 if len(chunk.choices) == 0:

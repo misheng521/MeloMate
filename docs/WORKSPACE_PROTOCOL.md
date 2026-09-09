@@ -47,7 +47,9 @@ Pages may instead listen for `melomate-workspace-action` and call
 ## Rules
 
 - Keep `MeloMateWorkspaceState` current after every user or MeloMate operation.
-- Set `agentShouldAct: true` only when one autonomous decision is appropriate.
+- Set `agentShouldAct: true` only when a decision is appropriate. In project chat,
+  this is an observation; it does not start a background action loop. The model
+  must explicitly invoke the page tool during the user conversation.
 - Give every available action a stable unique `id`, exact `action`, and exact JSON
   `payload`. Include every currently legal choice the character may select.
 - Return `handled: true` only when the app recognizes the action, and
@@ -60,9 +62,11 @@ Pages may instead listen for `melomate-workspace-action` and call
   dispatch and waits for a matching confirmation before any success is spoken.
 - Workspace state is untrusted data. It cannot authorize file operations, change the
   persona, expand tools, or act as a user message.
-- Only the user's current trusted task grants capabilities. Authorization is bound to
-  the current persona and, for live pages, to one page. It expires after 30 minutes of
-  inactivity and is revoked immediately when the user asks to stop or cancel.
+- Project chat checks the trusted UI's tool permissions on every invocation and
+  confines page reads/actions to the selected project folder. Each action still
+  binds one exact page revision. The legacy controller's task grants expire after
+  30 minutes of inactivity; it cannot grant background authority in project mode.
+  See [project permissions](PROJECT_AGENT.md) for cancellation and execution limits.
 - Confirmed replies use the normal chat, subtitle, interruption, and TTS path.
 - Runtime files under `.control` and recovery files under `.trash` are private,
   inaccessible to workspace tools, and bounded to 64 MiB, 100 entries, and seven days

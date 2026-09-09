@@ -2,6 +2,8 @@
 
 import shutil
 import json
+import sys
+from datetime import timedelta
 
 from pathlib import Path
 from typing import Dict, Optional, Union, Any
@@ -18,19 +20,23 @@ class ServerRegistry:
 
     def __init__(self, config_path: str | Path = DEFAULT_CONFIG_PATH) -> None:
         """Initialize the MCP Server Manager."""
+        if str(config_path) == DEFAULT_CONFIG_PATH:
+            config_path = Path(__file__).resolve().parents[3] / DEFAULT_CONFIG_PATH
         try:
             config_path = validate_file(config_path, ".json")
         except ValueError:
             logger.error(
                 f"MCPSR: File '{config_path}' does not exist, or is not a json file."
             )
-            raise ValueError(
-                f"MCPSR: File '{config_path}' does not exist, or is not a json file."
-            )
+            if Path(config_path).name != DEFAULT_CONFIG_PATH:
+                raise
 
-        self.config: Dict[str, Union[str, dict]] = json.loads(
-            config_path.read_text(encoding="utf-8")
-        )
+        config_path = Path(config_path)
+        self.config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {"mcp_servers": {}}
+        backend = Path(__file__).resolve().parents[3]
+        entries = self.config.setdefault("mcp_servers", {})
+        for name, file in (("workspace", "mcp_workspace.py"), ("daily-tools", "mcp_daily_tools.py")):
+            entries.setdefault(name, {"command": sys.executable, "args": [str(backend / file)], "cwd": str(backend)})
 
         self.servers: Dict[str, MCPServer] = {}
 
@@ -53,6 +59,17 @@ class ServerRegistry:
             return
 
         for server_name, server_details in servers_config.items():
+            if server_details.get("enabled") is False:
+                continue
+            timeout = timedelta(seconds=max(5, min(600, float(server_details.get("timeout") or 30))))
+            if server_details.get("url"):
+                from urllib.parse import urlsplit
+                parsed = urlsplit(server_details["url"])
+                if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+                    raise ValueError("MCP URL must be HTTP(S) without embedded credentials")
+                self.servers[server_name] = MCPServer(name=server_name, url=server_details["url"],
+                    headers=server_details.get("headers"), timeout=timeout)
+                continue
             if "command" not in server_details or "args" not in server_details:
                 logger.warning(
                     f"MCPSR: Invalid server details for '{server_name}'. Ignoring."
@@ -86,7 +103,7 @@ class ServerRegistry:
                 args=server_details["args"],
                 env=server_details.get("env", None),
                 cwd=server_details.get("cwd", None),
-                timeout=server_details.get("timeout", None),
+                timeout=timeout,
             )
             logger.debug(f"MCPSR: Loaded server: '{server_name}'.")
 

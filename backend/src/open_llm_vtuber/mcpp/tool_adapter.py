@@ -2,6 +2,9 @@
 
 from typing import Dict, Optional, List, Tuple, Any
 from loguru import logger
+import copy
+import hashlib
+import re
 
 from .types import FormattedTool
 from .mcp_client import MCPClient
@@ -53,7 +56,15 @@ class ToolAdapter:
                         tool_info["required"] = tool.inputSchema.get("required", [])
 
                         # Store the tool info in FormattedTool format
-                        formatted_tools[tool.name] = FormattedTool(
+                        # Built-ins keep stable names; plugins get unambiguous namespaces.
+                        alias = tool.name if server_name in {"workspace", "daily-tools", "local-launcher"} else (
+                            re.sub(r"[^a-zA-Z0-9_-]", "_", server_name + "__" + tool.name)[:51]
+                            + "_" + hashlib.sha256((server_name + ":" + tool.name).encode()).hexdigest()[:12])
+                        if alias in formatted_tools:
+                            raise ValueError(f"Duplicate tool alias: {alias}")
+                        formatted_tools[alias] = FormattedTool(
+                            original_name=tool.name,
+                            timeout_seconds=self.server_registery.servers[server_name].timeout.total_seconds(),
                             input_schema=tool.inputSchema,
                             related_server=server_name,
                             description=tool.description,
@@ -159,32 +170,8 @@ class ToolAdapter:
             tool_description = data_object.description or "No description provided."
             required_params = input_schema.get("required", [])
 
-            # Format for OpenAI
-            openai_function_params = {
-                "type": "object",
-                "properties": {},
-                "required": required_params,
-                "additionalProperties": False,  # Disallow extra properties
-            }
-            for param_name, param_info in properties.items():
-                param_schema = {
-                    "type": param_info.get("type", "string"),
-                    "description": param_info.get("description")
-                    or param_info.get("title", "No description provided."),
-                }
-                # Add enum if present
-                if "enum" in param_info:
-                    param_schema["enum"] = param_info["enum"]
-                # Handle array type correctly
-                if param_schema["type"] == "array" and "items" in param_info:
-                    param_schema["items"] = param_info["items"]
-                elif param_schema["type"] == "array" and "items" not in param_info:
-                    logger.warning(
-                        f"MC: Array parameter '{param_name}' in tool '{tool_name}' is missing 'items' definition. Assuming items are strings."
-                    )
-                    param_schema["items"] = {"type": "string"}  # Default or log warning
-
-                openai_function_params["properties"][param_name] = param_schema
+            openai_function_params = copy.deepcopy(input_schema)
+            openai_function_params.setdefault("type", "object")
 
             openai_tools.append(
                 {
@@ -198,11 +185,7 @@ class ToolAdapter:
             )
 
             # Format for Claude
-            claude_input_schema = {
-                "type": "object",
-                "properties": properties,
-                "required": required_params,
-            }
+            claude_input_schema = copy.deepcopy(input_schema)
             claude_tools.append(
                 {
                     "name": tool_name,
@@ -226,7 +209,13 @@ class ToolAdapter:
         servers_info, formatted_tools_dict = await self.get_server_and_tool_info(
             enabled_servers
         )
-        mcp_prompt_string = self.construct_mcp_prompt_string(servers_info)
+        self.last_tools = formatted_tools_dict
+        mcp_prompt_string = ('To invoke a tool, output one JSON object: {"tool":"exact_alias","arguments":{...}}. '
+                             'Arguments must match the schema; use {} for no parameters. Wait for real results before continuing. '
+                             'Do not output this invocation format as an example or pretend a tool ran.\n'
+                             'Available tool aliases and JSON schemas:\n') + __import__("json").dumps(
+            {name: {"description": item.description, "parameters": item.input_schema}
+             for name, item in formatted_tools_dict.items()}, ensure_ascii=False)
         openai_tools, claude_tools = self.format_tools_for_api(formatted_tools_dict)
         logger.info("MC: Dynamic tool construction complete.")
         return mcp_prompt_string, openai_tools, claude_tools

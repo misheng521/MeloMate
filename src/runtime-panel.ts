@@ -5,6 +5,7 @@ type Plan = {goal?: string; steps?: {text: string; status: string}[]; next_step?
 type State = { type?: string; success?: boolean; message?: string; request_id?: string;
   tool_id?: string; tool_name?: string; content?: string; status?: string;
   preview_image?: string;
+  memory_file?: string; persona_file?: string;
   settings?: Record<string, unknown>; tools?: Tool[]; events?: State[]; plan?: Plan };
 
 export class RuntimePanel {
@@ -18,6 +19,7 @@ export class RuntimePanel {
   private services: Service[] = [];
   private serviceList = document.createElement("div");
   private planView = document.createElement("pre");
+  private memoryFiles = document.createElement("p");
   constructor(private send: Send) {
     this.root.className = "runtime-panel";
     const summary = document.createElement("summary"); summary.textContent = "项目与工具";
@@ -37,11 +39,10 @@ export class RuntimePanel {
     }
     this.field("temperature", "生成温度", "0.7", "number");
     this.field("max_tokens", "单次输出上限", "8192", "number");
-    this.field("memory_model", "记忆整理模型（留空跟随聊天）", "", "text");
-    const memoryLabel = document.createElement("label"); memoryLabel.className = "field";
-    const memoryText = document.createElement("span"); memoryText.textContent = "语义记忆检索（每轮最多增加一次模型请求）";
-    const memory = document.createElement("input"); memory.type = "checkbox";
-    this.controls.set("semantic_memory", memory); memoryLabel.append(memoryText, memory); this.root.append(memoryLabel);
+    const memoryHint = document.createElement("p"); memoryHint.className = "field-hint";
+    memoryHint.textContent = "人设和记忆使用 UTF-8 文本，保存后下一轮加载。新增记忆保留对话；局部删改会处理相关旧内容，清空整份记忆才重置上下文。原聊天档案仍可查看。记忆由当前聊天模型按积累量整理。";
+    this.memoryFiles.className = "field-hint";
+    this.root.append(memoryHint, this.memoryFiles);
     const save = document.createElement("button"); save.type = "button"; save.className = "secondary-button";
     save.textContent = "应用项目设置";
     save.onclick = () => this.send({type: "runtime-settings", settings: this.values()});
@@ -134,13 +135,14 @@ export class RuntimePanel {
   }
   connect(persona: string) {
     this.persona = persona;
+    this.memoryFiles.textContent = "";
     this.log.replaceChildren();
     this.renderPlan();
     this.root.querySelectorAll<HTMLInputElement>('input[type="password"]').forEach(input => input.value = "");
     for (const card of this.approvals.values()) card.remove();
     this.approvals.clear();
     const defaults = {project_folder: "", workspace: "allow", reminders: "ask", external: "ask", execution: "ask",
-      tools: {}, temperature: 0.7, max_tokens: 8192, memory_model: "", semantic_memory: false,
+      tools: {}, temperature: 0.7, max_tokens: 8192,
       services: [], service_access: "ask", browser: "ask", network_execution: "ask"};
     try {
       const value = localStorage.getItem(`melomate-runtime:${persona}`);
@@ -153,6 +155,7 @@ export class RuntimePanel {
     if (message.type === "work-plan") { this.renderPlan(message.plan); return true; }
     if (message.type === "runtime-state") {
       if (!message.success) { this.entry(message.message || "设置失败"); return true; }
+      this.memoryFiles.textContent = [message.persona_file ? `人设：characters/profiles/${message.persona_file}` : "", message.memory_file ? `记忆：${message.memory_file}` : ""].filter(Boolean).join("；");
       if (message.settings) {
         for (const [key, input] of this.controls) {
           if (input instanceof HTMLInputElement && input.type === "checkbox") input.checked = message.settings[key] === true;

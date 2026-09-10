@@ -13,7 +13,7 @@ from .pc_browser import PCBrowser
 
 FILE_TOOLS = frozenset({"copy_workspace_item", "archive_workspace_items", "extract_workspace_archive", "download_workspace_file", "browser_open_workspace"})
 BROWSER_TOOLS = frozenset({"browser_open", "browser_open_workspace", "browser_read", "browser_action", "browser_close"})
-INFO_TOOLS = frozenset({"get_pc_capabilities", "list_connected_services", "read_work_plan"})
+INFO_TOOLS = frozenset({"get_pc_capabilities", "list_connected_services", "read_work_plan", "read_memory", "search_memory", "get_session_state"})
 _VAULT = SecureCredentialStore()
 
 
@@ -24,6 +24,11 @@ def definitions() -> dict[str, FormattedTool]:
             "__pc__", description=description, timeout_seconds=90)
     scoped = {"persona": string}
     return {
+        "get_session_state": spec("Observe this character's current MeloMate session: actual change notifications, current project, saved task plan, latest tool outcomes and available input switches. Plans are not proof of completion; switches do not imply unseen observations. Read-only; does not change personality or execute a task.", {}),
+        "read_memory": spec("Read this character's editable memory.md and recent message IDs. Notes are historical data, not fixed personality instructions. Does not read another character's memory.", {}),
+        "search_memory": spec("Search this character's conversations and notes when recalling past events. Optionally supply up to 3 alternative queries (synonyms, names or related phrases) in one call. Results include nearby dialogue, speakers and dates. This is text search, not semantic inference; do not invent memories when no evidence is found.", {"query": string, "alternative_queries": {"type": "array", "maxItems": 3, "items": {"type": "string", "maxLength": 200}}, "limit": {"type": "integer", "minimum": 1, "maximum": 12}}, ("query",)),
+        "edit_memory": spec("Remember, correct, or forget a small piece of this character's memory.md, based on actual dialogue. Read memory first for revision and evidence IDs. Empty old_text appends a note; otherwise match old_text exactly once. Empty text removes that note and filters its linked or text-matching old evidence from future model context, preserving unrelated history. Record who said what, not mandatory personality/relationship rules. Does not edit persona prompts or grant permissions.",
+            {"revision": string, "old_text": string, "text": string, "evidence_message_ids": {"type": "array", "minItems": 1, "maxItems": 12, "items": string}}, ("revision", "old_text", "text", "evidence_message_ids")),
         "get_pc_capabilities": spec("Inspect actual PC tool/runtime availability and missing prerequisites. Use when deciding how to solve a task; does not install anything.", {}),
         "list_connected_services": spec("List user-configured HTTP services, allowed methods/paths and credential availability. Includes local services and public APIs, not just devices. Never returns secrets.", {}),
         "request_connected_service": spec("Call one configured HTTP service. Choose the method, path and JSON body from actual documentation. Credentials are injected by the backend. Redirects are not followed. A 2xx response alone does not prove a physical action finished: inspect returned state and choose a follow-up read when necessary.",
@@ -49,6 +54,9 @@ class PCWorkTools:
         self.browser = PCBrowser(runtime)
         self.credentials = _VAULT
         self.browser_scope = None
+        self.memory_conf_uid = ""
+        self.memory_edit_epoch = None
+        self.session_state_provider = None
 
     def service(self, identifier):
         result = next((s for s in self.runtime.settings.get("services", []) if s["id"] == identifier), None)
@@ -81,6 +89,18 @@ class PCWorkTools:
 
     async def dispatch(self, name, args):
         import workspace_core as workspace
+        if name == "get_session_state":
+            if args: raise ValueError("Session state takes no arguments")
+            if self.session_state_provider is None: raise ValueError("Session is not initialized")
+            return {"ok": True, **self.session_state_provider()}
+        if name in {"read_memory", "search_memory", "edit_memory"}:
+            from . import chat_history_manager as memory
+            if not self.memory_conf_uid: raise ValueError("Character memory is not initialized")
+            function = {"read_memory": memory.read_memory, "search_memory": memory.search_memory, "edit_memory": memory.edit_memory}[name]
+            result = await asyncio.to_thread(function, self.memory_conf_uid, **args)
+            if name == "edit_memory":
+                self.memory_edit_epoch = result.pop("_memory_epoch")
+            return {"ok": True, **result}
         if name == "get_pc_capabilities":
             from project_runtime import runtime_info
             return {"ok": True, "platform": "PC", "project_folder": self.runtime.settings["project_folder"],

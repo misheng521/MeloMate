@@ -7,7 +7,7 @@ import numpy as np
 from fastapi import WebSocket
 from loguru import logger
 
-from ..chat_history_manager import store_message
+from ..chat_history_manager import store_message, memory_epoch
 from ..proactive_conversation import (
     build_proactive_prompt,
     normalize_proactive_request,
@@ -36,6 +36,10 @@ async def handle_conversation_trigger(
 ) -> None:
     """Handle triggers that start a conversation"""
     metadata = None
+    epoch = memory_epoch(context.character_config.conf_uid)
+    if getattr(context, "last_memory_epoch", epoch) != epoch:
+        context.proactive_utterances.clear()
+    context.last_memory_epoch = epoch
 
     if msg_type == "ai-speak-signal":
         # Never trust a browser-supplied hidden prompt.  The client may only send
@@ -47,12 +51,14 @@ async def handle_conversation_trigger(
         )
 
         # Add metadata to indicate this is a proactive speak request
-        # that should be skipped in both memory and history
+        # whose synthetic input is excluded from memory and history.
         metadata = {
             "proactive_speak": True,
             "proactive_mode": proactive_request["mode"],
+            "proactive_request": proactive_request,
             "skip_memory": True,  # Skip storing in AI's internal memory
-            "skip_history": True,  # Skip storing in local conversation history
+            "skip_history": True,  # Only real visible replies are archived.
+            "runtime_event": data.get("_validated_runtime_event") is True,
         }
 
         await websocket.send_text(
@@ -87,6 +93,7 @@ async def handle_conversation_trigger(
         # state server-side and consume it even if the reply later fails.
         context.proactive_utterances.clear()
 
+    metadata["memory_epoch_at_queue"] = epoch
     images = data.get("images")
     screen_vision = data.get("screen_vision")
     session_emoji = np.random.choice(EMOJI_LIST)
@@ -406,6 +413,8 @@ async def handle_individual_interrupt(
                 role="ai",
                 content=heard_response,
                 name=context.character_config.character_name,
+                expected_epoch=(getattr(getattr(context, "pc_tools", None), "memory_edit_epoch", None)
+                                or getattr(context, "active_memory_epoch", None)),
             )
         if context.history_uid:
             store_message(

@@ -9,6 +9,12 @@ and configurable chat/memory behavior are described in
 [项目与工具使用说明](docs/PROJECT_AGENT.md). Source-only checks do not require
 installing the full voice runtime.
 
+人设与记忆已简化为可编辑文本，使用方法见 [人设与记忆说明](docs/MEMORY.md)。
+默认小可的人设只有「你叫小可。」。新角色可直接添加
+`characters/profiles/角色名.md`，无需编写角色 YAML；API 与语音仍使用应用的运行配置。
+
+聊天、记忆变化和工作状态现在交给同一个模型连续处理，见 [会话与真实状态说明](docs/COMPANION.md)。主动说话也支持文字聊天，模型可以选择回应或沉默。
+
 ## Requirements
 
 - Windows 10/11 is recommended for the bundled `start.bat`.
@@ -155,8 +161,8 @@ npm run check
 - `docs/WORKSPACE_PROTOCOL.md` - Protocol for interactive workspace apps that both the user and MeloMate can control.
 - `backend/prompts` - Prompt fragments used by the backend.
 - `backend/conf.yaml` - Main backend configuration.
-- `characters/profiles` - Character YAML profiles.
-- `characters/memory` - Default character memory files.
+- `characters/profiles` - Editable Markdown/text personas and compatible YAML runtime profiles.
+- `characters/memory` - Private per-character memory.md and automatic SQLite conversation archives.
 - `models/*.vrm` - VRM avatars automatically discovered by the frontend model picker.
 - `backgrounds` - Background images discovered by the frontend.
 - `reference_sounds/samples` - Small sample reference voices.

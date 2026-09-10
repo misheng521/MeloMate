@@ -14,10 +14,10 @@ backend/reminders.sqlite3*
 backend/logs/
 backend/chat_history/
 # Per-persona conversation memory is editable local runtime data.  Keep only
-# documentation and the blank schema example in source control.
+# documentation and the blank text example in source control.
 characters/memory/*
 !characters/memory/README.md
-!characters/memory/core_memory.example.json
+!characters/memory/memory.example.md
 reference_sounds/voice_clone_refs/
 
 # Large downloaded backend models

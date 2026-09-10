@@ -1,33 +1,11 @@
 # 角色记忆目录
 
-MeloMate 会在这里为每个角色创建独立目录，例如：
+每个角色自动生成 `memory.md` 和 `.history.sqlite3`。用户只需编辑前者，后者由程序维护聊天档案、检索索引和整理进度。运行时可能有 SQLite 临时文件；全部私人数据已排除在 Git 提交之外。
 
-```text
-characters/memory/avatar_example_001/
-  core_memory.json
-  short_memory.json
-  core_memory.json.bak
-  short_memory.json.bak
-  backups/
-```
+默认小可的可编辑记忆：`avatar_xiaoke_001/memory.md`。保存为 UTF-8，写普通句子或 Markdown 即可，可以增删改，不需要固定字段。人设在 `characters/profiles/小可.md`。
 
-这些文件包含真实对话和用户记忆，已被 `.gitignore` 排除，不会提交到 GitHub。仓库只保存本说明和 `core_memory.example.json` 空白示例。
+下一轮会加载修改后的文本。新增记忆保留现有对话；局部删改通过来源记录和文字匹配过滤相关旧内容，保留其他话题；清空整份记忆才重置模型上下文。文字匹配不能保证识别所有换说法。聊天档案仍保留供查看，这不等于擦除旧备份或第三方记录。
 
-## 手工编辑
+旧 JSON 首次使用时自动迁移，原文件保留，之后不再参与记忆。仓库只保存本说明和空白 `memory.example.md`。
 
-建议先停止 MeloMate，再用 UTF-8 编辑 `core_memory.json`。程序也会在下一次读取时热加载合法 JSON；如果保存到一半或 JSON 语法错误，程序会先把错误内容保留为 `core_memory.invalid-时间.json`，然后从 `.bak` 或空白结构恢复，避免聊天服务无法启动。
-
-- 数组里直接写字符串，例如 `"桂花糕"`，会被当作 `source: "manual"`。
-- 手工记录的优先级最高，模型不能删除、降级或覆盖。
-- 若编辑完整记录对象，请把 `source` 写成 `"manual"`，并保持 `status: "active"`。
-- `profile` 记录用户明确表达或稳定形成的信息。
-- `character_self` 记录角色自己在真实对话中反复表达、或得到用户明确理解的选择；它不是第二份固定人设。
-- `relationship` 只记录双方共同形成的含义、习惯与约定，单方面要求不会写成共同事实。
-- `pending_inferences` 是证据还不足的候选记忆。用户推断通常需要两次独立用户证据；角色自己的选择通常需要跨阶段重复，或一次角色表达加用户明确确认。
-- `forgotten_topics` 是用户要求忘记的主题；模型不能从旧对话重新添加这些主题。用户以后亲自重新明确说明时，才会解除对应限制。
-- `manual_notes` 可填写希望角色长期理解的简短补充。它不是角色身份或工具指令，不能改变固定人设、安全边界或权限。
-- `extensions` 留给未来功能使用，当前不会作为可执行指令。
-
-每次有效写入采用临时文件原子替换，并保存上一版 `.bak`。核心记忆还会在 `backups/` 中轮换保留最近 8 个版本。
-
-固定角色人设仍来自 `characters/profiles/*.yaml`。记忆只是运行时补充，不会自动修改 YAML。
+完整说明，包括新增角色、后台 API 用量、遗忘范围和迁移行为，见 [人设与记忆说明](../../docs/MEMORY.md)。

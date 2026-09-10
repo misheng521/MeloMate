@@ -20,6 +20,7 @@ class CharacterConfig(I18nMixin):
     human_name: str = Field(default="Human", alias="human_name")
     voice_style: Dict[str, str] = Field(default_factory=dict, alias="voice_style")
     persona_prompt: str = Field(..., alias="persona_prompt")
+    persona_file: str = ""  # Set by the profile loader; the user edits this text file.
     agent_config: AgentConfig = Field(..., alias="agent_config")
     asr_config: ASRConfig = Field(..., alias="asr_config")
     tts_config: TTSConfig = Field(..., alias="tts_config")

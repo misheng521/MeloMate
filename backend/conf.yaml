@@ -12,7 +12,7 @@ system_config:
   config_alts_dir: '../characters/profiles' # 用于存放替代配置的目录
   tool_prompts: # 要插入到角色提示词中的工具提示词
     avatar_expression_prompt: 'avatar_expression_prompt' # 用于数字人表情控制；聊天显示和 TTS 会过滤方括号标签。
-    # 启用 think_tag_prompt 可让不具备思考输出的 LLM 也能展示内心想法、心理活动和动作（以括号形式呈现），但不会进行语音合成。更多详情请参考 think_tag_prompt。
+    # 可选的表达格式提示，不要求模型输出内心独白或心理活动。
     # think_tag_prompt: 'think_tag_prompt'
     # live_prompt: 'live_prompt'
     # 启用 mcp_prompt 可让 LLM 具备通过 MCP（Model Context Protocol）使用工具的能力。

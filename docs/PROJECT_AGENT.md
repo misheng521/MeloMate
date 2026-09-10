@@ -53,11 +53,12 @@ docker build -t melomate-runner:local backend/runner
 
 ## PC 通用工作工具
 
-本次增加 14 个本地 PC 工具，接入同一个模型工具调用循环。默认工具定义从 29 个扩展到 43 个，另有屏幕查看与本地启动器的可选工具。定义存在不表示运行环境已就绪。
+本地 PC 工具共 18 个（含 3 个角色记忆工具和 1 个会话状态工具），接入同一个模型工具调用循环。加上内置工作区与日常工具，默认共 47 个工具定义，另有屏幕查看与本地启动器的可选工具。定义存在不表示运行环境已就绪。
 
 | 工具 | 用途 |
 |---|---|
 | `get_pc_capabilities` | 检查真实环境和能力，不凭空假设已经安装 |
+| `get_session_state` | 查看当前角色的会话、实际变化通知、项目、计划和近期工具结果；只读 |
 | `list_connected_services` / `request_connected_service` | 查看并调用已配置的 HTTP 服务，适用于本地程序、公开 API、设备等 |
 | `copy_workspace_item` | 非覆盖地复制文件或目录 |
 | `archive_workspace_items` / `extract_workspace_archive` | 创建/解压 ZIP，限制大小并拒绝目录越界与链接 |
@@ -65,6 +66,7 @@ docker build -t melomate-runner:local backend/runner
 | `browser_open` / `browser_open_workspace` | 打开公共网页或预览当前项目 HTML |
 | `browser_read` / `browser_action` / `browser_close` | 获取页面文字、元素、截图和 JS 错误；执行一次点击、输入、选择、按键或滚动；关闭标签页 |
 | `read_work_plan` / `update_work_plan` | 由模型按需保存与恢复任务计划；不会自动执行计划 |
+| `read_memory` / `search_memory` / `edit_memory` | 读取、检索、更新当前角色的文本记忆，有真实对话来源与版本校验 |
 
 模型自行决定工具组合、参数、顺序、是否重试或询问。普通聊天无需调用工具或写计划。需要解决问题时，模型可根据实际情况查资料、检查项目、写代码、运行测试、查看网页并继续修正；没有同名专用工具不等于无法推进。账号、真实设备协议、许可证、用户选择等未知条件不能靠编造补足。
 
@@ -114,11 +116,13 @@ OpenAI-compatible API 明确报告不支持工具时，会切换为 JSON 文本�
 
 ## 聊天与记忆
 
-通用任务指导只在进入工具循环后加入，普通聊天使用更短的说明。小鱼、小薇取消固定字数和强制短句，保留角色语气，并把语音表达长度与项目代码完整度分开。
+通用任务指导只在进入工具循环后加入，普通聊天使用更短的说明。默认小可人设只有名字，不预设关系发展或强制表达方式。用户定制人设和聊天产生的记忆均为可编辑文本，见 [人设与记忆说明](MEMORY.md)。
 
-界面可以调整生成温度、单次输出上限、记忆整理模型。记忆整理模型留空跟随聊天模型，使用同一 API 服务与凭据。Claude 的温度按其适配器范围最高限制为 1。
+当前会话、文件变化和实际工具结果交给同一个聊天模型处理；主动说话开关也控制文件变化引起的回应机会，见 [会话与真实状态说明](COMPANION.md)。
 
-可选的语义记忆检索默认关闭。开启后，每轮最多增加一次模型请求，从已有记忆 ID 中选择相关项；失败时回到原有检索，不生成新事实。它有额外延迟与 API 用量。提示词和工具工程能减少僵硬约束，实际聊天与编程质量仍需用同一模型、同类任务实测。
+界面保留生成温度、单次输出上限等运行设置。记忆整理使用当前聊天模型与同一 API 服务、凭据，按新对话量触发，短闲聊延后、失败后冷却重试，不需另配模型。具体阈值见记忆说明。Claude 的温度按其适配器范围最高限制为 1。
+
+移除了旧的语义筛选模型请求和对应设置。现在用 SQLite 文本索引检索历史，模型按需换关键词查询；不是向量语义搜索。后台整理仍有额外 API 用量。实际聊天与编程质量需要用所选模型、同类任务实测。
 
 ## 源码验证
 
@@ -126,6 +130,7 @@ OpenAI-compatible API 明确报告不支持工具时，会切换为 JSON 文本�
 
 ```text
 python -B -m unittest discover -s backend/tests -p test_project_runtime.py
+python -B -m unittest discover -s backend/tests -p test_text_memory.py
 python -B -m unittest discover -s backend/tests -p test_pc_work_tools.py
 python -B -m unittest discover -s backend/tests -p test_daily_tool_executor_policy.py
 npm run check

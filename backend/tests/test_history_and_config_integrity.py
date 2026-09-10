@@ -1,6 +1,7 @@
 import ast
 import concurrent.futures
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -43,14 +44,10 @@ class ChatHistoryIntegrityTests(unittest.TestCase):
             {message["content"] for message in messages},
             {f"message-{index}" for index in range(history.MAX_MEMORY_MESSAGES)},
         )
-        stored = json.loads(
-            (Path(self.temporary.name) / "persona" / history.SHORT_MEMORY_FILE).read_text(
-                encoding="utf-8"
-            )
-        )
-        self.assertEqual(stored["version"], 2)
+        with sqlite3.connect(Path(self.temporary.name) / "persona" / history.DATABASE_FILE) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM messages").fetchone()[0], history.MAX_MEMORY_MESSAGES)
 
-    def test_metadata_is_real_and_damage_recovers_from_valid_backup(self):
+    def test_metadata_and_history_survive_reopening_storage(self):
         uid = history.create_new_history("persona")
         self.assertTrue(
             history.update_metadata(
@@ -61,11 +58,10 @@ class ChatHistoryIntegrityTests(unittest.TestCase):
 
         history.store_message("persona", uid, "human", "first")
         history.store_message("persona", uid, "ai", "second")
-        memory_path = Path(self.temporary.name) / "persona" / history.SHORT_MEMORY_FILE
-        memory_path.write_text("{damaged", encoding="utf-8")
+        history.create_new_history("persona")
         recovered = history.get_history("persona", uid)
         self.assertTrue(recovered)
-        json.loads(memory_path.read_text(encoding="utf-8"))
+        self.assertEqual([m["content"] for m in recovered], ["first", "second"])
 
     def test_two_backend_processes_cannot_overwrite_each_others_messages(self):
         script = (

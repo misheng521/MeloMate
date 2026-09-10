@@ -8,7 +8,40 @@ model through the proactive-conversation protocol.
 from __future__ import annotations
 
 import re
+from functools import wraps
 from typing import Any, Mapping
+
+SILENCE_TOKEN = "<silence/>"
+
+
+def optional_proactive_output():
+    """Filter a model-selected silence before sentence splitting, UI and TTS."""
+    def decorate(function):
+        @wraps(function)
+        async def wrapped(input_data):
+            if not (input_data.metadata or {}).get("proactive_speak"):
+                async for item in function(input_data): yield item
+                return
+            pending, decided = "", False
+            async for item in function(input_data):
+                if not isinstance(item, str):
+                    yield item
+                elif decided:
+                    yield item
+                else:
+                    pending += item
+                    probe = pending.strip()
+                    if probe and not SILENCE_TOKEN.startswith(probe):
+                        decided = True
+                        yield pending
+                        pending = ""
+            if not decided:
+                if pending.strip() in {"", SILENCE_TOKEN}:
+                    yield {"type": "proactive-silence"}
+                else:
+                    yield pending
+        return wrapped
+    return decorate
 
 
 _PROACTIVE_MODES = {"automatic", "manual"}
@@ -127,7 +160,8 @@ def build_proactive_prompt(
 最近几次主动说过的话：
 {recent_block}
 
-结合你自己的人设、真实记忆和最近对话，自行判断此刻会有什么感受、是否延续原话题，以及最自然会说什么。不要解释触发机制，也不要把经过时间直接当成某种情绪的理由。只输出角色真正会说的话。"""
+结合你自己的人设、真实记忆和最近对话，自行判断此刻会有什么感受、是否想开口，以及想说什么。无需为了触发机会寻找话题。
+若此刻选择保持安静，只输出 <silence/>，它不会显示或发声。否则输出想说的话，不解释触发机制，不把经过时间直接当成某种情绪的理由。"""
 
 
 def build_return_context_prompt(

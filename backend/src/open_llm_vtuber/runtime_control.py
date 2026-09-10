@@ -41,8 +41,7 @@ class RuntimeControl:
         self.send = send
         self.settings = {"project_folder": "", "workspace": "allow", "reminders": "ask",
                          "external": "ask", "execution": "ask", "tools": {},
-                         "temperature": 0.7, "max_tokens": 8192, "memory_model": ""}
-        self.settings["semantic_memory"] = False
+                         "temperature": 0.7, "max_tokens": 8192}
         self.settings.update({"services": [], "service_access": "ask", "browser": "ask", "network_execution": "ask"})
         self.work_plan = {}
         self.pending: dict[str, asyncio.Future] = {}
@@ -75,10 +74,6 @@ class RuntimeControl:
             result["temperature"] = max(0.0, min(2.0, float(data["temperature"])))
         if "max_tokens" in data:
             result["max_tokens"] = max(512, min(65536, int(data["max_tokens"])))
-        if "memory_model" in data:
-            result["memory_model"] = str(data["memory_model"] or "").strip()[:160]
-        if "semantic_memory" in data:
-            result["semantic_memory"] = data["semantic_memory"] is True
         self.cancel_pending()
         self.settings = result
         self.revision += 1
@@ -93,7 +88,7 @@ class RuntimeControl:
             return self.settings["browser"]
         if name == "request_connected_service":
             return self.settings["service_access"]
-        if name == "update_work_plan":
+        if name in {"update_work_plan", "edit_memory"}:
             return "allow"
         if name in SAFE_READS:
             return "allow"
@@ -155,6 +150,8 @@ class RuntimeControl:
                 "workspace_relevant": True}
 
     def record(self, event: dict) -> None:
+        if event.get("tool_name") in {"read_memory", "search_memory", "edit_memory", "get_session_state"}:
+            event = {**event, "content": "会话或记忆工具已执行；内容不复制到项目日志。"}
         self.events.append({k: redact(event.get(k, ""), 1000)
                             for k in ("tool_id", "tool_name", "status", "content", "timestamp")})
         del self.events[:-100]

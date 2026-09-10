@@ -9,6 +9,7 @@ import chardet
 from loguru import logger
 
 from .main import Config
+from ..persona_text import persona_path, read_prompt, text_character
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -95,8 +96,8 @@ def load_config_with_character(
     character_file_name: str = DEFAULT_CHARACTER_CONFIG_NAME,
 ) -> dict:
     """
-    Load the base config and merge in a character YAML from config_alts_dir.
-    Persona prompts live only in character YAML files.
+    Merge application defaults with a text persona or a legacy YAML profile.
+    A same-name Markdown/text prompt overrides the YAML persona only.
     """
     base_config = read_yaml(config_path)
     config_alts_dir = base_config.get("system_config", {}).get("config_alts_dir")
@@ -106,17 +107,36 @@ def load_config_with_character(
     if character_file_name in {"xyu.yaml", "xyua.yaml"}:
         character_file_name = DEFAULT_CHARACTER_CONFIG_NAME
 
-    character_path = os.path.normpath(os.path.join(config_alts_dir, character_file_name))
-    character_data = read_yaml(character_path)
-    alt_character_config = character_data.get("character_config")
-    if not alt_character_config:
-        raise ValueError(f"Missing character_config in {character_path}")
+    alt_character_config = load_character_profile(config_alts_dir, character_file_name)
 
     base_character_config = base_config.get("character_config", {})
     base_config["character_config"] = deep_merge(
         base_character_config, alt_character_config
     )
     return base_config
+
+
+def load_character_profile(directory: str, filename: str) -> dict:
+    path = persona_path(directory, filename)
+    if path.suffix.lower() in {".md", ".txt"}:
+        # A text prompt alone is sufficient for a new character; inherited
+        # application defaults provide the technical runtime configuration.
+        result = text_character(directory, filename)
+        companion = path.with_suffix(".yaml")
+        if companion.is_file():
+            existing = read_yaml(str(persona_path(directory, companion.name))).get("character_config", {})
+            result = {**existing, "persona_prompt": result["persona_prompt"], "persona_file": filename,
+                      "conf_name": path.stem, "character_name": path.stem}
+        return result
+    result = read_yaml(str(path)).get("character_config")
+    if not isinstance(result, dict): raise ValueError("Missing character_config")
+    result = {**result, "persona_file": "", "conf_name": path.stem, "character_name": path.stem}
+    for extension in (".md", ".txt"):
+        companion = path.with_suffix(extension)
+        if companion.exists():
+            result.update(persona_prompt=read_prompt(directory, companion.name), persona_file=companion.name)
+            break
+    return result
 
 
 def load_text_file_with_guess_encoding(file_path: str) -> str | None:
@@ -172,7 +192,7 @@ def save_config(config: BaseModel, config_path: Union[str, Path]):
 def scan_config_alts_directory(config_alts_dir: str) -> list[dict]:
     """
     Scan the config_alts directory and return a list of config information.
-    Each config info uses the exact character YAML filename as the value and
+    Each config info uses the exact character profile filename as the value and
     the filename without suffix as the display name.
 
     Parameters:
@@ -181,20 +201,22 @@ def scan_config_alts_directory(config_alts_dir: str) -> list[dict]:
     Returns:
     - list[dict]: A list of dicts containing config info:
         - filename: The actual config file name
-        - name: The config file name without the .yaml/.yml suffix
+        - name: The character display name
     """
     config_files = []
 
     for root, _, files in os.walk(config_alts_dir):
         for file in files:
-            if file.endswith(".yaml"):
+            if file.endswith((".yaml", ".md", ".txt")):
+                if Path(root).resolve() != Path(config_alts_dir).resolve():
+                    continue
+                if file.endswith((".md", ".txt")) and (Path(root) / Path(file).with_suffix(".yaml")).exists():
+                    continue  # Companion prompt shares the existing character ID.
                 config_path = Path(root) / file
                 conf_name = os.path.splitext(file)[0]
                 character_name = conf_name
                 try:
-                    with open(config_path, "r", encoding="utf-8") as f:
-                        config_data = yaml.safe_load(f) or {}
-                    character_config = config_data.get("character_config", {})
+                    character_config = load_character_profile(config_alts_dir, file)
                     conf_name = character_config.get("conf_name") or conf_name
                     character_name = (
                         character_config.get("character_name")

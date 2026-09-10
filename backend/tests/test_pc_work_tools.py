@@ -122,6 +122,60 @@ class PCWorkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(workspace.workspace_path("Alice", "demo/b.txt").read_text(), "actual contents")
         self.assertFalse(workspace.workspace_path("Alice", "b.txt").exists())
 
+    async def test_memory_tools_use_current_character_through_model_loop(self):
+        from src.open_llm_vtuber import chat_history_manager as memory
+        with patch.object(memory, "CHAT_HISTORY_DIR", self.root / "memory"):
+            self.tools.memory_conf_uid = "Alice"
+            evidence = memory.store_message("Alice", memory.SINGLE_HISTORY_UID, "human", "记住青柠方案")
+            state = await self.tools.dispatch("read_memory", {})
+            manager = ToolManager(initial_tools_dict=definitions())
+            executor = ToolExecutor(None, manager, self.tools)
+            call = {"name": "edit_memory", "id": "note1", "args": {"revision": state["revision"], "old_text": "", "text": "用户选择青柠方案。", "evidence_message_ids": [evidence]}}
+            events = [event async for event in executor.execute_tools([call], "OpenAI", self.policy)]
+            self.assertEqual(events[-2]["status"], "completed")
+            self.assertIn("青柠方案", memory.get_memory_prompt("Alice"))
+            self.assertEqual(self.tools.memory_edit_epoch, memory.memory_epoch("Alice"))
+            self.assertNotIn("_memory_epoch", json.dumps(events))
+            found = await self.tools.dispatch("search_memory", {"query": "青柠"})
+            self.assertEqual(found["messages"][0]["id"], evidence)
+            self.tools.memory_conf_uid = "Bob"
+            self.assertEqual((await self.tools.dispatch("search_memory", {"query": "青柠"}))["messages"], [])
+            denied = await self.tools.call("read_memory", {"conf_uid": "Alice"})
+            self.assertTrue(denied["is_error"])
+
+    async def test_memory_contents_are_not_copied_into_project_progress(self):
+        self.runtime.load_progress("Alice")
+        for name in ("read_memory", "search_memory", "edit_memory", "get_session_state"):
+            self.runtime.record({"tool_name": name, "status": "completed", "content": "不该留在项目日志的记忆"})
+        self.assertNotIn("不该留在", self.runtime.progress_prompt())
+        self.runtime.load_progress("Alice")
+        self.assertNotIn("不该留在", self.runtime.progress_prompt())
+        for path in (self.root / "backend/cache/task-progress").glob("*.json"):
+            self.assertNotIn("不该留在", path.read_text(encoding="utf-8"))
+
+    async def test_event_can_observe_session_but_cannot_write_or_override_denial(self):
+        from test_text_memory import source_method, BACKEND
+        attach = source_method(BACKEND / "src/open_llm_vtuber/conversations/single_conversation.py",
+                               "_attach_live_workspace_context", {})
+        context = types.SimpleNamespace(runtime_control=self.runtime,
+            character_config=types.SimpleNamespace(character_name="Alice", conf_name="Alice"),
+            workspace_agent=types.SimpleNamespace(awareness_for_turn=lambda policy: None))
+        self.tools.session_state_provider = lambda: {"character": "Alice", "phase": "responding"}
+        executor = ToolExecutor(None, ToolManager(initial_tools_dict=definitions()), self.tools)
+        policy = attach(context, "事件不是操作授权", {"skip_history": True})["workspace_tool_policy"]
+        call = {"name": "get_session_state", "id": "state1", "args": {}}
+        events = [event async for event in executor.execute_tools([call], "OpenAI", policy)]
+        self.assertEqual(events[-2]["status"], "completed")
+        self.assertIn("Alice", json.dumps(events))
+        write = {"name": "update_work_plan", "id": "write1", "args": {"goal": "unauthorized", "steps": [], "next_step": ""}}
+        events = [event async for event in executor.execute_tools([write], "OpenAI", policy)]
+        self.assertEqual(events[0]["status"], "error")
+        self.assertEqual(self.runtime.work_plan, {})
+        self.runtime.configure({"tools": {"get_session_state": "forbid"}})
+        policy = attach(context, "", {"skip_history": True})["workspace_tool_policy"]
+        events = [event async for event in executor.execute_tools([call], "OpenAI", policy)]
+        self.assertEqual(events[0]["status"], "error")
+
     async def test_work_plan_persists_per_project_without_starting_an_action(self):
         plan = {"goal": "Investigate a problem", "steps": [{"text": "inspect", "status": "in_progress"}], "next_step": "read the real error"}
         result = await self.tools.dispatch("update_work_plan", plan)

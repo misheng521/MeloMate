@@ -20,8 +20,9 @@ from .conversation_utils import (
 )
 from .types import WebSocketSend
 from .tts_manager import TTSTaskManager
-from ..chat_history_manager import store_message
-from ..proactive_conversation import build_return_context_prompt
+from ..chat_history_manager import store_message, memory_epoch
+from ..proactive_conversation import build_return_context_prompt, build_proactive_prompt
+from ..companion_session import event_reaction_prompt
 from ..service_context import ServiceContext
 from ..workspace_intent import (
     WORKSPACE_ALWAYS_AVAILABLE_TOOLS,
@@ -45,8 +46,13 @@ def _attach_live_workspace_context(
     session = context.workspace_agent
     if next_metadata.get("skip_history"):
         # A timer/proactive event is an observation, not fresh user authority.
-        policy = {"source": "proactive", "enforce": True,
-                  "allowed_tool_names": frozenset(), "workspace_persona": persona}
+        runtime = getattr(context, "runtime_control", None)
+        policy = runtime.policy(persona) if runtime else {"workspace_persona": persona}
+        policy.update({"source": "proactive", "project_mode": True, "enforce": True,
+                       "allowed_tool_names": frozenset({"get_session_state", "read_memory", "search_memory", "read_work_plan", "get_pc_capabilities"}),
+                       "user_authorized_daily_tools": frozenset(),
+                       "user_authorized_workspace_tools": frozenset(),
+                       "available_workspace_tools": frozenset()})
     else:
         policy = session.begin_user_turn(input_text, persona)
     if not policy.get("project_mode"):
@@ -133,6 +139,9 @@ async def process_single_conversation(
     tts_manager = TTSTaskManager()
     full_response = ""  # Initialize full_response here
     reply_started = False
+    companion = getattr(context, "companion", None)
+    companion_receipt = None
+    turn_outcome = "error"
     websocket_send_with_turn = with_turn_id(websocket_send, turn_id)
 
     try:
@@ -151,6 +160,16 @@ async def process_single_conversation(
             announced_transcription_ids=announced_transcription_ids,
         )
         metadata = dict(metadata or {})
+        if metadata.get("runtime_event"):
+            input_text = event_reaction_prompt()
+        current_epoch = memory_epoch(context.character_config.conf_uid)
+        if metadata.get("memory_epoch_at_queue", current_epoch) != current_epoch:
+            metadata.pop("proactive_return", None)
+            context.proactive_utterances.clear()
+            if metadata.get("proactive_speak"):
+                input_text = event_reaction_prompt() if metadata.get("runtime_event") else build_proactive_prompt(
+                    metadata.get("proactive_request"), trusted_recent_utterances=[]
+                )
         proactive_screen_context = bool(
             metadata.get("proactive_speak") and images and screen_vision
         )
@@ -223,25 +242,33 @@ async def process_single_conversation(
         # Store user message (check if we should skip storing to history)
         skip_history = metadata and metadata.get("skip_history", False)
         if context.history_uid and not skip_history:
-            store_message(
+            message_id = store_message(
                 conf_uid=context.character_config.conf_uid,
                 history_uid=context.history_uid,
                 role="human",
                 content=input_text,
                 name=context.character_config.human_name,
             )
+            batch_input.metadata["memory_message_id"] = message_id
 
         if skip_history:
             logger.debug("Skipping storing user input to history (proactive speak)")
 
+        turn_memory_epoch = memory_epoch(context.character_config.conf_uid)
+        context.active_memory_epoch = turn_memory_epoch
+        if companion is not None:
+            companion_receipt = companion.begin_turn("runtime_event" if metadata.get("runtime_event") else "proactive_opportunity" if skip_history else "user_message")
+        turn_pc_tools = getattr(context, "pc_tools", None)
+        if turn_pc_tools is not None:
+            turn_pc_tools.memory_edit_epoch = None
+
         if (
-            not skip_history
-            and context.agent_engine
+            context.agent_engine
             and hasattr(context.agent_engine, "set_system")
         ):
             refreshed_prompt = await context.construct_system_prompt(
                 context.character_config.persona_prompt,
-                current_user_text=input_text,
+                current_user_text="" if skip_history else input_text,
             )
             context.agent_engine.set_system(refreshed_prompt)
             context.system_prompt = refreshed_prompt
@@ -250,15 +277,22 @@ async def process_single_conversation(
         if images:
             logger.info(f"With {len(images)} images")
 
+        stream_failed = False
         try:
             # agent.chat yields Union[SentenceOutput, Dict[str, Any]]
             agent_output_stream = context.agent_engine.chat(batch_input)
 
             async for output_item in agent_output_stream:
+                if isinstance(output_item, dict) and output_item.get("type") == "proactive-silence":
+                    turn_outcome = "silent"
+                    await websocket_send_with_turn(json.dumps(output_item))
+                    continue
                 if (
                     isinstance(output_item, dict)
                     and output_item.get("type") == "tool_call_status"
                 ):
+                    if companion is not None:
+                        companion.tool_event(output_item)
                     if is_workspace_tool_status(output_item):
                         if output_item.get("status") == "running":
                             on_workspace_work_started and on_workspace_work_started()
@@ -300,6 +334,7 @@ async def process_single_conversation(
                     )
 
         except Exception as e:
+            stream_failed = True
             logger.exception(
                 f"Error processing agent response stream: {e}"
             )  # Log with stack trace
@@ -319,29 +354,38 @@ async def process_single_conversation(
             websocket_send=websocket_send_with_turn,
             client_uid=client_uid,
         )
+        if not stream_failed and full_response:
+            turn_outcome = "replied"
+        elif stream_failed:
+            turn_outcome = "error"
 
+        # A memory edit performed by this very turn is acknowledged by the model.
+        # Later external edits still fail the epoch check when archiving.
+        tool_epoch = getattr(turn_pc_tools, "memory_edit_epoch", None)
+        response_epoch = turn_memory_epoch if tool_epoch is None else tool_epoch
         if (
             full_response
             and metadata.get("proactive_speak")
             and metadata.get("proactive_mode") == "automatic"
+            and memory_epoch(context.character_config.conf_uid) == response_epoch
         ):
-            # Retain only a short per-client window for repetition avoidance and
-            # the user's one-shot return reaction.  It is never chat history or
-            # long-term character memory.
+            # The visible utterance is also archived below; this cache only
+            # avoids repeating recent proactive messages.
             context.proactive_utterances.append(full_response.strip()[:180])
             context.proactive_utterances[:] = context.proactive_utterances[-5:]
 
-        if context.history_uid and full_response and not skip_history:
+        if context.history_uid and full_response:
             store_message(
                 conf_uid=context.character_config.conf_uid,
                 history_uid=context.history_uid,
                 role="ai",
                 content=full_response,
                 name=context.character_config.character_name,
+                expected_epoch=response_epoch,
             )
             logger.info(f"AI response completed (chars={len(full_response)})")
             schedule_memory_review = getattr(
-                context.agent_engine, "schedule_core_memory_review", None
+                context.agent_engine, "schedule_memory_review", None
             )
             if callable(schedule_memory_review):
                 schedule_memory_review()
@@ -349,6 +393,7 @@ async def process_single_conversation(
         return full_response  # Return accumulated full_response
 
     except asyncio.CancelledError:
+        turn_outcome = "interrupted"
         logger.info(f"🤡👍 Conversation {session_emoji} cancelled because interrupted.")
         raise
     except Exception as e:
@@ -358,6 +403,11 @@ async def process_single_conversation(
         )
         raise
     finally:
+        if companion is not None:
+            try:
+                companion.finish_turn(companion_receipt, turn_outcome)
+            except Exception as error:
+                logger.warning("Session outcome could not be saved: {}", type(error).__name__)
         await cleanup_conversation(tts_manager, session_emoji)
 
 
@@ -377,6 +427,7 @@ async def process_workspace_agent_turn(
     send = with_turn_id(websocket_send, turn_id)
     full_response = ""
     acted = False
+    turn_memory_epoch = memory_epoch(context.character_config.conf_uid)
     try:
         await send_conversation_start_signals(send)
         async for output_item in run_workspace_turn(runtime):
@@ -430,6 +481,7 @@ async def process_workspace_agent_turn(
                     role="ai",
                     content=full_response,
                     name=context.character_config.character_name,
+                    expected_epoch=turn_memory_epoch,
                 )
         return {"acted": acted, "response": full_response}
     finally:

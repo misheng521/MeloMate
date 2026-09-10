@@ -71,6 +71,9 @@ type WsMessage = {
     gestures?: string[];
   };
   conf_name?: string;
+  conf_uid?: string;
+  event_token?: string;
+  event_ready?: boolean;
   character_name?: string;
   client_uid?: string;
   success?: boolean;
@@ -356,6 +359,8 @@ let lastWorkspaceEventMs = Date.now();
 const handledWorkspaceEventIds = new Set<string>();
 let lastAppliedCharacterConfigFile = "";
 let currentAssistantName = "小可";
+let companionPollTimer = 0;
+let currentCompanionUid = "";
 let activeVrmModelId = "";
 let pendingVrmModelId = "";
 let isVrmModelSwitching = false;
@@ -372,6 +377,7 @@ let proactiveSpeakTimer = 0;
 let nextProactiveSpeakAt = Number.POSITIVE_INFINITY;
 let proactiveUnansweredCount = 0;
 let lastProactiveSpeakAt = 0;
+let previousProactiveSpeakAt = 0;
 let currentProactiveTurnId = "";
 let currentProactiveIsAutomatic = false;
 let isVideoFullscreen = false;
@@ -698,11 +704,11 @@ function selectedCharacterConfigFile() {
 }
 
 function characterDisplayName(filename: string) {
-  return filename.replace(/\.(ya?ml)$/i, "");
+  return filename.replace(/\.(ya?ml|md|txt)$/i, "");
 }
 
 function characterOptionDisplayName(option: CharacterConfigOption) {
-  return option.character_name || option.conf_name || option.name || characterDisplayName(option.filename);
+  return characterDisplayName(option.filename);
 }
 
 function selectedCharacterOption() {
@@ -1415,10 +1421,8 @@ function showMergedUserLine(texts: string[], fallbackText?: string) {
   return finalizePendingUserLine(fallbackText!.trim());
 }
 
-function appendAssistantLine(text: string, speakerName?: string) {
-  if (speakerName) {
-    setCurrentAssistantName(speakerName);
-  }
+function appendAssistantLine(text: string) {
+  syncAssistantNameFromSelection();
 
   const cleanText = sanitizeAssistantReply(text);
   if (!cleanText || cleanText === lastAssistantText) return;
@@ -1633,7 +1637,7 @@ function syncProactiveSpeakControls() {
 }
 
 function syncProactiveSpeakButton() {
-  proactiveSpeakButton.disabled = !isCapturing || !isWsReady || isAssistantResponding || isSettingsReadOnly;
+  proactiveSpeakButton.disabled = !isWsReady || isAssistantResponding || isSettingsReadOnly;
 }
 
 function refreshAvatarLayout() {
@@ -2220,7 +2224,7 @@ function proactiveBaseIntervalMs() {
 }
 
 function scheduleNextProactiveSpeak(now = Date.now()) {
-  if (!proactiveSpeakToggle.checked || !isCapturing) {
+  if (!proactiveSpeakToggle.checked || !isWsReady) {
     nextProactiveSpeakAt = Number.POSITIVE_INFINITY;
     return;
   }
@@ -2235,7 +2239,7 @@ function resetProactiveSilenceEpisode(now = Date.now()) {
   lastUserConversationActivityAt = now;
   proactiveUnansweredCount = 0;
   lastProactiveSpeakAt = 0;
-  nextProactiveSpeakAt = proactiveSpeakToggle.checked && isCapturing
+  nextProactiveSpeakAt = proactiveSpeakToggle.checked && isWsReady
     ? now + proactiveBaseIntervalMs()
     : Number.POSITIVE_INFINITY;
 }
@@ -2248,7 +2252,7 @@ function completeProactiveTurn(turnId?: string) {
   currentProactiveIsAutomatic = false;
   if (wasAutomatic) {
     scheduleNextProactiveSpeak();
-  } else if (proactiveSpeakToggle.checked && isCapturing) {
+  } else if (proactiveSpeakToggle.checked && isWsReady) {
     nextProactiveSpeakAt = Date.now() + proactiveBaseIntervalMs();
   } else {
     nextProactiveSpeakAt = Number.POSITIVE_INFINITY;
@@ -2273,13 +2277,7 @@ function proactiveTurnId() {
     : `proactive-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-async function requestProactiveSpeak(mode: "manual" | "automatic", announce = false) {
-  if (!isCapturing) {
-    if (announce) appendLine("system", "请先启动麦克风，再让 ta 说句话。");
-    syncProactiveSpeakButton();
-    return;
-  }
-
+async function requestProactiveSpeak(mode: "manual" | "automatic", announce = false, eventToken?: string) {
   if (!isWsReady) {
     appendLine("system", "MeloMate 后端还没有连接成功，暂时不能主动说话。");
     syncProactiveSpeakButton();
@@ -2307,9 +2305,11 @@ async function requestProactiveSpeak(mode: "manual" | "automatic", announce = fa
     console.warn("Capturing the proactive screen context failed.", error);
     return [];
   });
+  // A user turn may have replaced this opportunity while screen capture waited.
+  if (currentProactiveTurnId !== turnId) return;
   if (
-    currentProactiveTurnId !== turnId
-    || !isCapturing
+    !isWsReady
+    || (mode === "automatic" && !proactiveSpeakToggle.checked)
     || isUserSpeaking
     || isUserInputPriorityActive
   ) {
@@ -2319,6 +2319,7 @@ async function requestProactiveSpeak(mode: "manual" | "automatic", announce = fa
   }
   const sent = sendWs({
     type: "ai-speak-signal",
+    event_token: eventToken,
     turn_id: turnId,
     images,
     screen_vision: screenVisionConfigPayload(),
@@ -2337,6 +2338,7 @@ async function requestProactiveSpeak(mode: "manual" | "automatic", announce = fa
   }
   if (mode === "automatic") {
     proactiveUnansweredCount += 1;
+    previousProactiveSpeakAt = lastProactiveSpeakAt;
     lastProactiveSpeakAt = now;
   }
 }
@@ -2344,7 +2346,7 @@ async function requestProactiveSpeak(mode: "manual" | "automatic", announce = fa
 function restartProactiveSpeakLoop() {
   stopProactiveSpeakLoop();
 
-  if (!proactiveSpeakToggle.checked || !isCapturing) {
+  if (!proactiveSpeakToggle.checked || !isWsReady) {
     nextProactiveSpeakAt = Number.POSITIVE_INFINITY;
     return;
   }
@@ -2354,10 +2356,32 @@ function restartProactiveSpeakLoop() {
   }
 
   proactiveSpeakTimer = window.setInterval(() => {
-    if (!proactiveSpeakToggle.checked || !isCapturing || !canTriggerProactiveSpeak()) return;
+    if (!proactiveSpeakToggle.checked || !isWsReady || !canTriggerProactiveSpeak()) return;
     if (Date.now() < nextProactiveSpeakAt) return;
     void requestProactiveSpeak("automatic");
   }, proactiveSpeakCheckIntervalMs);
+}
+
+function pollCompanionState() {
+  if (!isWsReady) return;
+  sendWs({type: "companion-state-request", state: {
+    proactive_enabled: proactiveSpeakToggle.checked,
+    microphone_active: isCapturing,
+    screen_shared: screenVisionEnabled() && Boolean(latestScreenImage),
+  }});
+}
+
+function startCompanionStateLoop() {
+  if (companionPollTimer) window.clearInterval(companionPollTimer);
+  pollCompanionState();
+  companionPollTimer = window.setInterval(pollCompanionState, 5000);
+}
+
+function resetDisconnectedConversation() {
+  stopCurrentResponsePlayback(true);
+  cancelUserInputPriority();
+  activeAssistantTurnId = "";
+  resetProactiveSilenceEpisode();
 }
 
 function requestCredentialStatus() {
@@ -2553,6 +2577,8 @@ function connectWebSocket() {
     credentialStatusInitialized = false;
     requestCredentialStatus();
     startWorkspaceEventLoop();
+    startCompanionStateLoop();
+    restartProactiveSpeakLoop();
   };
 
   ws.onmessage = (event) => {
@@ -2573,6 +2599,11 @@ function connectWebSocket() {
     cancelPendingCredentialRequests();
     credentialStatusInitialized = false;
     stopWorkspaceEventLoop();
+    if (companionPollTimer) window.clearInterval(companionPollTimer);
+    companionPollTimer = 0;
+    currentCompanionUid = "";
+    stopProactiveSpeakLoop();
+    resetDisconnectedConversation();
     syncApplySettingsButtonState();
     syncProactiveSpeakButton();
     ws = null;
@@ -2656,6 +2687,24 @@ function cancelUserInputPriority() {
 
 function handleWsMessage(message: WsMessage) {
   if (runtimePanel.handle(message)) return;
+  if (message.type === "companion-state") {
+    if (message.success && message.conf_uid === currentCompanionUid && message.event_ready
+        && message.event_token && proactiveSpeakToggle.checked && canTriggerProactiveSpeak()) {
+      void requestProactiveSpeak("automatic", false, message.event_token);
+    }
+    return;
+  }
+  if (message.type === "event-opportunity-skipped") {
+    if (message.turn_id === currentProactiveTurnId) {
+      if (currentProactiveIsAutomatic) {
+        proactiveUnansweredCount = Math.max(0, proactiveUnansweredCount - 1);
+        lastProactiveSpeakAt = previousProactiveSpeakAt;
+      }
+      completeProactiveTurn(message.turn_id);
+      setThinking(false);
+    }
+    return;
+  }
   if (message.type === "credential-status") {
     savedChatApiKeyAvailable = Boolean(message.chat_api_key_saved);
     savedScreenVisionApiKeyAvailable = Boolean(message.screen_vision_api_key_saved);
@@ -2718,6 +2767,14 @@ function handleWsMessage(message: WsMessage) {
   if (message.type === "control" && message.text) {
     handleControlMessage(message.text, message.turn_id);
     return;
+  }
+
+  if (message.type === "proactive-silence") {
+    if (message.turn_id === currentProactiveTurnId && currentProactiveIsAutomatic) {
+      proactiveUnansweredCount = Math.max(0, proactiveUnansweredCount - 1);
+      lastProactiveSpeakAt = previousProactiveSpeakAt;
+    }
+    return; // Normal playback completion still ends this turn and schedules the next opportunity.
   }
 
   if (message.type === "full-text") {
@@ -2833,8 +2890,9 @@ function handleWsMessage(message: WsMessage) {
   }
 
   if (message.type === "set-model-and-conf") {
-    runtimePanel.connect(message.character_name || message.conf_name || "default");
-    setCurrentAssistantName(message.character_name || message.conf_name);
+    currentCompanionUid = message.conf_uid || "";
+    syncAssistantNameFromSelection();
+    runtimePanel.connect(currentAssistantName);
     if (typeof message.capabilities?.voice_clone === "boolean") {
       updateVoiceCloneCapability(message.capabilities.voice_clone);
       void sendClientVoiceCloneConfig();
@@ -2871,7 +2929,7 @@ function queueAudioMessage(message: WsMessage) {
       if (queueVersion !== audioQueueVersion || !shouldAcceptAssistantOutput({ turn_id: turnId })) return;
 
       if (text) {
-        appendAssistantLine(text, message.display_text?.name);
+        appendAssistantLine(text);
       }
 
       if (message.audio) {
@@ -3113,7 +3171,7 @@ async function finishBackendAudio() {
   setThinking(false);
   isAssistantResponding = false;
   const completedProactiveTurn = completeProactiveTurn(completion.turnId);
-  if (!completedProactiveTurn && proactiveSpeakToggle.checked && isCapturing) {
+  if (!completedProactiveTurn && proactiveSpeakToggle.checked && isWsReady) {
     nextProactiveSpeakAt = Date.now() + proactiveBaseIntervalMs();
   }
   if (completion.turnId && completion.turnId === activeAssistantTurnId) {
@@ -3441,6 +3499,7 @@ function stopCaptureInternal(announce: boolean) {
   stopProactiveSpeakLoop();
   completeProactiveTurn();
   resetProactiveSilenceEpisode();
+  restartProactiveSpeakLoop();
   syncProactiveSpeakButton();
 }
 
@@ -3637,6 +3696,8 @@ screenVisionIntervalInput.addEventListener("change", () => {
 });
 proactiveSpeakToggle.addEventListener("change", () => {
   syncProactiveSpeakControls();
+  pollCompanionState();
+  restartProactiveSpeakLoop();
 });
 proactiveIdleSecondsInput.addEventListener("change", () => {
   proactiveIdleSecondsInput.value = normalizeProactiveIdleSeconds(proactiveIdleSecondsInput.value);

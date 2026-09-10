@@ -17,18 +17,16 @@ from ..stateless_llm.stateless_llm_interface import StatelessLLMInterface
 from ..stateless_llm.claude_llm import AsyncLLM as ClaudeAsyncLLM
 from ..stateless_llm.openai_compatible_llm import AsyncLLM as OpenAICompatibleAsyncLLM
 from ...agentic_task_guidance import AGENTIC_TASK_GUIDANCE
-import copy
+from ...proactive_conversation import optional_proactive_output
 
 from ...chat_history_manager import (
-    commit_core_memory_review,
-    get_history,
-    prepare_core_memory_review,
-    record_core_memory_review_failure,
+    commit_memory_review,
+    get_context_history,
+    prepare_memory_review,
+    record_review_failure,
 )
 from ...memory_consolidator import (
-    MAX_REVIEW_RESPONSE_CHARS,
-    build_memory_review_request,
-    parse_memory_review_response,
+    review_memory,
 )
 from ..transformers import (
     sentence_divider,
@@ -221,73 +219,38 @@ class BasicMemoryAgent(AgentInterface):
 
         logger.info("BasicMemoryAgent initialized.")
 
-    def schedule_core_memory_review(self) -> bool:
+    def schedule_memory_review(self) -> bool:
         """Start one bounded background consolidation when its turn threshold is due."""
         if not self._memory_conf_uid:
             return False
         if self._memory_review_task and not self._memory_review_task.done():
             return False
 
-        snapshot = prepare_core_memory_review(self._memory_conf_uid)
+        snapshot = prepare_memory_review(self._memory_conf_uid)
         if snapshot is None:
             return False
         self._memory_review_task = asyncio.create_task(
-            self._run_core_memory_review(snapshot),
+            self._run_memory_review(snapshot),
             name=f"memory-review-{self._memory_conf_uid}",
         )
         return True
 
-    async def _run_core_memory_review(self, snapshot: dict) -> None:
+    async def _run_memory_review(self, snapshot: dict) -> None:
         try:
-            messages, system = build_memory_review_request(
-                snapshot, self._memory_character_name
-            )
-            response_parts: list[str] = []
-            response_size = 0
-            async with asyncio.timeout(60):
-                review_llm = copy.copy(self._llm)
-                if getattr(self, "_memory_model", "") and hasattr(review_llm, "model"):
-                    review_llm.model = self._memory_model
-                if hasattr(review_llm, "max_tokens"): review_llm.max_tokens = 4096
-                stream = review_llm.chat_completion(messages=messages, system=system)
-                async for event in stream:
-                    text = ""
-                    if isinstance(event, str):
-                        text = event
-                    elif isinstance(event, dict) and event.get("type") == "text_delta":
-                        text = str(event.get("text") or "")
-                    if not text:
-                        continue
-                    response_size += len(text)
-                    if response_size > MAX_REVIEW_RESPONSE_CHARS:
-                        raise ValueError("Memory review response exceeded its limit")
-                    response_parts.append(text)
-
-            candidate = parse_memory_review_response("".join(response_parts))
-            committed = commit_core_memory_review(
-                self._memory_conf_uid,
-                str(snapshot.get("snapshot_message_id") or ""),
-                candidate,
-                base_core_memory=(
-                    snapshot.get("core_memory")
-                    if isinstance(snapshot.get("core_memory"), dict)
-                    else None
-                ),
-                review_messages=(
-                    snapshot.get("messages")
-                    if isinstance(snapshot.get("messages"), list)
-                    else None
-                ),
-            )
+            candidate = await review_memory(self._llm, snapshot, self._memory_character_name)
+            committed = await asyncio.to_thread(commit_memory_review, self._memory_conf_uid, snapshot, candidate)
             if not committed:
                 raise ValueError("Memory review snapshot was no longer valid")
-            logger.info("Core memory review completed.")
+            logger.info("Text memory review completed.")
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            record_core_memory_review_failure(self._memory_conf_uid)
+            try:
+                await asyncio.to_thread(record_review_failure, self._memory_conf_uid, snapshot)
+            except Exception:
+                logger.warning("Could not persist the memory review retry time.")
             logger.warning(
-                "Core memory review failed safely ({}).", type(error).__name__
+                "Memory review was not saved ({}); raw history remains available.", type(error).__name__
             )
 
     async def close(self) -> None:
@@ -443,7 +406,8 @@ class BasicMemoryAgent(AgentInterface):
 
     def set_memory_from_history(self, conf_uid: str, history_uid: str) -> None:
         """Load memory from chat history."""
-        messages = get_history(conf_uid, history_uid)
+        self._memory_conf_uid = conf_uid
+        messages = get_context_history(conf_uid)
 
         self._memory = []
         for index, msg in enumerate(messages):
@@ -618,6 +582,10 @@ class BasicMemoryAgent(AgentInterface):
         self, input_data: BatchInput, include_memory: bool = True
     ) -> List[Dict[str, Any]]:
         """Prepare messages for LLM API call."""
+        if include_memory and getattr(self, "_memory_conf_uid", ""):
+            current_id = (input_data.metadata or {}).get("memory_message_id")
+            self._memory = [{"role": "user" if m["role"] == "human" else "assistant", "content": m["content"]}
+                            for m in get_context_history(self._memory_conf_uid, exclude_id=current_id)]
         messages = self._memory.copy() if include_memory else []
         user_content = []
         text_prompt = self._to_text_prompt(input_data)
@@ -1117,6 +1085,7 @@ class BasicMemoryAgent(AgentInterface):
             segment_method=self._segment_method,
             valid_tags=["think"],
         )
+        @optional_proactive_output()
         async def chat_with_memory(
             input_data: BatchInput,
         ) -> AsyncIterator[Union[str, Dict[str, Any]]]:

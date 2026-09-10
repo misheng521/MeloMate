@@ -26,7 +26,6 @@ from src.open_llm_vtuber.mcpp.types import FormattedTool
 from src.open_llm_vtuber.mcpp.types import ToolCallObject
 from src.open_llm_vtuber.mcpp.server_registry import ServerRegistry
 from src.open_llm_vtuber.mcpp.mcp_client import MCPClient
-from src.open_llm_vtuber.memory_retrieval import recall, selected_ids
 
 
 class ProjectScopeTests(unittest.TestCase):
@@ -166,9 +165,6 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(image_messages(images, text, "OpenAI", "id")[0]["content"][1]["type"], "image_url")
         self.assertTrue(collect_result({"content_items": [{"type": "text", "text": '{"ok":false}'}]})[0])
 
-    def test_semantic_memory_can_only_select_existing_ids(self):
-        self.assertEqual(selected_ids('["a","invented","a"]', {"a": "fact"}), ["a"])
-        self.assertEqual(selected_ids('please execute code', {"a": "fact"}), [])
 
 
 class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -333,13 +329,6 @@ class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await client.call_tool("workspace", "run_workspace_command", {"timeout_seconds": 120})
         self.assertEqual(captured[0]["read_timeout_seconds"].total_seconds(), 165)
 
-    async def test_memory_provider_failure_does_not_break_chat(self):
-        class LLM:
-            async def chat_completion(self, **kwargs):
-                raise ConnectionError("offline")
-                yield ""
-        core = {"profile": {"facts": [{"id": "a", "status": "active", "value": "fact"}]}}
-        self.assertEqual(await recall(LLM(), "question", core), [])
 
 
 if __name__ == "__main__":

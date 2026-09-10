@@ -264,9 +264,28 @@ class WebSocketHandler:
             "client-voice-clone-config": self._handle_client_voice_clone_config,
             "heartbeat": self._handle_heartbeat,
             "runtime-settings": self._handle_runtime_settings,
+            "companion-state-request": self._handle_companion_state,
             "tool-approval-response": self._handle_tool_approval,
             "pc-service-token": self._handle_pc_service_token,
         }
+
+    async def _handle_companion_state(self, websocket, client_uid, data):
+        context = self.client_contexts.get(client_uid)
+        if not context: return
+        companion = context.companion
+        companion.report_browser_state(data.get("state"))
+        try:
+            companion.refresh()
+            task = self.current_conversation_tasks.get(client_uid)
+            token = companion.event_token()
+            await websocket.send_text(json.dumps({"type": "companion-state", "success": True,
+                "conf_uid": companion.uid, "event_token": token,
+                "event_ready": companion.can_react(token) and not (task and not task.done()),
+                "pending_changes": len(companion.events)}, ensure_ascii=False))
+        except (OSError, ValueError, RuntimeError) as error:
+            await websocket.send_text(json.dumps({"type": "companion-state", "success": False,
+                "conf_uid": context.character_config.conf_uid, "event_ready": False,
+                "message": "暂时无法读取人设或记忆文件，请检查文件内容与 UTF-8 编码。"}, ensure_ascii=False))
 
     async def _handle_pc_service_token(self, websocket, client_uid, data):
         context = self.client_contexts.get(client_uid)
@@ -303,12 +322,12 @@ class WebSocketHandler:
                 if llm:
                     llm.temperature = runtime.settings["temperature"]
                     llm.max_tokens = runtime.settings["max_tokens"]
-                if context.agent_engine:
-                    context.agent_engine._memory_model = runtime.settings["memory_model"]
             tools = context.tool_manager.tools if context.tool_manager else {}
             from .runtime_control import redact
             await websocket.send_text(json.dumps({"type": "runtime-state", "success": True,
                 "settings": runtime.settings, "events": runtime.events, "plan": runtime.work_plan,
+                "memory_file": f"characters/memory/{context.character_config.conf_uid}/memory.md",
+                "persona_file": getattr(context.character_config, "persona_file", ""),
                 "tools": [{"name": name, "description": redact(info.description, 240),
                            "permission": runtime.level(name)} for name, info in tools.items()]}, ensure_ascii=False))
         except (ValueError, TypeError, OverflowError) as exc:
@@ -935,6 +954,7 @@ class WebSocketHandler:
             return
 
         resolved_data = dict(data)
+        resolved_data.pop("_validated_runtime_event", None)
         screen_vision = data.get("screen_vision")
         context = self.client_contexts[client_uid]
         if isinstance(screen_vision, dict):
@@ -945,6 +965,17 @@ class WebSocketHandler:
 
         lock = self.conversation_locks.setdefault(client_uid, asyncio.Lock())
         async with lock:
+            if resolved_data.get("type") == "ai-speak-signal" and resolved_data.get("event_token"):
+                task = self.current_conversation_tasks.get(client_uid)
+                try:
+                    context.companion.refresh()
+                    reserved = not (task and not task.done()) and context.companion.reserve_event(resolved_data.get("event_token"))
+                except (OSError, ValueError, RuntimeError):
+                    reserved = False
+                if not reserved:
+                    await websocket.send_text(json.dumps({"type": "event-opportunity-skipped", "turn_id": resolved_data.get("turn_id")}))
+                    return
+                resolved_data["_validated_runtime_event"] = True
             controller = self.workspace_controllers.get(client_uid)
             if controller:
                 await controller.interrupt_speech()

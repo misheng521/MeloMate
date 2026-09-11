@@ -45,7 +45,7 @@ class ProactiveConversationTests(unittest.TestCase):
         )
         self.assertIn("约 95 秒", prompt)
         self.assertIn("主动说过 3 次", prompt)
-        self.assertIn("自行判断此刻会有什么感受", prompt)
+        self.assertIn("自行决定是否开口", prompt)
         self.assertIn("事实本身不规定任何情绪", prompt)
         for prescribed in ("俏皮的小不耐烦", "一丝关心", "温暖自然地接住"):
             self.assertNotIn(prescribed, prompt)
@@ -60,7 +60,7 @@ class ProactiveConversationTests(unittest.TestCase):
             }
         )
         self.assertIn("现在用户重新开口了", prompt)
-        self.assertIn("自行判断此刻的感受与回应方式", prompt)
+        self.assertIn("自行决定回应方式", prompt)
         self.assertNotIn("闹别扭", prompt)
         self.assertNotIn("不会接受浏览器传来的这段话", prompt)
 

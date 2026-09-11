@@ -709,7 +709,8 @@ class ServiceContext:
 
         if self.character_config and getattr(self.character_config, "persona_file", ""):
             persona_prompt = read_prompt(self.system_config.config_alts_dir, self.character_config.persona_file)
-        persona_prompt += "\n\n" + CONVERSATION_GUIDANCE
+        persona_prompt = (CONVERSATION_GUIDANCE + "\n\n# 当前角色资料\n" + persona_prompt
+                          + "\n\n# MeloMate 运行说明\n")
         companion = getattr(self, "companion", None)
         if companion is not None:
             persona_prompt += "\n\n" + companion.prompt()

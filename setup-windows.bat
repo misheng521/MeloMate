@@ -83,6 +83,19 @@ if errorlevel 1 (
   goto :fail
 )
 
+echo Preparing browser tools with the main installation...
+"%VENV_PYTHON%" "%ROOT%backend\browser_environment.py"
+if errorlevel 1 (
+  echo No usable Edge, Chrome or prepared Chromium was found. Downloading Chromium for browser tools...
+  "%VENV_PYTHON%" -m playwright install chromium
+  if errorlevel 1 (
+    echo [ERROR] Browser preparation failed. Check the connection and rerun this installer.
+    goto :fail
+  )
+  "%VENV_PYTHON%" "%ROOT%backend\browser_environment.py"
+  if errorlevel 1 goto :fail
+)
+
 echo [5/7] Optional OmniVoice voice cloning...
 if /I "%MELOMATE_VOICE_CLONE%"=="1" set "OPTIONAL_REQUESTED=1"
 if /I "%MELOMATE_VOICE_CLONE%"=="yes" set "OPTIONAL_REQUESTED=1"

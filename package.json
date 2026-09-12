@@ -10,7 +10,8 @@
     "build": "vite build",
     "check": "tsc --noEmit",
     "test:security": "node --test tests/security-boundaries.test.mjs",
-    "test:session": "node --test tests/companion-state.test.mjs"
+    "test:session": "node --test tests/companion-state.test.mjs",
+    "test:runtime": "node --test tests/runtime-panel.test.mjs"
   },
   "engines": {
     "node": ">=20"

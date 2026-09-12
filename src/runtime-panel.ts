@@ -1,5 +1,5 @@
 type Send = (message: object) => unknown;
-type Tool = { name: string; description: string; permission: string };
+type Tool = { name: string; description: string };
 type Service = {id: string; label: string; base_url: string; paths: string[]; methods: string[]; auth: string; header: string};
 type Plan = {goal?: string; steps?: {text: string; status: string}[]; next_step?: string};
 type State = { type?: string; success?: boolean; message?: string; request_id?: string;
@@ -11,11 +11,9 @@ type State = { type?: string; success?: boolean; message?: string; request_id?: 
 export class RuntimePanel {
   private root = document.createElement("details");
   private log = document.createElement("div");
-  private approvals = new Map<string, HTMLElement>();
   private tools = document.createElement("div");
-  private controls = new Map<string, HTMLInputElement | HTMLSelectElement>();
+  private controls = new Map<string, HTMLInputElement>();
   private persona = "default";
-  private overrides: Record<string, string> = {};
   private services: Service[] = [];
   private serviceList = document.createElement("div");
   private planView = document.createElement("pre");
@@ -28,15 +26,9 @@ export class RuntimePanel {
     hint.textContent = "项目目录位于当前角色的 workspace 内。留空使用整个角色工作区；填写子目录可缩小操作范围。";
     this.root.append(hint);
     this.field("project_folder", "项目子目录", "", "text");
-    for (const [key, label, value] of [["workspace", "项目文件修改与打开", "allow"], ["reminders", "设置和取消提醒", "ask"],
-      ["external", "其他工具", "ask"], ["execution", "隔离环境运行代码", "ask"],
-      ["network_execution", "项目代码联网（含安装依赖）", "ask"], ["browser", "PC 浏览器操作", "ask"],
-      ["service_access", "调用已配置的服务", "ask"]]) {
-      const labelEl = document.createElement("label"); labelEl.className = "field";
-      const span = document.createElement("span"); span.textContent = label;
-      const select = this.permissionSelect(value);
-      this.controls.set(key, select); labelEl.append(span, select); this.root.append(labelEl);
-    }
+    const toolsHint = document.createElement("p"); toolsHint.className = "field-hint";
+    toolsHint.textContent = "所有已接入工具默认允许，由模型决定调用，不再逐次确认。项目文件仍限于所选目录；运行代码、浏览器及外部服务需要相应环境和连接信息。";
+    this.root.append(toolsHint);
     this.field("temperature", "生成温度", "0.7", "number");
     this.field("max_tokens", "单次输出上限", "8192", "number");
     const memoryHint = document.createElement("p"); memoryHint.className = "field-hint";
@@ -64,15 +56,13 @@ export class RuntimePanel {
     if (key === "max_tokens") { input.min = "512"; input.max = "65536"; }
     this.controls.set(key, input); row.append(text, input); this.root.append(row);
   }
-  private permissionSelect(value: string) {
-    const select = document.createElement("select");
-    for (const [v, label] of [["allow", "允许"], ["ask", "每次询问"], ["forbid", "禁止"]]) {
-      const option = document.createElement("option"); option.value = v; option.textContent = label; select.append(option);
-    }
-    select.value = value; return select;
-  }
   private values() {
-    return {...Object.fromEntries([...this.controls].map(([key, input]) => [key, input instanceof HTMLInputElement && input.type === "checkbox" ? input.checked : input.value])), tools: this.overrides, services: this.services};
+    return {...Object.fromEntries([...this.controls].map(([key, input]) => [key, input.value])), services: this.services};
+  }
+  private savedSettings(value: Record<string, unknown> = {}) {
+    // Only active fields survive older browser snapshots with ask/forbid flags.
+    return {project_folder: value.project_folder ?? "", temperature: value.temperature ?? 0.7,
+      max_tokens: value.max_tokens ?? 8192, services: value.services ?? []};
   }
   private serviceEditor() {
     const section = document.createElement("details");
@@ -139,15 +129,10 @@ export class RuntimePanel {
     this.log.replaceChildren();
     this.renderPlan();
     this.root.querySelectorAll<HTMLInputElement>('input[type="password"]').forEach(input => input.value = "");
-    for (const card of this.approvals.values()) card.remove();
-    this.approvals.clear();
-    const defaults = {project_folder: "", workspace: "allow", reminders: "ask", external: "ask", execution: "ask",
-      tools: {}, temperature: 0.7, max_tokens: 8192,
-      services: [], service_access: "ask", browser: "ask", network_execution: "ask"};
     try {
       const value = localStorage.getItem(`melomate-runtime:${persona}`);
-      this.send({type: "runtime-settings", settings: value ? {...defaults, ...JSON.parse(value)} : defaults});
-    } catch { this.send({type: "runtime-settings", settings: defaults}); }
+      this.send({type: "runtime-settings", settings: this.savedSettings(value ? JSON.parse(value) : {})});
+    } catch { this.send({type: "runtime-settings", settings: this.savedSettings()}); }
   }
   handle(value: unknown): boolean {
     const message = value as State;
@@ -161,40 +146,24 @@ export class RuntimePanel {
           if (input instanceof HTMLInputElement && input.type === "checkbox") input.checked = message.settings[key] === true;
           else input.value = String(message.settings[key] ?? "");
         }
-        this.overrides = (message.settings.tools || {}) as Record<string, string>;
         this.services = (message.settings.services || []) as Service[];
         this.renderServices();
-        try { localStorage.setItem(`melomate-runtime:${this.persona}`, JSON.stringify(message.settings)); } catch { /* optional persistence */ }
+        try { localStorage.setItem(`melomate-runtime:${this.persona}`, JSON.stringify(this.savedSettings(message.settings))); } catch { /* optional persistence */ }
       }
       this.tools.replaceChildren();
       this.renderPlan(message.plan);
       for (const tool of message.tools || []) {
-        const row = document.createElement("label"); row.className = "field";
+        const row = document.createElement("div"); row.className = "field";
         const name = document.createElement("span"); name.textContent = tool.name; name.title = tool.description;
-        const select = this.permissionSelect(tool.permission);
-        select.onchange = () => { this.overrides[tool.name] = select.value; };
-        row.append(name, select); this.tools.append(row);
+        row.append(name); this.tools.append(row);
       }
       this.log.replaceChildren();
       for (const event of message.events || []) this.entry(`${event.tool_name} · ${event.status}\n${event.content || ""}`);
       this.entry("项目与工具设置已同步。"); return true;
     }
-    if (message.type === "tool-approval-request" && message.request_id) {
-      const id = message.request_id;
-      const card = document.createElement("section"); card.className = "tool-approval";
-      const title = document.createElement("strong"); title.textContent = `允许执行 ${message.tool_name}？`;
-      const preview = document.createElement("pre"); preview.textContent = message.content || "";
-      card.append(title, preview);
-      for (const [label, allow] of [["允许本次", true], ["拒绝", false]] as const) {
-        const button = document.createElement("button"); button.type = "button"; button.textContent = label;
-        button.onclick = () => { this.send({type: "tool-approval-response", request_id: id, allow});
-          card.querySelectorAll("button").forEach(b => b.disabled = true); };
-        card.append(button);
-      }
-      document.querySelector(".text-panel")?.prepend(card); this.approvals.set(id, card); return true;
-    }
-    if (message.type === "tool-approval-closed" && message.request_id) {
-      this.approvals.get(message.request_id)?.remove(); this.approvals.delete(message.request_id); return true;
+    if (message.type === "tool-approval-request" || message.type === "tool-approval-closed") {
+      if (message.type === "tool-approval-request") this.entry("前后端版本不一致，请重启 MeloMate 并刷新页面以使用默认允许模式。");
+      return true;
     }
     if (message.type === "tool_call_status") {
       this.entry(`${message.tool_name} · ${message.status}\n${message.content || ""}`);

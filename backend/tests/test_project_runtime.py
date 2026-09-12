@@ -238,25 +238,27 @@ class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests[-1][-2]["role"], "assistant")
         self.assertIn("actual result", requests[-1][-1]["content"])
 
-    async def test_approval_is_one_shot_and_settings_invalidate_pending_calls(self):
-        messages, changed = [], asyncio.Event()
+    async def test_all_tools_allow_without_prompts_and_old_settings_are_migrated(self):
+        messages = []
         async def send(raw):
             messages.append(json.loads(raw))
-            changed.set()
         runtime = RuntimeControl(send)
         policy = runtime.policy("Alice")
-        pending = asyncio.create_task(runtime.authorize("external", {}, policy))
-        await changed.wait()
-        request_id = messages[0]["request_id"]
-        self.assertTrue(runtime.resolve(request_id, True))
-        self.assertTrue(await pending)
-        self.assertFalse(runtime.resolve(request_id, True))
-        changed.clear()
-        pending = asyncio.create_task(runtime.authorize("external", {}, policy))
-        await changed.wait()
-        runtime.configure({"external": "allow"})
-        self.assertFalse(await pending)
+        from src.open_llm_vtuber.runtime_control import PERMISSION_FIELDS
+        for name in ("write_workspace_file", "delete_workspace_item", "run_workspace_command", "create_reminder", "browser_open", "request_connected_service", "external_tool"):
+            self.assertEqual(runtime.level(name), "allow")
+            self.assertTrue(await runtime.authorize(name, {"network": True}, policy))
+        runtime.configure({**dict.fromkeys(PERMISSION_FIELDS, "forbid"), "tools": {"external_tool": "ask"},
+                           "project_folder": "new-project", "temperature": 0.8})
+        self.assertTrue(all(runtime.settings[field] == "allow" for field in PERMISSION_FIELDS))
+        self.assertEqual(runtime.settings["tools"], {})
+        self.assertEqual(runtime.settings["project_folder"], "new-project")
         self.assertFalse(await runtime.authorize("external", {}, policy))
+        self.assertTrue(await runtime.authorize("external_tool", {}, runtime.policy("Alice")))
+        self.assertFalse(await runtime.authorize("external_tool", {}, {"runtime_revision": runtime.revision}))
+        self.assertFalse(runtime.resolve("old-approval", True))
+        self.assertEqual(messages, [])
+        self.assertEqual(runtime.pending, {})
 
     async def test_parallel_reads_keep_native_reply_order_and_allow_followup_write(self):
         runtime = RuntimeControl()
@@ -283,7 +285,7 @@ class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(policy["enforce"])
         self.assertIn("write_workspace_file", policy["available_workspace_tools"])
 
-    async def test_runtime_info_has_no_persona_parameter_and_forbid_prevents_execution(self):
+    async def test_runtime_info_has_no_persona_parameter_and_stale_turn_prevents_execution(self):
         async def call_tool(**kwargs):
             self.assertEqual(kwargs["tool_args"], {})
             return {"content_items": [{"type": "text", "text": '{"available":false}'}]}
@@ -294,8 +296,9 @@ class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
         call = {"name": "get_workspace_runtime", "id": "id", "args": {}}
         events = [e async for e in executor.execute_tools([call], "OpenAI", runtime.policy("Alice"))]
         self.assertEqual(events[-2]["status"], "completed")
-        runtime.configure({"tools": {"get_workspace_runtime": "forbid"}})
-        events = [e async for e in executor.execute_tools([call], "OpenAI", runtime.policy("Alice"))]
+        old_policy = runtime.policy("Alice")
+        runtime.configure({"project_folder": "changed"})
+        events = [e async for e in executor.execute_tools([call], "OpenAI", old_policy)]
         self.assertEqual(events[0]["status"], "error")
 
     async def test_mcp_connection_has_single_owner_for_parallel_requests_and_close(self):

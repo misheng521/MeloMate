@@ -25,6 +25,9 @@ letta-client>=0.1
 pywin32>=306; sys_platform == "win32"
 tzdata>=2024.1; sys_platform == "win32"
 
+# Browser tool bridge is part of the main installation.
+-r pc-tools-requirements.txt
+
 # Optional providers may require extra packages:
 # azure-cognitiveservices-speech
 # faster-whisper

@@ -1,7 +1,7 @@
-"""Trusted UI settings and invocation approvals, independent of user wording.
+"""Project settings with tools allowed by default and no per-call approvals.
 
-Only the authenticated chat WebSocket can change settings or resolve approvals.
-Tools and workspace documents cannot grant themselves capabilities.
+Project scope, service validation and current-conversation checks still apply.
+Legacy permission settings are normalized so upgrades cannot restore prompts.
 """
 from __future__ import annotations
 
@@ -11,20 +11,20 @@ import json
 import re
 import hashlib
 import math
-from pathlib import Path
-from uuid import uuid4
 
 from .workspace_intent import WORKSPACE_READ_TOOLS, WORKSPACE_SIDE_EFFECT_TOOLS, WORKSPACE_ALWAYS_AVAILABLE_TOOLS
 from .daily_tool_policy import DAILY_READ_TOOLS, DAILY_SIDE_EFFECT_TOOLS
-from .pc_tools import FILE_TOOLS, BROWSER_TOOLS, INFO_TOOLS
+from .pc_tools import FILE_TOOLS, INFO_TOOLS
 from .pc_network import validate_services
 
 PROJECT_TOOLS = frozenset({*WORKSPACE_READ_TOOLS, *WORKSPACE_SIDE_EFFECT_TOOLS,
                           *FILE_TOOLS,
                           *WORKSPACE_ALWAYS_AVAILABLE_TOOLS, "validate_workspace_project",
                           "run_workspace_command", "get_workspace_runtime"})
-SAFE_READS = frozenset({*WORKSPACE_READ_TOOLS, *DAILY_READ_TOOLS,
-                       *INFO_TOOLS,
+PERMISSION_FIELDS = ("workspace", "reminders", "external", "execution",
+                     "browser", "service_access", "network_execution")
+# Read-only classification controls safe parallel dispatch, not permissions.
+SAFE_READS = frozenset({*WORKSPACE_READ_TOOLS, *DAILY_READ_TOOLS, *INFO_TOOLS,
                        "validate_workspace_project", "get_workspace_runtime"})
 
 
@@ -39,10 +39,9 @@ def redact(value: object, limit: int = 2000) -> str:
 class RuntimeControl:
     def __init__(self, send=None):
         self.send = send
-        self.settings = {"project_folder": "", "workspace": "allow", "reminders": "ask",
-                         "external": "ask", "execution": "ask", "tools": {},
-                         "temperature": 0.7, "max_tokens": 8192}
-        self.settings.update({"services": [], "service_access": "ask", "browser": "ask", "network_execution": "ask"})
+        self.settings = {"project_folder": "", "tools": {}, "services": [],
+                         "temperature": 0.7, "max_tokens": 8192,
+                         **dict.fromkeys(PERMISSION_FIELDS, "allow")}
         self.work_plan = {}
         self.pending: dict[str, asyncio.Future] = {}
         self.events: list[dict] = []
@@ -57,17 +56,10 @@ class RuntimeControl:
             result["project_folder"] = "/".join(parts)
         if "services" in data:
             result["services"] = validate_services(data["services"])
-        for field in ("workspace", "reminders", "external", "execution", "browser", "service_access", "network_execution"):
-            if field in data:
-                if data[field] not in {"allow", "ask", "forbid"}:
-                    raise ValueError("Invalid permission level")
-                result[field] = data[field]
-        if "tools" in data:
-            permissions = data["tools"]
-            if not isinstance(permissions, dict) or len(permissions) > 300:
-                raise ValueError("Invalid tool permissions")
-            result["tools"] = {str(k)[:64]: v for k, v in permissions.items()
-                               if v in {"allow", "ask", "forbid"}}
+        # Keep compatibility fields in snapshots, but discard old per-tool and
+        # per-group choices from browsers that used the previous settings UI.
+        result.update(dict.fromkeys(PERMISSION_FIELDS, "allow"))
+        result["tools"] = {}
         if "temperature" in data:
             if not math.isfinite(float(data["temperature"])):
                 raise ValueError("Temperature must be finite")
@@ -79,59 +71,15 @@ class RuntimeControl:
         self.revision += 1
 
     def level(self, name: str) -> str:
-        override = self.settings["tools"].get(name)
-        if override:
-            return override
-        if name == "run_workspace_command":
-            return self.settings["execution"]
-        if name in BROWSER_TOOLS:
-            return self.settings["browser"]
-        if name == "request_connected_service":
-            return self.settings["service_access"]
-        if name in {"update_work_plan", "edit_memory"}:
-            return "allow"
-        if name in SAFE_READS:
-            return "allow"
-        group = "workspace" if name in PROJECT_TOOLS else "reminders" if name in DAILY_SIDE_EFFECT_TOOLS else "external"
-        return self.settings[group]
+        return "allow"
 
     async def authorize(self, name: str, arguments: dict, policy: dict) -> bool:
-        if policy.get("runtime_revision") != self.revision:
-            return False
-        level = self.level(name)
-        if name == "run_workspace_command" and arguments.get("network") is True:
-            network_level = self.settings["network_execution"]
-            level = "forbid" if "forbid" in {level, network_level} else "ask" if "ask" in {level, network_level} else "allow"
-        if level == "forbid":
-            return False
-        if level == "allow":
-            return True
-        if not self.send:
-            return False
-        request_id = uuid4().hex
-        future = asyncio.get_running_loop().create_future()
-        self.pending[request_id] = future
-        try:
-            await self.send(json.dumps({"type": "tool-approval-request", "request_id": request_id,
-                                       "tool_name": name, "content": redact(json.dumps(arguments, ensure_ascii=False)),
-                                       "project_folder": self.settings["project_folder"]}, ensure_ascii=False))
-            allowed = bool(await asyncio.wait_for(future, 300))
-            return allowed and policy.get("runtime_revision") == self.revision
-        except asyncio.TimeoutError:
-            return False
-        finally:
-            self.pending.pop(request_id, None)
-            try:
-                await self.send(json.dumps({"type": "tool-approval-closed", "request_id": request_id}))
-            except Exception:
-                pass  # Disconnect cannot convert a denial into execution.
+        # An old turn must not run against a newly selected project or service.
+        return policy.get("runtime_control") is self and policy.get("runtime_revision") == self.revision
 
     def resolve(self, request_id: str, allow: bool) -> bool:
-        future = self.pending.get(request_id)
-        if future is None or future.done():
-            return False
-        future.set_result(allow is True)
-        return True
+        # Old clients can still send this message; it no longer authorizes work.
+        return False
 
     def cancel_pending(self) -> None:
         for future in self.pending.values():

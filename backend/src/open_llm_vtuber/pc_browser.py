@@ -1,4 +1,4 @@
-"""Optional, session-owned PC browser. All HTTP traffic goes through our gateway."""
+"""Session-owned PC browser. All HTTP traffic goes through our gateway."""
 from __future__ import annotations
 import asyncio
 import base64
@@ -6,6 +6,7 @@ import mimetypes
 from urllib.parse import urlsplit, unquote
 from uuid import uuid4
 from . import pc_network as network
+from browser_environment import installed_browser
 
 
 class PCBrowser:
@@ -24,14 +25,16 @@ class PCBrowser:
         try:
             from playwright.async_api import async_playwright
         except ImportError as exc:
-            raise RuntimeError("Browser component is not installed. See backend/pc-tools-requirements.txt; do not claim a browser test ran.") from exc
+            raise RuntimeError("Browser component is missing. Update this installation with setup-windows.bat; do not claim a browser test ran.") from exc
         self.driver = await async_playwright().start()
         try:
             options = {"headless": True, "proxy": {"server": "http://127.0.0.1:9"},
                        "args": ["--force-webrtc-ip-handling-policy=disable_non_proxied_udp", "--disable-quic"]}
-            # Use an installed PC Edge first; no browser is downloaded here.
-            try: self.browser = await self.driver.chromium.launch(channel="msedge", **options)
-            except Exception: self.browser = await self.driver.chromium.launch(**options)
+            # Share discovery with setup. No downloads occur during a chat.
+            executable = installed_browser()
+            if executable:
+                options["executable_path"] = executable
+            self.browser = await self.driver.chromium.launch(**options)
             self.context = await self.browser.new_context(viewport={"width": 1280, "height": 800},
                 service_workers="block", accept_downloads=False)
             self.context.set_default_timeout(10000)

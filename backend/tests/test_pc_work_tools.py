@@ -103,12 +103,13 @@ class PCWorkTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.configure({"services": [{"id": "fixture", "base_url": "http://127.0.0.1:1", "auth": "bearer"}]})
         self.assertFalse(self.tools.credential_ready(self.tools.service("fixture")))
 
-    async def test_denied_tool_never_contacts_service(self):
-        self.runtime.configure({"service_access": "forbid"})
+    async def test_stale_turn_never_contacts_service(self):
+        policy = self.runtime.policy("Alice")
+        self.runtime.configure({"project_folder": "changed"})
         manager = ToolManager(initial_tools_dict=definitions())
         executor = ToolExecutor(None, manager, self.tools)
         call = {"name": "request_connected_service", "id": "test", "args": {"service_id": "fixture", "method": "POST", "path": "/api/jobs", "json_body": {}}}
-        events = [event async for event in executor.execute_tools([call], "OpenAI", self.runtime.policy("Alice"))]
+        events = [event async for event in executor.execute_tools([call], "OpenAI", policy)]
         self.assertEqual(events[0]["status"], "error")
         self.assertEqual(FixtureHandler.requests, [])
 
@@ -153,7 +154,7 @@ class PCWorkTests(unittest.IsolatedAsyncioTestCase):
         for path in (self.root / "backend/cache/task-progress").glob("*.json"):
             self.assertNotIn("不该留在", path.read_text(encoding="utf-8"))
 
-    async def test_event_can_observe_session_but_cannot_write_or_override_denial(self):
+    async def test_event_can_observe_session_but_cannot_write_or_use_stale_scope(self):
         from test_text_memory import source_method, BACKEND
         attach = source_method(BACKEND / "src/open_llm_vtuber/conversations/single_conversation.py",
                                "_attach_live_workspace_context", {})
@@ -171,8 +172,7 @@ class PCWorkTests(unittest.IsolatedAsyncioTestCase):
         events = [event async for event in executor.execute_tools([write], "OpenAI", policy)]
         self.assertEqual(events[0]["status"], "error")
         self.assertEqual(self.runtime.work_plan, {})
-        self.runtime.configure({"tools": {"get_session_state": "forbid"}})
-        policy = attach(context, "", {"skip_history": True})["workspace_tool_policy"]
+        self.runtime.configure({"project_folder": "changed"})
         events = [event async for event in executor.execute_tools([call], "OpenAI", policy)]
         self.assertEqual(events[0]["status"], "error")
 
@@ -189,11 +189,11 @@ class PCWorkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reloaded.work_plan, {})
         self.assertEqual(FixtureHandler.requests, [])
 
-    async def test_network_execution_has_separate_permission_and_strict_boolean(self):
+    async def test_network_execution_allows_legacy_settings_but_requires_strict_boolean(self):
         self.runtime.configure({"execution": "allow", "network_execution": "forbid"})
         policy = self.runtime.policy("Alice")
         self.assertTrue(await self.runtime.authorize("run_workspace_command", {"network": False}, policy))
-        self.assertFalse(await self.runtime.authorize("run_workspace_command", {"network": True}, policy))
+        self.assertTrue(await self.runtime.authorize("run_workspace_command", {"network": True}, policy))
         with self.assertRaises(ValueError): scope_arguments("run_workspace_command", {"network": "true"}, policy)
 
     async def test_browser_gateway_blocks_private_network_and_project_traversal(self):

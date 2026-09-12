@@ -4,7 +4,7 @@ MeloMate is a local AI voice companion app with lightweight VRM rendering, micro
 
 This repository is the **source edition**. It is intended for development, GitHub hosting, and reproducible setup. Generated folders such as `node_modules`, `dist`, `backend/.venv`, caches, logs, and large downloaded backend models are intentionally not part of the source tree.
 
-Project-scoped tools, invocation permissions, optional isolated code execution,
+Project-scoped tools, default-allowed tool calls, optional isolated code execution,
 and configurable chat/memory behavior are described in
 [项目与工具使用说明](docs/PROJECT_AGENT.md). Source-only checks do not require
 installing the full voice runtime.
@@ -38,8 +38,10 @@ installer from the project root:
 setup-windows.bat
 ```
 
-The installer always installs and verifies the common application first. It
-then asks:
+The installer installs and verifies the common application and browser tools.
+It reuses installed Edge or Chrome; if neither is available and no Playwright
+Chromium is prepared, it downloads Chromium in the same setup flow. No separate
+PC browser installation is needed. It then asks:
 
 - `Install voice cloning now? [Y/N]`
 - Choose `N` for the smaller normal installation. Setup finishes without

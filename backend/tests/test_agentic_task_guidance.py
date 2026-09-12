@@ -27,7 +27,9 @@ class AgenticTaskGuidanceTests(unittest.TestCase):
         self.assertIn("mcp_servers.json", AGENTIC_TASK_GUIDANCE)
         self.assertIn("不要把 MCP", AGENTIC_TASK_GUIDANCE)
         self.assertIn("不得写入工作区文件或代码", AGENTIC_TASK_GUIDANCE)
-        self.assertIn("有授权后继续安装、连接和验证", AGENTIC_TASK_GUIDANCE)
+        self.assertIn("已接入工具统一允许，不重复询问调用许可", AGENTIC_TASK_GUIDANCE)
+        self.assertIn("遵守用户“不下载”等明确限制", AGENTIC_TASK_GUIDANCE)
+        self.assertIn("条件具备后继续验证", AGENTIC_TASK_GUIDANCE)
 
     def test_tool_work_keeps_the_character_voice(self):
         self.assertIn("当前角色自然的说话方式", AGENTIC_TASK_GUIDANCE)

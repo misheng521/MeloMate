@@ -1113,6 +1113,4 @@ audio {
  .runtime-panel .field { margin: 8px 0; }
  .runtime-panel button { margin: 5px; }
  .runtime-log { max-height: 220px; overflow: auto; }
- .runtime-log pre, .tool-approval pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
- .tool-approval { padding: 12px; border: 2px solid #9275cc; border-radius: 10px; background: var(--panel-bg, #252434); color: #fff; }
- .tool-approval button { margin: 6px; padding: 6px 16px; cursor: pointer; }
+ .runtime-log pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }

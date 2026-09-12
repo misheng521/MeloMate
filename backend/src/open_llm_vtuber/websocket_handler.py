@@ -313,7 +313,7 @@ class WebSocketHandler:
             if isinstance(data.get("settings"), dict):
                 task = self.current_conversation_tasks.get(client_uid)
                 if task and not task.done():
-                    raise ValueError("请先停止当前任务，再修改项目或工具权限。")
+                    raise ValueError("请先停止当前任务，再修改项目或服务设置。")
                 runtime.configure(data["settings"])
                 await context.pc_tools.close()
                 runtime.load_progress(context.character_config.character_name or context.character_config.conf_name)

@@ -1,3 +1,3 @@
-# Optional PC browser component; use installed Edge or separately provision Chromium.
-# This source file does not install anything automatically.
+# Included by the main requirements; also used to update older installations.
+# setup-windows.bat reuses installed Edge/Chrome before preparing Chromium.
 playwright>=1.49,<2

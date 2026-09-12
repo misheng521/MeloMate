@@ -584,9 +584,14 @@ class BasicMemoryAgent(AgentInterface):
         """Prepare messages for LLM API call."""
         if include_memory and getattr(self, "_memory_conf_uid", ""):
             current_id = (input_data.metadata or {}).get("memory_message_id")
-            self._memory = [{"role": "user" if m["role"] == "human" else "assistant", "content": m["content"]}
-                            for m in get_context_history(self._memory_conf_uid, exclude_id=current_id)]
-        messages = self._memory.copy() if include_memory else []
+            history = get_context_history(self._memory_conf_uid, exclude_id=current_id,
+                                          protocol_provider=getattr(getattr(self, "_llm", None), "protocol_key", None))
+            self._memory = [{"role": "user" if m["role"] == "human" else "assistant", "content": m["content"]} for m in history]
+            messages = []
+            for item, ordinary in zip(history, self._memory):
+                messages.extend(item.get("protocol_messages") or [ordinary])
+        else:
+            messages = self._memory.copy() if include_memory else []
         user_content = []
         text_prompt = self._to_text_prompt(input_data)
         memory_text_prompt = self._to_text_prompt(
@@ -680,6 +685,12 @@ class BasicMemoryAgent(AgentInterface):
             current_turn_text = ""
 
             async for event in stream:
+                if event["type"] == "reasoning_delta":
+                    yield event
+                    continue
+                if event["type"] == "thinking_block":
+                    current_assistant_message_content.append(event["block"])
+                    continue
                 if event["type"] == "text_delta":
                     text = event["text"]
                     current_turn_text += text
@@ -830,6 +841,7 @@ class BasicMemoryAgent(AgentInterface):
     ) -> AsyncIterator[Union[str, Dict[str, Any]]]:
         """Handle OpenAI interaction with tool support."""
         messages = initial_messages.copy()
+        protocol_start = len(messages)
         current_turn_text = ""
         pending_tool_calls: Union[List[ToolCallObject], List[Dict[str, Any]]] = []
         current_system_prompt = system_prompt
@@ -876,10 +888,17 @@ class BasicMemoryAgent(AgentInterface):
             pending_tool_calls.clear()
             current_turn_text = ""
             assistant_message_for_api = None
+            captured_protocol = None
             detected_prompt_json = None
             goto_next_while_iteration = False
 
             async for event in stream:
+                if isinstance(event, dict) and event.get("type") == "reasoning_delta":
+                    yield event
+                    continue
+                if isinstance(event, dict) and event.get("type") == "assistant_protocol":
+                    captured_protocol = event["message"]
+                    continue
                 if event == "__API_NOT_SUPPORT_TOOLS__":
                     self.prompt_mode_flag = True
                     self._json_detector.reset()
@@ -931,12 +950,15 @@ class BasicMemoryAgent(AgentInterface):
                         }
                         break
             await stream.aclose()
+            if captured_protocol and assistant_message_for_api:
+                assistant_message_for_api = captured_protocol
+                current_turn_text = captured_protocol.get("content") or current_turn_text
             if goto_next_while_iteration:
                 continue
 
             if detected_prompt_json:
                 logger.info("Processing tools detected via prompt mode JSON.")
-                messages.append({"role": "assistant", "content": current_turn_text})
+                messages.append(captured_protocol or {"role": "assistant", "content": current_turn_text})
                 if remember_turn:
                     self._add_message(current_turn_text, "assistant")
 
@@ -1066,6 +1088,10 @@ class BasicMemoryAgent(AgentInterface):
                 continue
 
             else:
+                if captured_protocol:
+                    messages.append(captured_protocol)
+                    yield {"type": "turn_protocol", "provider": getattr(self._llm, "protocol_key", ""),
+                           "messages": messages[protocol_start:]}
                 if current_turn_text:
                     yield current_turn_text
                     if remember_turn:
@@ -1210,6 +1236,12 @@ class BasicMemoryAgent(AgentInterface):
                 complete_response = ""
                 async for event in token_stream:
                     text_chunk = ""
+                    if isinstance(event, dict) and event.get("type") == "reasoning_delta":
+                        yield event
+                        continue
+                    if isinstance(event, dict) and event.get("type") == "assistant_protocol":
+                        yield {"type": "turn_protocol", "provider": getattr(self._llm, "protocol_key", ""), "messages": [event["message"]]}
+                        continue
                     if isinstance(event, dict) and event.get("type") == "text_delta":
                         text_chunk = event.get("text", "")
                     elif isinstance(event, str):

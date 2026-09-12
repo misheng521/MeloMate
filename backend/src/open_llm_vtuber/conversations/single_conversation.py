@@ -139,6 +139,7 @@ async def process_single_conversation(
     tts_manager = TTSTaskManager()
     full_response = ""  # Initialize full_response here
     reply_started = False
+    response_protocol = None
     companion = getattr(context, "companion", None)
     companion_receipt = None
     turn_outcome = "error"
@@ -283,6 +284,12 @@ async def process_single_conversation(
             agent_output_stream = context.agent_engine.chat(batch_input)
 
             async for output_item in agent_output_stream:
+                if isinstance(output_item, dict) and output_item.get("type") == "turn_protocol":
+                    response_protocol = output_item
+                    continue
+                if isinstance(output_item, dict) and output_item.get("type") == "reasoning_delta":
+                    await websocket_send_with_turn(json.dumps(output_item, ensure_ascii=False))
+                    continue
                 if isinstance(output_item, dict) and output_item.get("type") == "proactive-silence":
                     turn_outcome = "silent"
                     await websocket_send_with_turn(json.dumps(output_item))
@@ -308,6 +315,10 @@ async def process_single_conversation(
                     )
 
                     await websocket_send_with_turn(json.dumps(output_item))
+                    if output_item.get("tool_name") == "update_work_plan" and output_item.get("status") == "completed":
+                        runtime = getattr(context, "runtime_control", None)
+                        if runtime:
+                            await websocket_send_with_turn(json.dumps({"type": "work-plan", "plan": runtime.work_plan}, ensure_ascii=False))
 
                 elif isinstance(output_item, (SentenceOutput, AudioOutput)):
                     if not reply_started:
@@ -382,6 +393,8 @@ async def process_single_conversation(
                 content=full_response,
                 name=context.character_config.character_name,
                 expected_epoch=response_epoch,
+                # A memory edit within this turn invalidates its earlier reasoning too.
+                protocol=response_protocol if not stream_failed and response_epoch == turn_memory_epoch else None,
             )
             logger.info(f"AI response completed (chars={len(full_response)})")
             schedule_memory_review = getattr(

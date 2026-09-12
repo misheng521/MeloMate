@@ -1,182 +1,167 @@
 type Send = (message: object) => unknown;
-type Tool = { name: string; description: string };
-type Service = {id: string; label: string; base_url: string; paths: string[]; methods: string[]; auth: string; header: string};
 type Plan = {goal?: string; steps?: {text: string; status: string}[]; next_step?: string};
-type State = { type?: string; success?: boolean; message?: string; request_id?: string;
-  tool_id?: string; tool_name?: string; content?: string; status?: string;
-  preview_image?: string;
-  memory_file?: string; persona_file?: string;
-  settings?: Record<string, unknown>; tools?: Tool[]; events?: State[]; plan?: Plan };
+type Event = {tool_name?: string; status?: string; content?: string; preview_image?: string};
+type State = Event & {type?: string; turn_id?: string; text?: string; success?: boolean;
+  message?: string; settings?: Record<string, unknown>; plan?: Plan};
+type Trace = {id: string; reasoning: string; truncated: boolean; events: Event[]; plan?: Plan; finished: boolean};
 
 export class RuntimePanel {
-  private root = document.createElement("details");
-  private log = document.createElement("div");
-  private tools = document.createElement("div");
-  private controls = new Map<string, HTMLInputElement>();
+  private root = document.createElement("section");
+  private body = document.createElement("div");
+  private stop = document.createElement("button");
+  private heading = document.createElement("h2");
+  private traces = new Map<string, Trace>();
   private persona = "default";
-  private services: Service[] = [];
-  private serviceList = document.createElement("div");
-  private planView = document.createElement("pre");
-  private memoryFiles = document.createElement("p");
+  private activeId = "";
+  private selectedId = "";
+  private returnFocus: HTMLElement | null = null;
+  private redrawPending = false;
   constructor(private send: Send) {
-    this.root.className = "runtime-panel";
-    const summary = document.createElement("summary"); summary.textContent = "项目与工具";
-    this.root.append(summary);
-    const hint = document.createElement("p"); hint.className = "field-hint";
-    hint.textContent = "项目目录位于当前角色的 workspace 内。留空使用整个角色工作区；填写子目录可缩小操作范围。";
-    this.root.append(hint);
-    this.field("project_folder", "项目子目录", "", "text");
-    const toolsHint = document.createElement("p"); toolsHint.className = "field-hint";
-    toolsHint.textContent = "所有已接入工具默认允许，由模型决定调用，不再逐次确认。项目文件仍限于所选目录；运行代码、浏览器及外部服务需要相应环境和连接信息。";
-    this.root.append(toolsHint);
-    this.field("temperature", "生成温度", "0.7", "number");
-    this.field("max_tokens", "单次输出上限", "8192", "number");
-    const memoryHint = document.createElement("p"); memoryHint.className = "field-hint";
-    memoryHint.textContent = "人设和记忆使用 UTF-8 文本，保存后下一轮加载。新增记忆保留对话；局部删改会处理相关旧内容，清空整份记忆才重置上下文。原聊天档案仍可查看。记忆由当前聊天模型按积累量整理。";
-    this.memoryFiles.className = "field-hint";
-    this.root.append(memoryHint, this.memoryFiles);
-    const save = document.createElement("button"); save.type = "button"; save.className = "secondary-button";
-    save.textContent = "应用项目设置";
-    save.onclick = () => this.send({type: "runtime-settings", settings: this.values()});
-    const refresh = document.createElement("button"); refresh.type = "button"; refresh.className = "secondary-button";
-    refresh.textContent = "刷新工具与记录"; refresh.onclick = () => this.send({type: "runtime-settings"});
-    const stop = document.createElement("button"); stop.type = "button"; stop.className = "secondary-button";
-    stop.textContent = "停止当前任务"; stop.onclick = () => this.send({type: "interrupt-signal", text: ""});
-    this.root.append(save, refresh, stop, this.planView);
-    this.serviceEditor();
-    this.root.append(this.tools, this.log);
-    document.querySelector("#settingsPanel")?.append(this.root);
-    this.log.className = "runtime-log"; this.log.setAttribute("aria-live", "polite");
-  }
-  private field(key: string, label: string, value: string, type: string) {
-    const row = document.createElement("label"); row.className = "field";
-    const text = document.createElement("span"); text.textContent = label;
-    const input = document.createElement("input"); input.type = type; input.value = value;
-    if (key === "temperature") { input.min = "0"; input.max = "2"; input.step = "0.1"; }
-    if (key === "max_tokens") { input.min = "512"; input.max = "65536"; }
-    this.controls.set(key, input); row.append(text, input); this.root.append(row);
-  }
-  private values() {
-    return {...Object.fromEntries([...this.controls].map(([key, input]) => [key, input.value])), services: this.services};
+    this.root.className = "reply-details";
+    this.root.hidden = true;
+    this.root.setAttribute("aria-label", "回复详情");
+    const header = document.createElement("div"); header.className = "reply-details-header";
+    const back = document.createElement("button"); back.type = "button"; back.className = "secondary-button";
+    back.textContent = "← 返回"; back.onclick = () => this.close();
+    this.heading.textContent = "回复详情"; this.heading.tabIndex = -1;
+    this.stop.type = "button"; this.stop.className = "secondary-button"; this.stop.textContent = "停止当前任务";
+    this.stop.onclick = () => this.send({type: "interrupt-signal", text: ""});
+    header.append(back, this.heading, this.stop);
+    this.body.className = "reply-details-body";
+    this.root.append(header, this.body);
+    this.root.addEventListener("keydown", event => { if (event.key === "Escape") this.close(); });
+    document.querySelector(".text-panel")?.append(this.root);
   }
   private savedSettings(value: Record<string, unknown> = {}) {
-    // Only active fields survive older browser snapshots with ask/forbid flags.
-    return {project_folder: value.project_folder ?? "", temperature: value.temperature ?? 0.7,
-      max_tokens: value.max_tokens ?? 8192, services: value.services ?? []};
-  }
-  private serviceEditor() {
-    const section = document.createElement("details");
-    const title = document.createElement("summary"); title.textContent = "连接服务与 API"; section.append(title);
-    const hint = document.createElement("p"); hint.className = "field-hint";
-    hint.textContent = "可连接电脑上的程序、局域网设备或公共 API。填写你确认的地址与允许路径；模型自行决定何时调用。密钥在下面单独保存，不填进聊天。";
-    section.append(hint, this.serviceList);
-    const inputs: Record<string, HTMLInputElement> = {};
-    for (const [key, label, value] of [["id", "服务 ID（英文）", ""], ["label", "名称", ""],
-      ["base_url", "地址（协议、主机、端口）", ""], ["paths", "允许路径（逗号分隔）", "/api/"],
-      ["methods", "允许方法（逗号分隔）", "GET,HEAD"], ["header", "自定义认证请求头", "Authorization"]]) {
-      const row = document.createElement("label"); row.className = "field";
-      const span = document.createElement("span"); span.textContent = label;
-      const input = document.createElement("input"); input.value = value; inputs[key] = input;
-      row.append(span, input); section.append(row);
-    }
-    const auth = document.createElement("select");
-    for (const [value, label] of [["none", "无需密钥"], ["bearer", "Bearer Token"], ["header", "自定义请求头密钥"]]) {
-      const option = document.createElement("option"); option.value = value; option.textContent = label; auth.append(option);
-    }
-    const authLabel = document.createElement("label"); authLabel.className = "field";
-    const authText = document.createElement("span"); authText.textContent = "认证方式"; authLabel.append(authText, auth); section.append(authLabel);
-    const save = document.createElement("button"); save.type = "button"; save.textContent = "添加或更新服务";
-    save.onclick = () => {
-      const service: Service = {id: inputs.id.value.trim(), label: inputs.label.value.trim(), base_url: inputs.base_url.value.trim(),
-        paths: inputs.paths.value.split(",").map(s => s.trim()).filter(Boolean), methods: inputs.methods.value.toUpperCase().split(",").map(s => s.trim()).filter(Boolean), auth: auth.value, header: inputs.header.value.trim()};
-      this.send({type: "runtime-settings", settings: {...this.values(), services: [...this.services.filter(s => s.id !== service.id), service]}});
-    };
-    const secret = document.createElement("input"); secret.type = "password"; secret.autocomplete = "new-password";
-    secret.placeholder = "先应用服务，再在此输入密钥"; secret.setAttribute("aria-label", "服务密钥");
-    const saveSecret = document.createElement("button"); saveSecret.type = "button"; saveSecret.textContent = "安全保存密钥";
-    saveSecret.onclick = () => { this.send({type: "pc-service-token", service_id: inputs.id.value.trim(), secret: secret.value}); secret.value = ""; };
-    const clearSecret = document.createElement("button"); clearSecret.type = "button"; clearSecret.textContent = "清除密钥";
-    clearSecret.onclick = () => this.send({type: "pc-service-token", service_id: inputs.id.value.trim(), clear: true});
-    section.append(save, secret, saveSecret, clearSecret);
-    this.root.append(section);
-    this.serviceList.addEventListener("click", event => {
-      const target = event.target as HTMLElement;
-      const service = this.services.find(s => s.id === target.dataset.edit);
-      if (!service) return;
-      for (const [key, input] of Object.entries(inputs)) input.value = key === "paths" ? service.paths.join(",") : key === "methods" ? service.methods.join(",") : String(service[key as keyof Service]);
-      auth.value = service.auth;
-    });
-  }
-  private renderServices() {
-    this.serviceList.replaceChildren();
-    for (const service of this.services) {
-      const row = document.createElement("div");
-      const edit = document.createElement("button"); edit.type = "button"; edit.dataset.edit = service.id;
-      edit.textContent = `${service.label} · ${service.base_url}`;
-      const remove = document.createElement("button"); remove.type = "button"; remove.textContent = "移除连接";
-      remove.onclick = () => this.send({type: "runtime-settings", settings: {...this.values(), services: this.services.filter(s => s.id !== service.id)}});
-      row.append(edit, remove); this.serviceList.append(row);
-    }
-  }
-  private renderPlan(plan?: Plan) {
-    const status: Record<string, string> = {pending: "待处理", in_progress: "进行中", completed: "已完成", blocked: "待补充条件"};
-    this.planView.textContent = plan?.goal ? `当前任务：${plan.goal}\n${(plan.steps || []).map(step => `${status[step.status] || step.status}：${step.text}`).join("\n")}\n下一步：${plan.next_step || ""}` : "";
-    this.planView.className = "runtime-plan";
+    return {project_folder: value.project_folder ?? "", services: value.services ?? []};
   }
   connect(persona: string) {
+    if (persona !== this.persona) { this.close(); this.traces.clear(); }
+    this.finish(this.activeId);
+    this.activeId = "";
     this.persona = persona;
-    this.memoryFiles.textContent = "";
-    this.log.replaceChildren();
-    this.renderPlan();
-    this.root.querySelectorAll<HTMLInputElement>('input[type="password"]').forEach(input => input.value = "");
     try {
       const value = localStorage.getItem(`melomate-runtime:${persona}`);
       this.send({type: "runtime-settings", settings: this.savedSettings(value ? JSON.parse(value) : {})});
     } catch { this.send({type: "runtime-settings", settings: this.savedSettings()}); }
   }
+  begin(id: string) {
+    if (!id) return;
+    this.finish(this.activeId);
+    this.activeId = id;
+    if (!this.traces.has(id)) this.traces.set(id, {id, reasoning: "", truncated: false, events: [], finished: false});
+    this.prune();
+  }
+  finish(id: string) {
+    const trace = this.traces.get(id);
+    if (trace) { trace.finished = true; this.scheduleRender(); }
+  }
+  disconnect() { this.finish(this.activeId); this.activeId = ""; }
+  bindReply(line: HTMLElement, id: string, text: string, prefix: string) {
+    // An inline semantic button preserves the original line wrapping.
+    const button = document.createElement("span");
+    button.setAttribute("role", "button"); button.tabIndex = 0;
+    button.className = "reply-detail-trigger"; button.textContent = text;
+    button.title = "双击查看这条回复的思考与工具记录";
+    button.setAttribute("aria-label", "查看回复详情：" + text.slice(0, 80));
+    const persona = this.persona;
+    const open = () => { if (persona === this.persona) this.open(id, button); };
+    button.ondblclick = open;
+    button.addEventListener("keydown", event => {
+      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); }
+    });
+    const label = document.createElement("span"); label.textContent = prefix;
+    line.replaceChildren(label, button);
+  }
+  private open(id: string, source: HTMLElement) {
+    this.selectedId = id;
+    this.returnFocus = source;
+    this.root.hidden = false;
+    document.querySelector(".text-panel")?.classList.add("show-reply-details");
+    this.render(); this.heading.focus();
+  }
+  private close() {
+    this.root.hidden = true;
+    this.selectedId = "";
+    document.querySelector(".text-panel")?.classList.remove("show-reply-details");
+    this.returnFocus?.focus(); this.returnFocus = null;
+  }
   handle(value: unknown): boolean {
     const message = value as State;
-    if (message.type === "pc-service-token-result") { this.entry(message.message || "凭据状态已更新"); return true; }
-    if (message.type === "work-plan") { this.renderPlan(message.plan); return true; }
     if (message.type === "runtime-state") {
-      if (!message.success) { this.entry(message.message || "设置失败"); return true; }
-      this.memoryFiles.textContent = [message.persona_file ? `人设：characters/profiles/${message.persona_file}` : "", message.memory_file ? `记忆：${message.memory_file}` : ""].filter(Boolean).join("；");
-      if (message.settings) {
-        for (const [key, input] of this.controls) {
-          if (input instanceof HTMLInputElement && input.type === "checkbox") input.checked = message.settings[key] === true;
-          else input.value = String(message.settings[key] ?? "");
-        }
-        this.services = (message.settings.services || []) as Service[];
-        this.renderServices();
+      if (message.success && message.settings) {
         try { localStorage.setItem(`melomate-runtime:${this.persona}`, JSON.stringify(this.savedSettings(message.settings))); } catch { /* optional persistence */ }
       }
-      this.tools.replaceChildren();
-      this.renderPlan(message.plan);
-      for (const tool of message.tools || []) {
-        const row = document.createElement("div"); row.className = "field";
-        const name = document.createElement("span"); name.textContent = tool.name; name.title = tool.description;
-        row.append(name); this.tools.append(row);
-      }
-      this.log.replaceChildren();
-      for (const event of message.events || []) this.entry(`${event.tool_name} · ${event.status}\n${event.content || ""}`);
-      this.entry("项目与工具设置已同步。"); return true;
-    }
-    if (message.type === "tool-approval-request" || message.type === "tool-approval-closed") {
-      if (message.type === "tool-approval-request") this.entry("前后端版本不一致，请重启 MeloMate 并刷新页面以使用默认允许模式。");
+      // Global restored logs do not belong to a specific reply.
       return true;
     }
-    if (message.type === "tool_call_status") {
-      this.entry(`${message.tool_name} · ${message.status}\n${message.content || ""}`);
-      if (message.preview_image && /^data:image\/(jpeg|png);base64,[A-Za-z0-9+/=]+$/.test(message.preview_image) && message.preview_image.length < 12000000) {
-        const preview = document.createElement("img"); preview.src = message.preview_image; preview.alt = "工具返回的浏览器截图";
-        preview.style.maxWidth = "100%"; this.log.append(preview);
+    if (message.type === "pc-service-token-result" || message.type === "tool-approval-request" || message.type === "tool-approval-closed") return true;
+    if (!["reasoning_delta", "tool_call_status", "work-plan"].includes(message.type || "")) return false;
+    // Ignore unscoped and late events instead of assigning them to another reply.
+    if (!message.turn_id || message.turn_id !== this.activeId) return true;
+    const trace = this.traces.get(message.turn_id);
+    if (!trace || trace.finished) return true;
+    if (message.type === "reasoning_delta") {
+      const text = typeof message.text === "string" ? message.text : "";
+      const room = Math.max(0, 250000 - trace.reasoning.length);
+      trace.reasoning += text.slice(0, room);
+      trace.truncated ||= text.length > room;
+    } else if (message.type === "work-plan") {
+      trace.plan = message.plan;
+    } else {
+      const event: Event = {tool_name: String(message.tool_name || "工具"), status: String(message.status || ""), content: String(message.content || "").slice(0, 4000)};
+      if (message.preview_image && message.preview_image.length < 4000000 && /^data:image\/(jpeg|png);base64,[A-Za-z0-9+/=]+$/.test(message.preview_image)) {
+        for (const previous of trace.events) delete previous.preview_image;
+        event.preview_image = message.preview_image;
       }
-      return true;
+      trace.events.push(event);
+      trace.events = trace.events.slice(-100);
     }
-    return false;
+    this.prune(); this.scheduleRender(); return true;
   }
-  private entry(text: string) {
-    const p = document.createElement("pre"); p.textContent = text.slice(0, 2000); this.log.append(p);
-    while (this.log.childElementCount > 40) this.log.firstElementChild?.remove();
+  private prune() {
+    let remaining = 8000000, kept = 0;
+    for (const trace of [...this.traces.values()].reverse()) {
+      const size = trace.reasoning.length + JSON.stringify(trace.events).length;
+      if ((size > remaining || kept >= 120) && trace.id !== this.activeId && trace.id !== this.selectedId) {
+        this.traces.delete(trace.id);
+      } else { remaining -= size; kept++; }
+    }
+  }
+  private scheduleRender() {
+    if (this.root.hidden || this.redrawPending) return;
+    this.redrawPending = true;
+    requestAnimationFrame(() => { this.redrawPending = false; if (!this.root.hidden) this.render(); });
+  }
+  private section(title: string, text: string) {
+    const heading = document.createElement("h3"); heading.textContent = title;
+    const content = document.createElement("pre"); content.textContent = text;
+    this.body.append(heading, content);
+  }
+  private render() {
+    const scroll = this.body.scrollTop;
+    this.body.replaceChildren();
+    const trace = this.traces.get(this.selectedId);
+    this.stop.hidden = !trace || trace.finished || trace.id !== this.activeId;
+    if (!trace) {
+      this.section("暂无记录", "这条回复没有可用的详情记录，可能来自旧会话或记录已清理。");
+      return;
+    }
+    this.section("思考内容", trace.reasoning || (trace.finished ? "本次 API 未返回可展示的思考内容。" : "正在等待 API 返回思考内容……"));
+    if (trace.truncated) this.section("显示提示", "这条思考内容较长，详情页只显示前 250,000 字符；此显示限制不截断 API 的协议回传。");
+    if (trace.plan?.goal) {
+      const labels: Record<string, string> = {pending: "待处理", in_progress: "进行中", completed: "已完成", blocked: "待补充条件"};
+      this.section("任务计划", `${trace.plan.goal}\n${(trace.plan.steps || []).map(step => `${labels[step.status] || step.status}：${step.text}`).join("\n")}\n${trace.plan.next_step || ""}`);
+    }
+    this.section("工具记录", trace.events.length ? "本条回复最近的工具调用与结果：" : "这条回复暂时没有工具调用记录。");
+    const labels: Record<string, string> = {running: "执行中", completed: "已完成", error: "失败"};
+    for (const event of trace.events) {
+      this.section(`${event.tool_name} · ${labels[event.status || ""] || event.status}`, event.content || "");
+      if (event.preview_image) {
+        const img = document.createElement("img"); img.src = event.preview_image; img.alt = "工具返回的截图";
+        this.body.append(img);
+      }
+    }
+    this.body.scrollTop = scroll;
   }
 }

@@ -623,7 +623,6 @@ class ServiceContext:
             base_url=base_url,
             llm_api_key=api_key,
             model=model,
-            temperature=self.runtime_control.settings["temperature"],
             interrupt_method="user",
         )
 
@@ -631,8 +630,6 @@ class ServiceContext:
             await self.agent_engine.close()
         self.agent_engine = None
         await self.init_agent(agent_config, self.character_config.persona_prompt)
-        if hasattr(self.agent_engine, "_llm"):
-            self.agent_engine._llm.max_tokens = self.runtime_control.settings["max_tokens"]
         self._load_short_memory_into_agent()
         self.client_api_config = {
             "base_url": base_url,

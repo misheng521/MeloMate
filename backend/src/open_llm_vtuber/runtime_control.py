@@ -10,7 +10,6 @@ import copy
 import json
 import re
 import hashlib
-import math
 
 from .workspace_intent import WORKSPACE_READ_TOOLS, WORKSPACE_SIDE_EFFECT_TOOLS, WORKSPACE_ALWAYS_AVAILABLE_TOOLS
 from .daily_tool_policy import DAILY_READ_TOOLS, DAILY_SIDE_EFFECT_TOOLS
@@ -40,7 +39,6 @@ class RuntimeControl:
     def __init__(self, send=None):
         self.send = send
         self.settings = {"project_folder": "", "tools": {}, "services": [],
-                         "temperature": 0.7, "max_tokens": 8192,
                          **dict.fromkeys(PERMISSION_FIELDS, "allow")}
         self.work_plan = {}
         self.pending: dict[str, asyncio.Future] = {}
@@ -60,12 +58,8 @@ class RuntimeControl:
         # per-group choices from browsers that used the previous settings UI.
         result.update(dict.fromkeys(PERMISSION_FIELDS, "allow"))
         result["tools"] = {}
-        if "temperature" in data:
-            if not math.isfinite(float(data["temperature"])):
-                raise ValueError("Temperature must be finite")
-            result["temperature"] = max(0.0, min(2.0, float(data["temperature"])))
-        if "max_tokens" in data:
-            result["max_tokens"] = max(512, min(65536, int(data["max_tokens"])))
+        result.pop("temperature", None)
+        result.pop("max_tokens", None)
         self.cancel_pending()
         self.settings = result
         self.revision += 1

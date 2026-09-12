@@ -230,6 +230,35 @@ class TextMemoryTests(unittest.TestCase):
         self.notes.write_text("新资料", encoding="utf-8")
         self.assertEqual(len(builder(agent, data)), 2)
 
+    def test_reasoning_protocol_is_replayed_only_for_matching_provider_and_unchanged_memory(self):
+        provider = "a" * 64
+        protocol = {"provider": provider, "messages": [
+            {"role": "assistant", "content": "", "reasoning_content": "private reasoning", "tool_calls": [{"id": "t", "type": "function", "function": {"name": "read", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "t", "content": "result"},
+            {"role": "assistant", "content": "answer", "reasoning_content": "after tool"}]}
+        self.say("question")
+        memory.store_message("Alice", self.uid, "ai", "answer", protocol=protocol)
+        self.assertNotIn("private reasoning", json.dumps(memory.get_history("Alice")))
+        self.assertNotIn("private reasoning", json.dumps(memory.get_context_history("Alice")))
+        self.assertEqual(memory.get_context_history("Alice", protocol_provider=provider)[-1]["protocol_messages"], protocol["messages"])
+        self.assertNotIn("protocol_messages", memory.get_context_history("Alice", protocol_provider="b" * 64)[-1])
+        builder = source_method(BACKEND / "src/open_llm_vtuber/agent/agents/basic_memory_agent.py", "_to_messages", {"get_context_history": memory.get_context_history})
+        agent = types.SimpleNamespace(_memory_conf_uid="Alice", _memory=[], _llm=types.SimpleNamespace(protocol_key=provider),
+            _to_text_prompt=lambda *a, **k: "next", _add_message=lambda *a: None)
+        messages = builder(agent, types.SimpleNamespace(metadata={}, images=None))
+        self.assertEqual(messages[1:-1], protocol["messages"])
+        memory.modify_latest_message("Alice", self.uid, "ai", "corrected answer")
+        self.assertFalse(any("protocol_messages" in m for m in memory.get_context_history("Alice", protocol_provider=provider)))
+
+    def test_partial_memory_edit_cannot_replay_old_reasoning(self):
+        source = self.say("用户叫小林。")
+        state = memory.read_memory("Alice")
+        memory.edit_memory("Alice", state["revision"], "", "用户叫小林。", [source])
+        memory.store_message("Alice", self.uid, "ai", "知道了", protocol={"provider": "a" * 64,
+            "messages": [{"role": "assistant", "content": "知道了", "reasoning_content": "小林是旧称呼"}]})
+        self.notes.write_text("用户叫小陈。", encoding="utf-8")
+        self.assertNotIn("小林是旧称呼", json.dumps(memory.get_context_history("Alice", protocol_provider="a" * 64), ensure_ascii=False))
+
     def test_plain_persona_file_is_sufficient_and_hot_reloadable(self):
         (self.root / "新人.md").write_text("你叫新人。", encoding="utf-8")
         first = text_character(self.root, "新人.md")
@@ -373,6 +402,22 @@ class TextMemoryTests(unittest.TestCase):
 
 
 class AsyncMemoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_thinking_is_forwarded_separately_and_never_becomes_spoken_or_searchable_reply(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(memory, "CHAT_HISTORY_DIR", Path(directory) / "memory"):
+            root = Path(directory)
+            (root / "Alice.md").write_text("你叫 Alice。", encoding="utf-8")
+            runner, context, sent = self.conversation_fixture(root)
+            sentence = context.agent_engine.outputs[0]
+            protocol = {"type": "turn_protocol", "provider": "a" * 64, "messages": [
+                {"role": "assistant", "content": sentence.text, "reasoning_content": "only reasoning"}]}
+            context.agent_engine.outputs = [{"type": "reasoning_delta", "text": "only reasoning"}, protocol, sentence]
+            await runner(context, sent.append_async, "client", "你好", turn_id="turn1")
+            self.assertEqual(memory.get_history("Alice")[-1]["content"], sentence.text)
+            events = [json.loads(item) for item in sent]
+            self.assertTrue(any(e.get("type") == "reasoning_delta" and e.get("text") == "only reasoning" for e in events))
+            self.assertFalse(any(e.get("type") == "turn_protocol" for e in events))
+            self.assertEqual(memory.get_context_history("Alice", protocol_provider="a" * 64)[-1]["protocol_messages"], protocol["messages"])
+
     async def test_turn_that_corrects_memory_still_archives_its_reply(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(memory, "CHAT_HISTORY_DIR", Path(directory) / "memory"):
             root = Path(directory)
@@ -387,11 +432,14 @@ class AsyncMemoryTests(unittest.IsolatedAsyncioTestCase):
                 state = memory.read_memory("Alice")
                 result = memory.edit_memory("Alice", state["revision"], "用户叫小林。", "用户叫小陈。", [data.metadata["memory_message_id"]])
                 context.pc_tools.memory_edit_epoch = result["_memory_epoch"]
+                yield {"type": "turn_protocol", "provider": "a" * 64, "messages": [
+                    {"role": "assistant", "content": "你好，很高兴认识你。", "reasoning_content": "旧思考称呼小林"}]}
                 async for item in original_chat(data): yield item
             context.agent_engine.chat = chat
             await runner(context, sent.append_async, "client", "现在叫我小陈。")
             self.assertEqual(memory.get_history("Alice")[-1]["role"], "ai")
             self.assertIn("小陈", memory.get_memory_prompt("Alice"))
+            self.assertFalse(any("protocol_messages" in m for m in memory.get_context_history("Alice", protocol_provider="a" * 64)))
 
     async def test_conversation_turn_archives_real_text_and_reloads_persona(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(memory, "CHAT_HISTORY_DIR", Path(directory) / "memory"):

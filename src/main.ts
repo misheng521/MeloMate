@@ -1246,7 +1246,7 @@ function keepActiveUserInputLinesAtBottom() {
   });
 }
 
-function appendLine(role: LineRole, text: string) {
+function appendLine(role: LineRole, text: string, turnId?: string) {
   if (role === "system" && isHiddenSystemError(text)) {
     console.warn(text);
     return null;
@@ -1262,6 +1262,7 @@ function appendLine(role: LineRole, text: string) {
   line.dataset.time = currentTime();
   line.dataset.rawText = text;
   line.textContent = `${line.dataset.time} ${roleLabel(role)}：${text}`;
+  if (role === "assistant") runtimePanel.bindReply(line, turnId || activeAssistantTurnId, text, `${line.dataset.time} ${roleLabel(role)}：`);
   transcriptLog.appendChild(line);
   if (!activeUserInputLines().includes(line)) {
     keepActiveUserInputLinesAtBottom();
@@ -1421,20 +1422,21 @@ function showMergedUserLine(texts: string[], fallbackText?: string) {
   return finalizePendingUserLine(fallbackText!.trim());
 }
 
-function appendAssistantLine(text: string) {
+function appendAssistantLine(text: string, turnId?: string) {
   syncAssistantNameFromSelection();
 
   const cleanText = sanitizeAssistantReply(text);
   if (!cleanText || cleanText === lastAssistantText) return;
   if (/^[.。…]+$/.test(cleanText) && lastAssistantLine) {
     lastAssistantText = `${lastAssistantText}${cleanText}`;
-    lastAssistantLine.textContent = `${lastAssistantLine.textContent || ""}${cleanText}`;
+    const reply = lastAssistantLine.querySelector(".reply-detail-trigger");
+    if (reply) reply.textContent = `${reply.textContent || ""}${cleanText}`;
     subtitle.textContent = `${subtitle.textContent}${cleanText}`;
     return;
   }
   lastAssistantText = cleanText;
   heardAssistantText = [heardAssistantText, cleanText].filter(Boolean).join(" ");
-  lastAssistantLine = appendLine("assistant", cleanText);
+  lastAssistantLine = appendLine("assistant", cleanText, turnId);
   subtitle.textContent = cleanText;
 }
 
@@ -2594,6 +2596,7 @@ function connectWebSocket() {
   };
 
   ws.onclose = () => {
+    runtimePanel.disconnect();
     isWsReady = false;
     cancelPendingVoiceCloneRequests();
     cancelPendingCredentialRequests();
@@ -2628,6 +2631,8 @@ async function waitForWebSocketReady(timeoutMs = 10_000) {
 function handleControlMessage(text: string, turnId?: string) {
   if (text === "conversation-chain-start") {
     if (!acceptAssistantTurn(turnId)) return;
+    runtimePanel.begin(turnId || "");
+    lastAssistantLine = null;
     lastAssistantText = "";
     heardAssistantText = "";
     isAssistantResponding = true;
@@ -2639,6 +2644,7 @@ function handleControlMessage(text: string, turnId?: string) {
 
   if (text === "conversation-chain-end") {
     if (!shouldAcceptAssistantOutput({ turn_id: turnId })) return;
+    runtimePanel.finish(turnId || "");
     void finishBackendAudio();
     if (turnId && turnId === pendingUserTurnId) {
       pendingUserTurnId = "";
@@ -2686,6 +2692,7 @@ function cancelUserInputPriority() {
 }
 
 function handleWsMessage(message: WsMessage) {
+  if (["reasoning_delta", "tool_call_status", "work-plan"].includes(message.type || "") && !shouldAcceptAssistantOutput(message)) return;
   if (runtimePanel.handle(message)) return;
   if (message.type === "companion-state") {
     if (message.success && message.conf_uid === currentCompanionUid && message.event_ready
@@ -2833,6 +2840,7 @@ function handleWsMessage(message: WsMessage) {
   }
 
   if (message.type === "interrupt-signal") {
+    runtimePanel.finish(message.turn_id || activeAssistantTurnId);
     stopCurrentResponsePlayback();
     return;
   }
@@ -2872,6 +2880,7 @@ function handleWsMessage(message: WsMessage) {
   }
 
   if (message.type === "error") {
+    runtimePanel.finish(message.turn_id || activeAssistantTurnId);
     if (isHiddenSystemError(message.message)) {
       console.warn(message.message);
     } else {
@@ -2929,7 +2938,7 @@ function queueAudioMessage(message: WsMessage) {
       if (queueVersion !== audioQueueVersion || !shouldAcceptAssistantOutput({ turn_id: turnId })) return;
 
       if (text) {
-        appendAssistantLine(text);
+        appendAssistantLine(text, turnId);
       }
 
       if (message.audio) {
@@ -3774,4 +3783,3 @@ async function startup() {
 }
 
 void startup();
-

@@ -3,6 +3,7 @@ This class is responsible for handling asynchronous interaction with Claude API 
 for language generation.
 """
 
+import asyncio
 import json
 from typing import AsyncIterator, List, Dict, Any
 
@@ -30,7 +31,7 @@ class AsyncLLM(StatelessLLMInterface):
             system (str): System prompt
         """
         self.model = model
-        self.max_tokens = 8192
+        self._output_limit = None
         self.temperature = 0.7
         self.system = system
         self.llm_api_key = llm_api_key or "melomate-placeholder-key"
@@ -42,6 +43,23 @@ class AsyncLLM(StatelessLLMInterface):
 
         logger.info(f"Initialized Claude AsyncLLM with model: {self.model}")
         logger.debug(f"Base URL: {base_url}")
+
+    async def _required_output_limit(self) -> int:
+        """Anthropic requires max_tokens; prefer the provider's model maximum."""
+        if self._output_limit is None:
+            try:
+                info = await asyncio.wait_for(self.client.models.retrieve(self.model), 10)
+                limit = getattr(info, "max_tokens", None)
+                if type(limit) is not int or limit <= 0:
+                    raise ValueError("Model metadata has no output limit")
+                self._output_limit = limit
+            except Exception:
+                # Older SDKs and compatible gateways may not expose model limits.
+                # Keep their previous request behavior instead of omitting a
+                # required field or guessing an unsupported model maximum.
+                logger.warning("Claude model output limit unavailable; using compatibility limit 8192")
+                self._output_limit = 8192
+        return self._output_limit
 
     def _convert_message_format(self, message: Dict[str, Any]) -> Dict[str, Any]:
         """Convert message format to Claude's expected format."""
@@ -128,12 +146,13 @@ class AsyncLLM(StatelessLLMInterface):
                 messages=converted_messages,
                 system=system if system else (self.system if self.system else ""),
                 model=self.model,
-                max_tokens=self.max_tokens,
+                max_tokens=await self._required_output_limit(),
                 temperature=min(1.0, self.temperature),
                 tools=tools if tools else NOT_GIVEN,
             ) as stream:
                 current_tool_call_info = None
                 partial_json_accumulator = ""
+                thinking_blocks = {}
 
                 async for event in stream:
                     if event.type == "message_start":
@@ -146,7 +165,9 @@ class AsyncLLM(StatelessLLMInterface):
                         logger.debug(
                             f"Stream: content_block_start - Index: {event.index}, Type: {event.content_block.type}"
                         )
-                        if event.content_block.type == "text":
+                        if event.content_block.type in {"thinking", "redacted_thinking"}:
+                            thinking_blocks[event.index] = event.content_block.model_dump(exclude_none=True)
+                        elif event.content_block.type == "text":
                             pass  # Handled by text_delta
                         elif event.content_block.type == "tool_use":
                             current_tool_call_info = {
@@ -167,7 +188,17 @@ class AsyncLLM(StatelessLLMInterface):
                         logger.debug(
                             f"Stream: content_block_delta - Index: {event.index}, Delta Type: {event.delta.type}"
                         )
-                        if event.delta.type == "text_delta":
+                        if event.delta.type == "thinking_delta":
+                            text = event.delta.thinking
+                            block = thinking_blocks.get(event.index)
+                            if block is not None:
+                                block["thinking"] = block.get("thinking", "") + text
+                            yield {"type": "reasoning_delta", "text": text}
+                        elif event.delta.type == "signature_delta":
+                            block = thinking_blocks.get(event.index)
+                            if block is not None:
+                                block["signature"] = block.get("signature", "") + event.delta.signature
+                        elif event.delta.type == "text_delta":
                             yield {"type": "text_delta", "text": event.delta.text}
                         elif event.delta.type == "input_json_delta":
                             if (
@@ -185,6 +216,8 @@ class AsyncLLM(StatelessLLMInterface):
                                     f"Received input_json_delta but no active tool call matching index {event.index}"
                                 )
                     elif event.type == "content_block_stop":
+                        if event.index in thinking_blocks:
+                            yield {"type": "thinking_block", "block": thinking_blocks.pop(event.index)}
                         logger.debug(
                             f"Stream: content_block_stop - Index: {event.index}"
                         )

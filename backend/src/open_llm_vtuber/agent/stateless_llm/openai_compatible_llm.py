@@ -4,6 +4,8 @@ endpoints for language generation.
 """
 
 from typing import AsyncIterator, List, Dict, Any
+import hashlib
+from urllib.parse import urlsplit
 from openai import (
     AsyncStream,
     AsyncOpenAI,
@@ -45,7 +47,6 @@ class AsyncLLM(StatelessLLMInterface):
         self.base_url = base_url
         self.model = model
         self.temperature = temperature
-        self.max_tokens = 8192
         # Allow the backend to start before the user fills an API key in the UI.
         # The real key can be applied later through the client-api-config message.
         self.llm_api_key = llm_api_key or "melomate-placeholder-key"
@@ -56,6 +57,8 @@ class AsyncLLM(StatelessLLMInterface):
             api_key=self.llm_api_key,
         )
         self.support_tools = True
+        self.protocol_key = hashlib.sha256(f"{base_url.rstrip('/')}\n{model}".encode()).hexdigest()
+        self.deepseek_protocol = urlsplit(base_url).hostname == "api.deepseek.com" or model.lower().startswith("deepseek")
 
         logger.info(
             f"Initialized AsyncLLM with the parameters: {self.base_url}, {self.model}"
@@ -66,7 +69,7 @@ class AsyncLLM(StatelessLLMInterface):
         messages: List[Dict[str, Any]],
         system: str = None,
         tools: List[Dict[str, Any]] | NotGiven = NOT_GIVEN,
-    ) -> AsyncIterator[str | List[ChoiceDeltaToolCall]]:
+    ) -> AsyncIterator[str | List[ToolCallObject] | Dict[str, Any]]:
         """
         Generates a chat completion using the OpenAI API asynchronously.
 
@@ -88,6 +91,10 @@ class AsyncLLM(StatelessLLMInterface):
         # Tool call related state variables
         accumulated_tool_calls = {}
         in_tool_call = False
+        response_text = ""
+        reasoning_text = ""
+        reasoning_seen = False
+        completed = False
 
         try:
             # If system prompt is provided, add it to the messages
@@ -102,6 +109,13 @@ class AsyncLLM(StatelessLLMInterface):
             )
 
             available_tools = tools if self.support_tools else NOT_GIVEN
+            # Legacy/imported assistant messages have no captured reasoning.
+            # Explicitly mark it absent; never invent a replacement explanation.
+            if getattr(self, "deepseek_protocol", False) and available_tools:
+                messages_with_system = [
+                    {"reasoning_content": "", **message} if message.get("role") == "assistant" else message
+                    for message in messages_with_system
+                ]
 
             stream: AsyncStream[
                 ChatCompletionChunk
@@ -110,7 +124,6 @@ class AsyncLLM(StatelessLLMInterface):
                 model=self.model,
                 stream=True,
                 temperature=self.temperature,
-                max_tokens=self.max_tokens,
                 tools=available_tools,
             )
             logger.debug(
@@ -122,6 +135,17 @@ class AsyncLLM(StatelessLLMInterface):
                 # Guard against chunks with missing choices field (e.g., from OpenWebUI)
                 if not chunk.choices:
                     continue
+
+                delta = chunk.choices[0].delta
+                completed = completed or chunk.choices[0].finish_reason == "stop"
+                reasoning = getattr(delta, "reasoning_content", None)
+                if isinstance(reasoning, str):
+                    reasoning_seen = True
+                    reasoning_text += reasoning
+                    if reasoning:
+                        yield {"type": "reasoning_delta", "text": reasoning}
+                if isinstance(delta.content, str):
+                    response_text += delta.content
 
                 if self.support_tools:
                     has_tool_calls = (
@@ -170,10 +194,11 @@ class AsyncLLM(StatelessLLMInterface):
                                         "arguments"
                                     ] += tool_call.function.arguments
 
-                        continue
+                        if chunk.choices[0].finish_reason not in {"tool_calls", "stop", "length"}:
+                            continue
 
                     # If we were in a tool call but now we're not, yield the tool call result
-                    elif in_tool_call and chunk.choices[0].finish_reason in {"tool_calls", "stop"}:
+                    if in_tool_call and chunk.choices[0].finish_reason in {"tool_calls", "stop"}:
                         in_tool_call = False
                         # Convert accumulated tool calls to the required format and output
                         logger.info(
@@ -186,13 +211,20 @@ class AsyncLLM(StatelessLLMInterface):
                             for tool_data in accumulated_tool_calls.values()
                         ]
 
+                        protocol = {"role": "assistant", "content": response_text,
+                            "tool_calls": [{"id": item["id"], "type": item["type"] or "function", "function": item["function"]}
+                                           for item in accumulated_tool_calls.values()]}
+                        if reasoning_seen:
+                            protocol["reasoning_content"] = reasoning_text
+                        yield {"type": "assistant_protocol", "message": protocol}
                         yield complete_tool_calls
                         accumulated_tool_calls = {}  # Reset for potential future tool calls
+                        return
 
                 if chunk.choices[0].finish_reason == "length":
                     accumulated_tool_calls.clear()
                     in_tool_call = False
-                    yield "\n[模型输出达到上限；未执行不完整的工具调用。请提高输出上限或缩小本次修改范围。]"
+                    yield "\n[API 输出达到上限；未执行不完整的工具调用。可将本次修改拆成更小的步骤后继续。]"
                     return
 
                 # Process regular content chunks
@@ -203,19 +235,17 @@ class AsyncLLM(StatelessLLMInterface):
                     chunk.choices[0].delta.content = ""
                 yield chunk.choices[0].delta.content
 
-            # If stream ends while still in a tool call, make sure to yield the tool call
+            # A dropped stream is not a completed tool request.
             if in_tool_call and accumulated_tool_calls:
-                logger.info(
-                    f"Completed {len(accumulated_tool_calls)} tool call(s) at stream end"
-                )
-
-                # Create a ToolCallObject instance from a dictionary using the from_dict method.
-                complete_tool_calls = [
-                    ToolCallObject.from_dict(tool_data)
-                    for tool_data in accumulated_tool_calls.values()
-                ]
-
-                yield complete_tool_calls
+                yield "\n[API 连接在工具请求完成前结束，未执行这次调用。]"
+                return
+            if not completed:
+                yield "\n[API 连接提前结束，这条回复可能不完整。]"
+                return
+            protocol = {"role": "assistant", "content": response_text}
+            if reasoning_seen:
+                protocol["reasoning_content"] = reasoning_text
+            yield {"type": "assistant_protocol", "message": protocol}
 
         except APIConnectionError as e:
             logger.error(

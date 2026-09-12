@@ -318,10 +318,6 @@ class WebSocketHandler:
                 await context.pc_tools.close()
                 runtime.load_progress(context.character_config.character_name or context.character_config.conf_name)
                 context.workspace_agent.reset()
-                llm = getattr(context.agent_engine, "_llm", None)
-                if llm:
-                    llm.temperature = runtime.settings["temperature"]
-                    llm.max_tokens = runtime.settings["max_tokens"]
             tools = context.tool_manager.tools if context.tool_manager else {}
             from .runtime_control import redact
             await websocket.send_text(json.dumps({"type": "runtime-state", "success": True,

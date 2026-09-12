@@ -196,10 +196,15 @@ class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 for chunk in self.chunks: yield chunk
             async def close(self): self.closed = True
         stream = Stream([delta("read_", '{"x":'), delta(), delta("file", '1}'), delta(finish="tool_calls")])
-        async def create(**kwargs): return stream
+        requests = []
+        async def create(**kwargs):
+            requests.append(kwargs)
+            return stream
         llm = types.SimpleNamespace(support_tools=True, model="test", temperature=0.7, max_tokens=8192,
             client=types.SimpleNamespace(chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create))))
         output = [event async for event in method(llm, [], tools=[])]
+        self.assertNotIn("max_tokens", requests[0])
+        self.assertNotIn("max_completion_tokens", requests[0])
         calls = [event for event in output if isinstance(event, list)]
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0].function.name, "read_file")
@@ -209,6 +214,114 @@ class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
         output = [event async for event in method(llm, [], tools=[])]
         self.assertFalse(any(isinstance(event, list) for event in output))
         self.assertTrue(stream.closed)
+        stream = Stream([delta("read_file", '{}', finish="tool_calls")])
+        output = [event async for event in method(llm, [], tools=[])]
+        self.assertEqual(len([event for event in output if isinstance(event, list)]), 1)
+        stream = Stream([delta("write", '{"code":"complete JSON but missing finish"}')])
+        output = [event async for event in method(llm, [], tools=[])]
+        self.assertFalse(any(isinstance(event, list) for event in output))
+
+    async def test_claude_uses_provider_output_maximum_and_caches_metadata(self):
+        method = self.isolated_method("agent/stateless_llm/claude_llm.py", "AsyncLLM", "_required_output_limit", {"asyncio": asyncio})
+        requests = []
+        async def retrieve(model):
+            requests.append(model)
+            return types.SimpleNamespace(max_tokens=32000)
+        llm = types.SimpleNamespace(_output_limit=None, model="test",
+            client=types.SimpleNamespace(models=types.SimpleNamespace(retrieve=retrieve)))
+        self.assertEqual(await method(llm), 32000)
+        self.assertEqual(await method(llm), 32000)
+        self.assertEqual(requests, ["test"])
+
+    async def test_reasoning_stream_survives_native_tool_deltas_without_becoming_reply_text(self):
+        class APIError(Exception): pass
+        method = self.isolated_method("agent/stateless_llm/openai_compatible_llm.py", "AsyncLLM", "chat_completion",
+            {"NOT_GIVEN": object(), "ToolCallObject": ToolCallObject, "APIError": APIError, "APIConnectionError": APIError, "RateLimitError": APIError})
+        class Stream:
+            closed = False
+            async def __aiter__(self):
+                for reasoning, calls, finish in [("step one", None, None), (" and two", [types.SimpleNamespace(index=0, id="call", type="function", function=types.SimpleNamespace(name="read_file", arguments='{}'))], None), (None, None, "tool_calls")]:
+                    yield types.SimpleNamespace(choices=[types.SimpleNamespace(finish_reason=finish,
+                        delta=types.SimpleNamespace(reasoning_content=reasoning, tool_calls=calls, content=None))])
+            async def close(self): self.closed = True
+        stream, requests = Stream(), []
+        async def create(**kwargs): requests.append(kwargs); return stream
+        llm = types.SimpleNamespace(support_tools=True, deepseek_protocol=True, model="test", temperature=1,
+            client=types.SimpleNamespace(chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create))))
+        old = {"role": "assistant", "content": "old", "reasoning_content": "original reasoning"}
+        output = [event async for event in method(llm, [old, {"role": "assistant", "content": "legacy"}], tools=[{}])]
+        protocol = next(event["message"] for event in output if isinstance(event, dict) and event["type"] == "assistant_protocol")
+        self.assertEqual(protocol["reasoning_content"], "step one and two")
+        self.assertEqual(protocol["tool_calls"][0]["function"]["name"], "read_file")
+        self.assertNotIn("step one", "".join(event for event in output if isinstance(event, str)))
+        self.assertEqual(requests[0]["messages"][0], old)
+        self.assertEqual(requests[0]["messages"][1]["reasoning_content"], "")
+        self.assertTrue(stream.closed)
+
+    async def test_agent_replays_reasoning_exactly_after_tool_result_and_emits_complete_protocol(self):
+        method = self.isolated_method("agent/agents/basic_memory_agent.py", "BasicMemoryAgent", "_openai_tool_interaction_loop",
+            {"DEFAULT_MAX_TOOL_ROUNDS": 8, "MAX_TOOL_CALLS_PER_TURN": 16, "AGENTIC_TASK_GUIDANCE": "guidance",
+             "SCREEN_VISION_TOOL_NAME": "screen", "ToolCallObject": ToolCallObject, "TOOL_LIMIT_MESSAGE": "limit"})
+        requests = []
+        call = ToolCallObject.from_dict({"id": "call1", "index": 0, "type": "function", "function": {"name": "read_file", "arguments": "{}"}})
+        first = {"role": "assistant", "content": "", "reasoning_content": "original reasoning", "tool_calls": [{"id": "call1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]}
+        final = {"role": "assistant", "content": "done", "reasoning_content": "checked result"}
+        class LLM:
+            protocol_key = "a" * 64
+            async def chat_completion(self, messages, system, tools=None):
+                requests.append(list(messages))
+                if len(requests) == 1:
+                    yield {"type": "reasoning_delta", "text": "original reasoning"}
+                    yield {"type": "assistant_protocol", "message": first}
+                    yield [call]
+                else:
+                    yield {"type": "reasoning_delta", "text": "checked result"}
+                    yield "done"
+                    yield {"type": "assistant_protocol", "message": final}
+        result = {"role": "tool", "tool_call_id": "call1", "content": "real result"}
+        class Executor:
+            async def execute_tools(self, **kwargs):
+                yield {"type": "tool_call_status", "tool_name": "read_file", "status": "completed"}
+                yield {"type": "final_tool_results", "results": [result]}
+        agent = types.SimpleNamespace(prompt_mode_flag=False, _llm=LLM(), _tool_executor=Executor(),
+            _secure_system_prompt_for_policy=lambda system, policy: system, _filter_tools_for_policy=lambda tools, *a: tools,
+            _consume_tool_call_budget=lambda total, count, limit: total + count, _tool_call_name=lambda call: call.function.name)
+        output = [event async for event in method(agent, [{"role": "user", "content": "check"}], [], "persona", remember_turn=False)]
+        self.assertEqual(requests[1][-2:], [first, result])
+        self.assertEqual([e for e in output if isinstance(e, str)], ["done"])
+        protocol = next(e for e in output if isinstance(e, dict) and e.get("type") == "turn_protocol")
+        self.assertEqual(protocol["messages"], [first, result, final])
+
+    async def test_claude_required_limit_survives_old_sdk_or_incomplete_gateway(self):
+        method = self.isolated_method("agent/stateless_llm/claude_llm.py", "AsyncLLM", "_required_output_limit", {"asyncio": asyncio})
+        for limit in (None, 0, -1, "32000", True):
+            async def retrieve(model): return types.SimpleNamespace(max_tokens=limit)
+            llm = types.SimpleNamespace(_output_limit=None, model="test",
+                client=types.SimpleNamespace(models=types.SimpleNamespace(retrieve=retrieve)))
+            with self.subTest(limit=limit): self.assertEqual(await method(llm), 8192)
+        llm = types.SimpleNamespace(_output_limit=None, model="test", client=object())
+        self.assertEqual(await method(llm), 8192)
+
+    async def test_claude_thinking_text_and_signed_protocol_are_separate(self):
+        method = self.isolated_method("agent/stateless_llm/claude_llm.py", "AsyncLLM", "chat_completion", {"NOT_GIVEN": object(), "json": json})
+        ns = types.SimpleNamespace
+        events = [ns(type="content_block_start", index=0, content_block=ns(type="thinking", model_dump=lambda **k: {"type": "thinking", "thinking": "", "signature": ""})),
+                  ns(type="content_block_delta", index=0, delta=ns(type="thinking_delta", thinking="visible thought")),
+                  ns(type="content_block_delta", index=0, delta=ns(type="signature_delta", signature="opaque signature")),
+                  ns(type="content_block_stop", index=0), ns(type="message_stop")]
+        class Stream:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): pass
+            async def __aiter__(self):
+                for event in events: yield event
+        async def limit(): return 32000
+        llm = ns(model="test", system="", temperature=1, _required_output_limit=limit, _convert_message_format=lambda m: m,
+                 client=ns(messages=ns(stream=lambda **k: Stream())))
+        output = [event async for event in method(llm, [])]
+        visible = [e for e in output if e["type"] == "reasoning_delta"]
+        self.assertEqual(visible, [{"type": "reasoning_delta", "text": "visible thought"}])
+        block = next(e["block"] for e in output if e["type"] == "thinking_block")
+        self.assertEqual(block["signature"], "opaque signature")
 
     async def test_agent_switches_to_prompt_tools_then_resumes_answer(self):
         method = self.isolated_method("agent/agents/basic_memory_agent.py", "BasicMemoryAgent", "_openai_tool_interaction_loop",
@@ -249,7 +362,9 @@ class AsyncRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(runtime.level(name), "allow")
             self.assertTrue(await runtime.authorize(name, {"network": True}, policy))
         runtime.configure({**dict.fromkeys(PERMISSION_FIELDS, "forbid"), "tools": {"external_tool": "ask"},
-                           "project_folder": "new-project", "temperature": 0.8})
+                           "project_folder": "new-project", "temperature": 0.8, "max_tokens": 512})
+        self.assertNotIn("temperature", runtime.settings)
+        self.assertNotIn("max_tokens", runtime.settings)
         self.assertTrue(all(runtime.settings[field] == "allow" for field in PERMISSION_FIELDS))
         self.assertEqual(runtime.settings["tools"], {})
         self.assertEqual(runtime.settings["project_folder"], "new-project")

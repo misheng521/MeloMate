@@ -348,6 +348,7 @@ def _session(uid):
             db.execute("BEGIN IMMEDIATE")
             db.execute("CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS messages(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,role TEXT NOT NULL,content TEXT NOT NULL,name TEXT,timestamp TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS response_protocol(message_id TEXT PRIMARY KEY,epoch INTEGER NOT NULL,provider TEXT NOT NULL,content_hash TEXT NOT NULL,payload TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS message_views(seq INTEGER PRIMARY KEY,content TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS note_sources(note_hash TEXT NOT NULL,message_id TEXT NOT NULL,PRIMARY KEY(note_hash,message_id))")
             db.execute("CREATE VIEW IF NOT EXISTS model_messages AS SELECT m.seq,m.id,m.role,COALESCE(v.content,m.content) AS content,m.name,m.timestamp FROM messages m LEFT JOIN message_views v ON v.seq=m.seq WHERE COALESCE(v.content,m.content)!=''")
@@ -383,7 +384,7 @@ def create_new_history(conf_uid):
     return SINGLE_HISTORY_UID
 
 
-def store_message(conf_uid, history_uid, role, content, name=None, expected_epoch=None):
+def store_message(conf_uid, history_uid, role, content, name=None, expected_epoch=None, protocol=None):
     _validate_history_uid(history_uid)
     if role == "system": return None
     if role not in {"human", "ai"}: raise ValueError("Unsupported history role")
@@ -392,7 +393,18 @@ def store_message(conf_uid, history_uid, role, content, name=None, expected_epoc
     if name is not None and (not isinstance(name, str) or len(name) > 200): raise ValueError("Invalid speaker name")
     with _session(conf_uid) as (db, _, __):
         if expected_epoch is not None and expected_epoch != _state(db, "generation", 0): return None
-        return _insert(db, role, content, name)
+        identifier = _insert(db, role, content, name)
+        # Wire-protocol state is separate from searchable dialogue and memory.
+        # Keep complete exchanges; never truncate reasoning or split tool pairs.
+        if role == "ai" and isinstance(protocol, dict):
+            provider, messages = protocol.get("provider"), protocol.get("messages")
+            if isinstance(provider, str) and re.fullmatch(r"[a-f0-9]{64}", provider) and isinstance(messages, list):
+                payload = json.dumps(messages, ensure_ascii=False)
+                if len(payload.encode("utf-8")) <= 4 * 1024 * 1024 and any(isinstance(m, dict) and "reasoning_content" in m for m in messages):
+                    db.execute("INSERT INTO response_protocol VALUES(?,?,?,?,?)",
+                        (identifier, _state(db, "generation", 0), provider, _digest(content), payload))
+        db.execute("DELETE FROM response_protocol WHERE epoch!=? OR message_id NOT IN (SELECT id FROM messages ORDER BY seq DESC LIMIT 120)", (_state(db, "generation", 0),))
+        return identifier
 
 
 def memory_epoch(conf_uid):
@@ -426,7 +438,7 @@ def get_history(conf_uid, history_uid=SINGLE_HISTORY_UID):
         return [dict(row) for row in reversed(db.execute("SELECT role,content,name,timestamp FROM messages ORDER BY seq DESC LIMIT ?", (MAX_MEMORY_MESSAGES,)).fetchall())]
 
 
-def get_context_history(conf_uid, exclude_id=None):
+def get_context_history(conf_uid, exclude_id=None, protocol_provider=None):
     with _session(conf_uid) as (db, _, __):
         rows = db.execute("SELECT id,role,content,name,timestamp FROM model_messages WHERE seq>? AND id!=? ORDER BY seq DESC LIMIT 120",
             (_state(db, "visible_after", 0), exclude_id or "")).fetchall()
@@ -439,6 +451,14 @@ def get_context_history(conf_uid, exclude_id=None):
                 item["content"] = item["content"][:remaining - 40] + "\n[长消息已截短，可检索历史原文]"
             remaining -= len(item["content"])
             selected.append(item)
+        if protocol_provider:
+            protocol_remaining = 4 * 1024 * 1024
+            for item in selected:
+                cached = db.execute("SELECT payload,content_hash FROM response_protocol WHERE message_id=? AND provider=? AND epoch=?",
+                    (item["id"], protocol_provider, _state(db, "generation", 0))).fetchone()
+                if cached and cached["content_hash"] == _digest(item["content"]) and len(cached["payload"].encode("utf-8")) <= protocol_remaining:
+                    item["protocol_messages"] = json.loads(cached["payload"])
+                    protocol_remaining -= len(cached["payload"].encode("utf-8"))
         return list(reversed(selected))
 
 
@@ -453,6 +473,7 @@ def delete_history(conf_uid, history_uid):
     with _session(conf_uid) as (db, directory, _):
         _atomic_text(_file(directory, MEMORY_FILE), EMPTY_MEMORY)
         db.execute("DELETE FROM messages")
+        db.execute("DELETE FROM response_protocol")
         db.execute("DELETE FROM message_views")
         db.execute("DELETE FROM note_sources")
         if _state(db, "fts", False): db.execute("DELETE FROM search")

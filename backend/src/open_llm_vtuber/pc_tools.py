@@ -104,7 +104,7 @@ class PCWorkTools:
         if name == "get_pc_capabilities":
             from project_runtime import runtime_info
             return {"ok": True, "platform": "PC", "project_folder": self.runtime.settings["project_folder"],
-                    "tools": list(definitions()), "isolated_runner": await asyncio.to_thread(runtime_info),
+                    "tools": list(definitions()), "code_runtime": await asyncio.to_thread(runtime_info),
                     "browser_component": importlib.util.find_spec("playwright") is not None,
                     "node_available": bool(shutil.which("node")), "service_count": len(self.runtime.settings.get("services", [])),
                     "extension_path": "Use existing file tools to implement and test missing logic in the project. Generic HTTP services and configured MCP servers can expose external capabilities. Software/API availability must be verified; writing code alone does not install or connect it."}

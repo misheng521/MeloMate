@@ -4,7 +4,7 @@ MeloMate is a local AI voice companion app with lightweight VRM rendering, micro
 
 This repository is the **source edition**. It is intended for development, GitHub hosting, and reproducible setup. Generated folders such as `node_modules`, `dist`, `backend/.venv`, caches, logs, and large downloaded backend models are intentionally not part of the source tree.
 
-Project-scoped tools, default-allowed tool calls, optional isolated code execution,
+Project-scoped tools, default-allowed tool calls, local background code execution,
 and configurable chat/memory behavior are described in
 [项目与工具使用说明](docs/PROJECT_AGENT.md). Source-only checks do not require
 installing the full voice runtime.
@@ -53,6 +53,15 @@ PC browser installation is needed. It then asks:
 The optional download is large and can take a while. Do not close the window
 until it reports `Setup finished successfully`. The script also builds the
 frontend, so no separate build command is needed.
+
+Code execution reuses the Python and Node.js already installed for MeloMate.
+No additional execution service or Windows permission setup is required.
+
+日常只需启动 MeloMate，在聊天中提出任务。模型把代码保存在角色工作区，后台运行原文件，
+查看报错后继续修改和验证，结果显示在回复详情中。普通执行不弹出 Python 或终端窗口；
+代码主动打开的应用仍可显示界面。命令以当前用户权限运行，工作目录不是文件权限隔离。
+项目需要的依赖由模型按任务决定，并遵守用户“不下载”等要求。
+详情见 [后台代码运行说明](docs/CODE_RUNNER.md)。
 
 Configure the LLM provider/API key in `backend/conf.yaml` (or in the app's
 settings), then start MeloMate:

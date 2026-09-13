@@ -159,8 +159,10 @@ def scope_arguments(name: str, arguments: dict, policy: dict) -> dict:
     """Map project-relative file paths inside the server-owned persona root."""
     from workspace_core import workspace_path, clean_workspace_parts
     result = dict(arguments)
-    if name == "run_workspace_command" and "network" in result and not isinstance(result["network"], bool):
-        raise ValueError("network must be a JSON boolean")
+    if name == "run_workspace_command":
+        # Old conversations may replay this retired transport parameter. Local
+        # execution has no network-isolation switch; never imply otherwise.
+        result.pop("network", None)
     persona = str(policy.get("workspace_persona") or "")
     project = str(policy.get("project_folder") or "")
     if name not in PROJECT_TOOLS or name == "get_workspace_runtime":

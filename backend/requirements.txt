@@ -21,6 +21,7 @@ chardet>=5.2
 jinja2>=3.1
 tqdm>=4.66
 mcp>=1.28,<2
+anyio>=4.4,<5
 letta-client>=0.1
 pywin32>=306; sys_platform == "win32"
 tzdata>=2024.1; sys_platform == "win32"

@@ -15,16 +15,19 @@ def validate_workspace_project(persona: str, folder: str = "") -> str:
 
 @mcp.tool()
 def get_workspace_runtime() -> str:
-    """Check whether the isolated project execution environment is ready. Never installs anything."""
+    """Inspect installed local Python, Node.js and shell paths, and actual execution boundaries. Never installs anything."""
     from project_runtime import runtime_info
     return safe_call(lambda: workspace_core.response(runtime_info()))
 
 
 @mcp.tool()
-def run_workspace_command(persona: str, argv: list[str], cwd: str = "", timeout_seconds: int = 120, network: bool = False) -> str:
-    """Run model-chosen argv in a project container; only cwd is mounted. Network is off by default; network=true requires the separate network-execution permission and can install project dependencies or test integrations. Use npm with --cache /tmp/npm or pip with --target in the project. Inspect errors, repair and re-test. No host execution or automatic image installation. Check runtime availability when uncertain."""
-    from project_runtime import run_command
-    return safe_call(lambda: workspace_core.response(run_command(persona, argv, cwd, timeout_seconds, network)))
+async def run_workspace_command(persona: str, argv: list[str], cwd: str = "", timeout_seconds: int = 120) -> str:
+    """Run an argv array in a hidden local process using preinstalled Python/Node.js. First save generated code in the persona workspace, then execute that original file, e.g. ['python','app.py'] or ['node','app.js']; repair that same file after errors. cwd is a workspace-relative starting directory, not a filesystem sandbox. Code runs with current-user file and network permissions. Use native platform paths/commands (Windows on PC). Python aliases reuse cwd/.venv if present; pip automatically prepares a project venv offline, so task packages do not enter MeloMate's backend environment. npm uses project node_modules. No automatic package downloads; choose installation commands only when needed and respect user constraints. Results include exit_code, output and errors. Inspect results, repair and retest. Stop/timeout cleans up this command and its descendants; long-running services do not survive the call."""
+    from project_runtime import run_command_async
+    try:
+        return workspace_core.response(await run_command_async(persona, argv, cwd, timeout_seconds))
+    except Exception as exc:
+        return workspace_core.response({"ok": False, "message": str(exc)})
 
 
 def safe_call(fn, *args, **kwargs) -> str:

@@ -1,6 +1,6 @@
 """PC work regression tests: real local HTTP fixture, storage and tool dispatch.
 
-No external accounts/devices, model keys, Docker or browser installation required.
+No external accounts/devices, model keys or browser installation required.
 """
 import asyncio
 import json
@@ -189,12 +189,12 @@ class PCWorkTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reloaded.work_plan, {})
         self.assertEqual(FixtureHandler.requests, [])
 
-    async def test_network_execution_allows_legacy_settings_but_requires_strict_boolean(self):
+    async def test_local_execution_discards_retired_network_flag(self):
         self.runtime.configure({"execution": "allow", "network_execution": "forbid"})
         policy = self.runtime.policy("Alice")
         self.assertTrue(await self.runtime.authorize("run_workspace_command", {"network": False}, policy))
         self.assertTrue(await self.runtime.authorize("run_workspace_command", {"network": True}, policy))
-        with self.assertRaises(ValueError): scope_arguments("run_workspace_command", {"network": "true"}, policy)
+        self.assertNotIn("network", scope_arguments("run_workspace_command", {"network": False}, policy))
 
     async def test_browser_gateway_blocks_private_network_and_project_traversal(self):
         browser = PCBrowser(self.runtime)

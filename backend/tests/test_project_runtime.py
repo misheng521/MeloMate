@@ -1,4 +1,4 @@
-"""Source-only regressions. No server, model key, Docker or voice packages needed.
+"""Source-only regressions. No server, model key or voice packages needed.
 
 MCP transport and logger imports use the existing policy-test stubs; assertions
 exercise the real policy, executor, storage, adapter and runtime implementations.
@@ -106,15 +106,14 @@ class ProjectScopeTests(unittest.TestCase):
         self.assertEqual(result["errors"][0]["path"], "bad.py")
         self.assertFalse(marker.exists())
 
-    def test_runner_mounts_only_project_and_never_falls_back_to_host(self):
-        command = project_runtime.command_argv("Alice", "projects/demo", ["python3", "app.py"], "test:local", "test")
-        self.assertIn("--network=none", command)
-        self.assertIn("--read-only", command)
-        self.assertIn("--pull=never", command)
-        self.assertEqual(command.count("--mount"), 1)
-        self.assertIn(str(workspace.workspace_path("Alice", "projects/demo")), command[command.index("--mount") + 1])
-        with patch.object(project_runtime, "runtime_info", return_value={"available": False, "reason": "missing"}), patch.object(project_runtime.subprocess, "Popen") as run:
-            self.assertFalse(project_runtime.run_command("Alice", ["python3", "app.py"])["executed"])
+    def test_local_runner_reports_permissions_and_checks_starting_directory(self):
+        info = project_runtime.runtime_info()
+        self.assertEqual(info["runtime"], "local")
+        self.assertFalse(info["filesystem_isolated"])
+        self.assertFalse(info["network_isolated"])
+        with patch("local_execution.subprocess.Popen") as run:
+            result = project_runtime.run_command("Alice", ["python", "app.py"], "../outside")
+            self.assertFalse(result["executed"])
             run.assert_not_called()
 
     def test_progress_is_scoped_redacted_and_journal_failure_does_not_fail_tool(self):

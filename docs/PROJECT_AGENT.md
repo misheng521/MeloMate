@@ -24,7 +24,7 @@ MeloMate/workspace/小可/
 - 设置中移除整个项目与工具栏目，包括工具列表、项目子目录、服务编辑器、生成温度和输出上限。
 - 旧浏览器保存的「询问／禁止」、单项权限、温度和输出上限自动清理；已有项目范围与服务连接保留。
 - 程序仍检查项目目录、服务范围、参数和任务配置版本；切换配置前的旧调用不能在新配置下继续。
-- 「停止当前任务」仍可取消当前对话。已发给外部服务的操作不保证可以撤回；容器命令还受独立超时限制，超时后需检查实际文件状态再重试。
+- 「停止当前任务」会取消当前对话并通知执行器清理本次命令及其子进程；每条命令也有超时。已保存的文件和已发给外部服务的操作不能靠停止撤回，重试前检查实际状态。
 
 工具结果、网页和项目文件属于资料，不能改变这些设置。项目聊天不会仅因网页自行报告 `agentShouldAct` 就启动后台操作；模型可在对话工具循环中读取状态并选择明确的页面动作。
 
@@ -38,21 +38,17 @@ MeloMate/workspace/小可/
 
 `validate_workspace_project` 可以检查 Python、JavaScript 和 JSON 语法，返回具体文件错误，不执行项目代码。JavaScript 检查需要可用的 Node.js；其他格式、依赖检查和实际交互不由这个工具验证。
 
-`get_workspace_runtime` 检查隔离执行环境是否可用。`run_workspace_command` 以参数数组运行测试或构建，例如：
+`get_workspace_runtime` 查询本机已有的 Python、Node.js 等运行环境。`run_workspace_command` 以参数数组运行测试或构建，例如：
 
 ```json
 {"persona":"小可","cwd":"","argv":["python3","-m","unittest","discover"],"timeout_seconds":120}
 ```
 
-执行使用本机已准备好的 Docker Linux 容器，只挂载当前项目目录，不传入宿主凭据，不开放 Docker socket，并限制内存、CPU、进程数和执行时长。单次命令的网络参数默认关闭；模型可以选择 `network=true` 开启，无需额外确认。联网容器可访问外部网络，也可能访问局域网服务，并不具有仅访问某个域名的限制。宿主私有 `.control` 和 `.trash` 在容器中被只读空挂载遮盖。没有容器环境时会明确返回未执行，**不会转到宿主命令行运行，也不会自动安装 Docker 或下载镜像**。
+模型先把代码保存到角色工作区，再用本机已有的 Python、Node.js 后台运行原文件，得到输出、错误和退出码后决定是否修改重试。普通执行隐藏控制台窗口；代码主动打开的 GUI 或浏览器仍可显示。无需另装执行服务或配置 Windows 权限。
 
-需要代码执行时，开发者可以另外准备 Docker，并主动构建仓库提供的基础镜像：
+执行目录使用本机路径。文件工具和命令起始目录仍受角色工作区限制，但**代码以当前用户权限运行，可以访问工作区外的文件和网络**；这不是文件权限沙箱。不会继承后端 API 密钥等环境变量，但不能阻止代码读取当前用户有权访问的文件。
 
-```text
-docker build -t melomate-runner:local backend/runner
-```
-
-这一步会下载构建依赖，此次源码修改并未执行。基础镜像提供 Node.js、Python、pip、venv、pytest、Git。模型可选择联网执行，把任务所需项目依赖安装进项目目录，例如 `python3 -m pip install --target .deps requests`，或 `npm install --cache /tmp/npm`；仍须遵守用户「不下载」等明确限制。执行 Python 时需通过项目代码或启动参数正确引用 `.deps`。依赖也可预先放入自定义镜像。可通过 `MELOMATE_RUNNER_IMAGE` 指定已有镜像。容器中的 Python 命令是 `python3`。
+Python 默认使用已有解释器，当前执行目录存在 `.venv` 时优先复用。通过 `pip` 或 `python -m pip` 准备依赖时，先离线创建项目 `.venv`，避免默认安装进后端环境。Node 使用项目 `node_modules`，没有 `package.json` 时创建最小配置，避免继承 MeloMate 的包设置，已有配置保留。安装依赖仍须遵守用户「不下载」等限制。文件和依赖跨调用保留；每条命令最长 10 分钟，结束或停止时清理其子进程，尚不托管长期服务。详见 [后台代码运行说明](CODE_RUNNER.md)。
 
 ## PC 通用工作工具
 
@@ -60,7 +56,7 @@ docker build -t melomate-runner:local backend/runner
 
 | 条件 | 通俗解释 | 何时需要 |
 |---|---|---|
-| Docker 与执行镜像 | 给项目代码提供一个独立的运行环境；需要本机已安装、启动 Docker，并准备执行镜像 | 实际运行项目命令、测试或构建 |
+| Python、Node.js | 复用部署 MeloMate 时已安装的版本，无需额外执行环境 | 实际运行项目命令、测试或构建 |
 | 浏览器组件 | 主安装流程已包含 Playwright；优先复用 Edge 或 Chrome，没有可用浏览器时由安装流程下载 Chromium | 使用浏览器工具；无需单独准备 |
 | 服务地址 | 程序或设备接口的连接位置，例如 `http://127.0.0.1:9000`；对应服务必须实际运行且可达 | 调用已连接的程序、API 或设备 |
 | 凭据 | 服务要求的 API Key、Token 等身份凭证；不要求认证的服务可以不填 | 调用需要认证的服务 |
@@ -151,6 +147,7 @@ OpenAI-compatible API 明确报告不支持工具时，会切换为 JSON 文本�
 
 ```text
 python -B -m unittest discover -s backend/tests -p test_project_runtime.py
+python -B -m unittest discover -s backend/tests -p test_local_execution.py
 python -B -m unittest discover -s backend/tests -p test_text_memory.py
 python -B -m unittest discover -s backend/tests -p test_pc_work_tools.py
 python -B -m unittest discover -s backend/tests -p test_daily_tool_executor_policy.py
@@ -160,4 +157,4 @@ npm run test:runtime
 npm run build
 ```
 
-新增测试使用模拟 MCP 和模型响应，以及本机临时 HTTP 测试服务，验证权限、目录映射、ZIP 处理、凭据注入/遮盖、重定向处理、任务恢复、浏览器请求网关、连接生命周期、参数格式和结果处理。测试凭据存储使用替代加密器验证数据流，不代替 Windows DPAPI 实机验证。尚未完成真实模型、语音、浏览器本体或 Docker 端到端测试。完整后端测试需要该后端的运行依赖。
+新增测试使用模拟 MCP 和模型响应，以及本机临时 HTTP 测试服务，验证权限、目录映射、ZIP 处理、凭据注入/遮盖、重定向处理、任务恢复、浏览器请求网关、连接生命周期、参数格式和结果处理。本地执行测试实际运行已安装的 Python、Node.js、npm 和离线 venv，检查原文件修改重跑、停止、超时、子进程清理和 Windows 隐藏控制台；测试不下载依赖。测试凭据存储使用替代加密器验证数据流，不代替 Windows DPAPI 实机验证。尚未完成真实模型、语音或浏览器本体端到端测试。完整后端测试需要该后端的运行依赖。

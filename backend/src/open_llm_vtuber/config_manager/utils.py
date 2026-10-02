@@ -14,7 +14,7 @@ from ..persona_text import persona_path, read_prompt, text_character
 T = TypeVar("T", bound=BaseModel)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
-DEFAULT_CHARACTER_CONFIG_NAME = "小可.yaml"
+DEFAULT_CHARACTER_CONFIG_NAME = "小可.md"
 
 
 def deep_merge(dict1: dict, dict2: dict) -> dict:
@@ -96,8 +96,7 @@ def load_config_with_character(
     character_file_name: str = DEFAULT_CHARACTER_CONFIG_NAME,
 ) -> dict:
     """
-    Merge application defaults with a text persona or a legacy YAML profile.
-    A same-name Markdown/text prompt overrides the YAML persona only.
+    Merge application-wide runtime defaults with one Markdown persona.
     """
     base_config = read_yaml(config_path)
     config_alts_dir = base_config.get("system_config", {}).get("config_alts_dir")
@@ -117,26 +116,10 @@ def load_config_with_character(
 
 
 def load_character_profile(directory: str, filename: str) -> dict:
+    # Old browser selections may still use a YAML/TXT suffix. They are aliases
+    # for the MD, never a second source of persona or runtime configuration.
     path = persona_path(directory, filename)
-    if path.suffix.lower() in {".md", ".txt"}:
-        # A text prompt alone is sufficient for a new character; inherited
-        # application defaults provide the technical runtime configuration.
-        result = text_character(directory, filename)
-        companion = path.with_suffix(".yaml")
-        if companion.is_file():
-            existing = read_yaml(str(persona_path(directory, companion.name))).get("character_config", {})
-            result = {**existing, "persona_prompt": result["persona_prompt"], "persona_file": filename,
-                      "conf_name": path.stem, "character_name": path.stem}
-        return result
-    result = read_yaml(str(path)).get("character_config")
-    if not isinstance(result, dict): raise ValueError("Missing character_config")
-    result = {**result, "persona_file": "", "conf_name": path.stem, "character_name": path.stem}
-    for extension in (".md", ".txt"):
-        companion = path.with_suffix(extension)
-        if companion.exists():
-            result.update(persona_prompt=read_prompt(directory, companion.name), persona_file=companion.name)
-            break
-    return result
+    return text_character(directory, path.name if path.suffix.lower() == ".md" else path.with_suffix(".md").name)
 
 
 def load_text_file_with_guess_encoding(file_path: str) -> str | None:
@@ -207,11 +190,9 @@ def scan_config_alts_directory(config_alts_dir: str) -> list[dict]:
 
     for root, _, files in os.walk(config_alts_dir):
         for file in files:
-            if file.endswith((".yaml", ".md", ".txt")):
+            if file.lower().endswith(".md"):
                 if Path(root).resolve() != Path(config_alts_dir).resolve():
                     continue
-                if file.endswith((".md", ".txt")) and (Path(root) / Path(file).with_suffix(".yaml")).exists():
-                    continue  # Companion prompt shares the existing character ID.
                 config_path = Path(root) / file
                 conf_name = os.path.splitext(file)[0]
                 character_name = conf_name
@@ -224,6 +205,7 @@ def scan_config_alts_directory(config_alts_dir: str) -> list[dict]:
                     )
                 except Exception as e:
                     logger.warning(f"Failed to read character config {config_path}: {e}")
+                    continue
 
                 config_files.append(
                     {

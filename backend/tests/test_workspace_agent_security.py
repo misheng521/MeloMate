@@ -349,6 +349,20 @@ class WorkspaceBoundaryTests(unittest.TestCase):
         self.assertFalse(metadata["workspace_tool_policy"]["enforce"])
 
 class ToolExecutorBoundaryTests(unittest.TestCase):
+    def test_dom_control_keeps_payload_but_page_events_cannot_grant_it(self):
+        executor = ToolExecutor(object(), object())
+        arguments = {"persona": "XiaoKe", "page_id": "page-1", "state_version": 4,
+                     "operation": "fill", "payload": {"selector": "ref:1", "value": "Hello"}, "folder": "demo"}
+        policy = {"source": "user_turn", "enforce": False, "workspace_persona": "XiaoKe",
+                  "project_mode": True, "user_authorized_workspace_tools": {"act_workspace_page"}}
+        normalized, error = executor.apply_tool_policy("act_workspace_page", arguments, policy)
+        self.assertIsNone(error)
+        self.assertEqual(normalized["operation"], "fill")
+        self.assertEqual(normalized["payload"], arguments["payload"])
+        self.assertEqual(normalized["folder"], "demo")
+        _, error = executor.apply_tool_policy("act_workspace_page", arguments, {**policy, "source": "workspace_runtime"})
+        self.assertIn("TOOL_POLICY_DENIED", error)
+
     def test_exact_page_action_drops_model_supplied_payload_and_action(self):
         executor = ToolExecutor(object(), object())
         normalized, error = executor.apply_tool_policy(

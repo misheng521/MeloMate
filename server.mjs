@@ -4,6 +4,7 @@ import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from
 import { createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { basename, dirname, extname, join, normalize, relative, resolve, sep } from "node:path";
+import { installWorkspaceDom } from "./workspace-dom.mjs";
 
 const appRoot = dirname(fileURLToPath(import.meta.url));
 const root = resolve(appRoot, "dist");
@@ -200,6 +201,7 @@ if (!existsSync(join(root, "index.html"))) {
 
 const types = {
   ".html": "text/html; charset=utf-8",
+  ".htm": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".json": "application/json; charset=utf-8",
@@ -724,8 +726,9 @@ function normalizeWorkspaceReport(value) {
       : 0,
     protocolAvailable: Boolean(value.protocolAvailable),
     appState: sanitizeWorkspaceValue(value.appState ?? null, budget),
-    lastAction: sanitizeWorkspaceValue(value.lastAction ?? null, budget),
-    actions: sanitizeWorkspaceValue(value.actions ?? [], budget),
+    // A large page snapshot must not consume the command acknowledgement budget.
+    lastAction: sanitizeWorkspaceValue(value.lastAction ?? null, { characters: 8000, nodes: 512 }),
+    actions: sanitizeWorkspaceValue(value.actions ?? [], { characters: 16000, nodes: 2048 }),
     state_version: Number.isSafeInteger(stateVersion) ? Math.max(0, stateVersion) : 0,
     page: {
       id: pageId,
@@ -756,6 +759,7 @@ function workspaceControlScript(persona, pageId, accessToken, logicalPath) {
   let stateVersion = 0;
   let pollInFlight = false;
   const actions = [];
+  const dom = (${installWorkspaceDom.toString()})();
   function safeJson(value) {
     if (value === undefined) return null;
     try {
@@ -791,7 +795,17 @@ function workspaceControlScript(persona, pageId, accessToken, logicalPath) {
     const actionHandler = typeof window.MeloMateWorkspaceAction === "function"
       ? window.MeloMateWorkspaceAction
       : (typeof window.MeloMateGameAction === "function" ? window.MeloMateGameAction : null);
-    if (actionHandler) {
+    if (command.action.startsWith("dom.")) {
+      detail.handled = true;
+      try {
+        await publishState(currentState(), true);
+        if (command.expected_state_version !== stateVersion) throw new Error("STALE_WORKSPACE_STATE: page changed; read again before acting.");
+        detail.result = await dom.run(command.action.slice(4), detail.payload);
+      } catch (exception) {
+        detail.accepted = false;
+        detail.error = exception && exception.message ? exception.message : String(exception);
+      }
+    } else if (actionHandler) {
       detail.handled = true;
       try {
         applyActionResult(detail, await actionHandler(detail.action, detail.payload, detail));
@@ -824,7 +838,7 @@ function workspaceControlScript(persona, pageId, accessToken, logicalPath) {
     await publishState(currentState(), true);
   }
 
-  function currentState() {
+  function applicationState() {
     try {
       if (typeof window.MeloMateWorkspaceState === "function") {
         return window.MeloMateWorkspaceState();
@@ -844,7 +858,16 @@ function workspaceControlScript(persona, pageId, accessToken, logicalPath) {
     return null;
   }
 
+  function currentState() {
+    const state = applicationState();
+    return { ...(state && typeof state === "object" && !Array.isArray(state) ? state : { application_state: state }),
+      melomate_dom: dom.snapshot() };
+  }
+
   async function publishState(nextState, force = false) {
+    if (nextState && typeof nextState === "object" && !Array.isArray(nextState) && !nextState.melomate_dom) {
+      nextState = { ...nextState, melomate_dom: dom.snapshot() };
+    }
     const latestAction = actions.length ? actions[actions.length - 1] : null;
     const stateSignature = JSON.stringify({
       protocolAvailable: nextState != null,
@@ -1377,7 +1400,7 @@ function listen(mainPort, isolatedWorkspacePort) {
       reject(response, 404, "Not found", workspaceSecurityHeaders);
       return;
     }
-    if (extname(filePath).toLowerCase() === ".html") {
+    if ([".html", ".htm"].includes(extname(filePath).toLowerCase())) {
       sendWorkspaceHtml(filePath, response, request.method === "HEAD");
       return;
     }

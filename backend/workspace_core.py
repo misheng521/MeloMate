@@ -1024,6 +1024,7 @@ def _send_workspace_action_unlocked(
         "id": uuid4().hex,
         "type": "action",
         "page_id": page_id,
+        "expected_state_version": expected_state_version,
         "action": clean_action,
         "payload": payload or {},
         "created_ms": int(now.timestamp() * 1000),
@@ -1047,11 +1048,13 @@ def _send_workspace_action_unlocked(
             "confirmed": confirmed,
             "control_ready": state_protocol_available(latest_state) and state_is_fresh(latest_state),
             "action_result": action_result,
+            "page_id": state_page_id(latest_state),
+            "state_version": state_version(latest_state),
             "state": latest_state,
             "message": (
                 "Action was accepted by the open workspace page. Use the returned state/action_result for your reply."
                 if confirmed
-                else "CONTROL_NOT_CONFIRMED: The action was not proven to run in the open workspace page. You must not say or imply that you clicked, moved, placed, chose, changed, scored, won, or completed the action. Say briefly that the workspace did not confirm the action, then ask the user to reopen it through MeloMate or revise the app protocol."
+                else "CONTROL_NOT_CONFIRMED: Execution was not confirmed. Read the page and action_result before retrying; effects may already have occurred. Do not claim success. If the page is closed or disconnected, reopen it through MeloMate."
             ),
             "command": {
                 "id": command["id"],
@@ -1090,6 +1093,38 @@ def send_workspace_action(
         )
 
 
+def control_workspace_page(
+    persona: str, page_id: str, state_version: int,
+    operation: str, payload: dict[str, Any] | None = None,
+    wait_ms: int = 1200, folder: str = "",
+) -> str:
+    """Control the actual open HTML document, retaining role/project/revision checks."""
+    if operation not in {"click", "fill", "select", "press", "scroll", "evaluate"}:
+        raise ValueError("Unknown page operation: use click, fill, select, press, scroll or evaluate.")
+    if not page_id or isinstance(state_version, bool) or not isinstance(state_version, int) or state_version < 1:
+        raise ValueError("Read the page first and provide its page_id and positive state_version.")
+    if payload is not None and not isinstance(payload, dict):
+        raise ValueError("payload must be an object.")
+    payload = payload or {}
+    selector = payload.get("selector", "")
+    if not isinstance(selector, str) or len(selector) > 2000:
+        raise ValueError("selector must be a string of at most 2000 characters.")
+    if operation == "evaluate":
+        if not isinstance(payload.get("script"), str) or not payload["script"].strip():
+            raise ValueError("evaluate requires payload.script: a JavaScript function body, optionally returning a result.")
+    elif operation in {"click", "fill", "select", "press"}:
+        if not selector and not all(isinstance(payload.get(key), (int, float)) and not isinstance(payload[key], bool) for key in ("x", "y")):
+            raise ValueError("Provide an observed selector (ref:N or unique CSS) or viewport x/y.")
+        if operation in {"fill", "select", "press"} and not isinstance(payload.get("value"), str):
+            raise ValueError("payload.value must be a string.")
+    for key in ("x", "y", "dx", "dy"):
+        if key in payload and (isinstance(payload[key], bool) or not isinstance(payload[key], (int, float))):
+            raise ValueError(f"payload.{key} must be a finite number.")
+    return send_workspace_action(
+        persona, "dom." + operation, payload, wait_ms, page_id, state_version, folder=folder,
+    )
+
+
 def _check_page_folder(persona: str, state: dict | None, folder: str) -> None:
     if not folder or state is None:
         return
@@ -1113,7 +1148,7 @@ def read_workspace_state(persona: str, page_id: str = "", folder: str = "") -> s
                 "persona": safe_name(persona),
                 "available": False,
                 "state": None,
-                "message": "No workspace app has reported state yet. Do not claim any visible value or page operation. Ask the user to open the workspace HTML through MeloMate or update the app to publish MeloMateWorkspaceState.",
+                "message": "No workspace HTML has reported state. Open the requested HTML through MeloMate; do not invent visible state or claim an operation.",
             }
         )
     age_ms = state_age_ms(state)
@@ -1130,10 +1165,12 @@ def read_workspace_state(persona: str, page_id: str = "", folder: str = "") -> s
             "protocol_available": protocol_available,
             "control_ready": control_ready,
             "age_ms": age_ms,
+            "page_id": state_page_id(state),
+            "state_version": state_version(state),
             "message": (
                 "Workspace control is ready. Use only this reported state for game/app claims."
                 if control_ready
-                else "CONTROL_NOT_READY: The workspace page is stale or does not expose MeloMateWorkspaceState. Do not claim any operation or current UI state."
+                else "CONTROL_NOT_READY: The workspace page is closed, stale or disconnected. Reopen or refresh it through MeloMate before acting. Do not invent current UI state."
             ),
             "state": state,
         }

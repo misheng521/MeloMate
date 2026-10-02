@@ -85,7 +85,7 @@ character_config:
         llm_api_key: ''
         organization_id: null
         project_id: null
-        model: 'deepseek-chat'
+        model: 'deepseek-v4-pro'
         template: 'CHATML'
         temperature: 1.0 # value between 0 to 2
         interrupt_method: 'user'
@@ -96,7 +96,7 @@ character_config:
         llm_api_key: '' # API 密钥
         organization_id: null # 组织 ID
         project_id: null # 项目 ID
-        model: 'deepseek-chat' # 使用的模型
+        model: 'deepseek-v4-pro' # 使用的模型
         temperature: 1.0 # 温度，介于 0 到 2 之间
         interrupt_method: 'user'
         # 用于表示中断信号的方法(提示词模式)。
@@ -136,7 +136,7 @@ character_config:
       deepseek_llm:
         base_url: 'https://api.deepseek.com' # 基础 URL
         llm_api_key: '' # DeepSeek API 密钥
-        model: 'deepseek-chat' # 使用的模型
+        model: 'deepseek-v4-pro' # 使用的模型
         temperature: 0.7 # 注意，DeepSeek 的温度范围是 0 到 1
 
       mistral_llm:

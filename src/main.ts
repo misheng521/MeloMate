@@ -157,13 +157,13 @@ const workspaceManifestUrl = "/api/workspace";
 const workspaceStateUrl = "/api/workspace-state";
 const workspaceEventsUrl = "/api/workspace-events";
 const fallbackBackgrounds: BackgroundOption[] = [{ name: "Default", url: "/backgrounds/default.svg" }];
-const defaultCharacterConfigFile = "小可.yaml";
+const defaultCharacterConfigFile = "小可.md";
 const defaultCharacterOption: CharacterConfigOption = { filename: defaultCharacterConfigFile };
 let vrmModelOptions: VrmModelOption[] = [];
 const referenceAudioDbName = "melomate-reference-audio";
 const moonshotApiEndpoint = "https://api.moonshot.cn/v1";
 const defaultApiEndpoint = "https://api.deepseek.com";
-const defaultModel = "deepseek-chat";
+const defaultModel = "deepseek-v4-pro";
 const defaultScreenVisionEndpoint = moonshotApiEndpoint;
 const defaultScreenVisionModel = "moonshot-v1-8k-vision-preview";
 const appSessionToken = window.__MELOMATE_RUNTIME_CONFIG__?.sessionToken?.trim() || "";
@@ -362,6 +362,11 @@ let currentAssistantName = "小可";
 let companionPollTimer = 0;
 let currentCompanionUid = "";
 let activeVrmModelId = "";
+let currentAvatarState: {
+  status: "not_loaded" | "loading" | "loaded" | "error";
+  file_name?: string;
+  model_name?: string;
+} = { status: "not_loaded" };
 let pendingVrmModelId = "";
 let isVrmModelSwitching = false;
 let voiceChatOutputSinkId = "";
@@ -695,8 +700,8 @@ function renderBackgroundOptions(options: BackgroundOption[]) {
 }
 
 function normalizeCharacterConfigFile(file: string | undefined | null) {
-  if (!file || file === "xyu.yaml" || file === "xyua.yaml") return defaultCharacterConfigFile;
-  return file;
+  if (!file || file === "conf.yaml" || file === "xyu.yaml" || file === "xyua.yaml") return defaultCharacterConfigFile;
+  return file.replace(/\.(ya?ml|txt)$/i, ".md");
 }
 
 function selectedCharacterConfigFile() {
@@ -1010,14 +1015,19 @@ async function selectVrmModel(id: string) {
   isVrmModelSwitching = true;
   pendingVrmModelId = option.id;
   syncVrmModelActiveState();
+  if (currentAvatarState.status !== "loaded") currentAvatarState = { status: "loading" };
+  pollCompanionState();
 
   try {
-    await avatarDriver.load(option.url);
+    const info = await avatarDriver.load(option.url);
     saveVrmModel(option.id);
+    currentAvatarState = { status: "loaded", file_name: option.fileName, model_name: info.name };
+    pollCompanionState();
     await settleVrmModelLayout();
   } catch (error) {
     console.warn(error);
     pendingVrmModelId = previousModelId;
+    if (currentAvatarState.status !== "loaded") currentAvatarState = { status: "error" };
     const message = error instanceof Error ? error.message : "模型切换失败。";
     setAvatarStatus(message, "error");
     appendLine("system", message);
@@ -1025,6 +1035,7 @@ async function selectVrmModel(id: string) {
     isVrmModelSwitching = false;
     pendingVrmModelId = "";
     syncVrmModelActiveState();
+    pollCompanionState();
   }
 }
 
@@ -2370,6 +2381,7 @@ function pollCompanionState() {
     proactive_enabled: proactiveSpeakToggle.checked,
     microphone_active: isCapturing,
     screen_shared: screenVisionEnabled() && Boolean(latestScreenImage),
+    avatar: currentAvatarState,
   }});
 }
 

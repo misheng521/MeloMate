@@ -775,15 +775,16 @@ class ServiceContext:
 
             characters_dir = os.path.normpath(self.system_config.config_alts_dir)
             if config_file_name == "conf.yaml":
-                config_file_name = "小可.yaml"
+                config_file_name = "小可.md"
             elif config_file_name in {"xyu.yaml", "xyua.yaml"}:
-                config_file_name = "小可.yaml"
+                config_file_name = "小可.md"
 
             file_path = os.path.normpath(os.path.join(characters_dir, config_file_name))
             if os.path.commonpath([characters_dir, file_path]) != characters_dir:
                 raise ValueError("Invalid configuration file path")
 
             alt_config_data = load_character_profile(characters_dir, config_file_name)
+            config_file_name = alt_config_data["persona_file"]
 
             # Start with original config data and perform a deep merge
             new_character_config_data = deep_merge(

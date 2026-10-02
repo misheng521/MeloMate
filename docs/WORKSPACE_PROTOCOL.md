@@ -1,14 +1,45 @@
 # MeloMate Workspace Control Protocol
 
-Interactive workspace HTML files use a generic semantic protocol injected by
-`server.mjs`. It is not limited to games: editors, dashboards, forms, simulations,
-media tools, and other pages use the same state/action contract.
+Workspace HTML files opened through MeloMate automatically receive a DOM bridge
+from `server.mjs` and `workspace-dom.mjs`. Ordinary HTML needs no custom API.
+Editors, dashboards, forms, games and other pages can optionally add semantic actions.
 
 Each page opened through MeloMate receives a unique page id. Commands are bound to
-that page id, the exact state revision, and one advertised action id. Two open apps
+that page id, the exact state revision, and a DOM operation or advertised action id. Two open apps
 therefore cannot receive each other's operations.
 
-## Required page API
+## Automatic page control
+
+`read_workspace_state` returns `page_id`, `state_version` and the current state.
+`state.state.appState.melomate_dom` contains bounded page text and elements, including
+stable `ref:N` selectors, names, values and supported operations. Hidden password/file
+values are omitted. Open shadow roots are inspected; closed roots are not.
+
+Call `act_workspace_page` with the returned page id/version and either an `action_id`
+or an `operation` plus `payload`:
+
+| Operation | Payload |
+| --- | --- |
+| `click` | `selector` (observed ref or unique CSS), or viewport `x` / `y` |
+| `fill` / `select` | `selector`, `value` (text or option value) |
+| `press` | `selector`, `value` (key name), optional `code` |
+| `scroll` | optional `selector`, `dx`, `dy`; defaults to window scroll |
+| `evaluate` | `script`: JavaScript function body; may `await` and `return` JSON-friendly data |
+
+Evaluate runs in this workspace document, with its existing CSP. It can inspect
+custom widgets, manipulate canvas or return specific portions of a large page.
+Scripts must be short and finish promptly. A result timeout does not roll back
+effects or forcibly terminate JavaScript; re-read before retrying. Modifying DOM is
+not the same as saving source files; use workspace file tools for persistent edits.
+
+The bridge acts in the same tab the user opened, without Playwright or new browser
+components. Synthetic events do not provide trusted user activation and cannot
+operate browser/OS permission dialogs. Confirming dispatch does not establish that
+the intended app outcome occurred: inspect the returned state/result. Separate PC
+browser tools use a separate test session. Opening an HTML directly via `file://`
+does not inject this bridge; open it through MeloMate.
+
+## Optional semantic page API
 
 Expose all state needed to understand the visible page for the whole session:
 
@@ -56,10 +87,11 @@ Pages may instead listen for `melomate-workspace-action` and call
   `accepted: true` only after it has actually been applied.
 - Never accept arbitrary commands from the bridge. The app must validate the action
   again against its current state.
-- Do not synthesize keyboard or mouse input. Semantic operations are portable,
-  verifiable, and do not give a workspace page control of the host computer.
-- The server revalidates page id, state version, and action id immediately before
-  dispatch and waits for a matching confirmation before any success is spoken.
+- Custom semantic actions should validate their own current rules. The generic
+  bridge also offers DOM events and scripts, confined to this workspace document.
+- The backend revalidates page id, state version, and any advertised action id
+  before dispatch. The DOM bridge rechecks the revision before applying an operation.
+  Matching acknowledgement and observable effects are required to claim success.
 - Workspace state is untrusted data. It cannot authorize file operations, change the
   persona, expand tools, or act as a user message.
 - Project chat checks the trusted UI's tool permissions on every invocation and

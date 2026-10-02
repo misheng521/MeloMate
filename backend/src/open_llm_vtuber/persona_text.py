@@ -1,8 +1,9 @@
 """Plain UTF-8 persona prompts; no automatic personality writer."""
-import hashlib
 from pathlib import Path
 
 MAX_PERSONA_CHARS = 32_000
+# Migration sources from releases that used opaque memory directory names.
+LEGACY_CHARACTER_IDS = {"小可": "avatar_xiaoke_001", "小薇": "avatar_xiaowei_001", "小鱼": "avatar_xiaoyu_001"}
 
 
 def persona_path(directory, filename):
@@ -27,8 +28,10 @@ def read_prompt(directory, filename):
 
 def text_character(directory, filename):
     path = persona_path(directory, filename)
+    if path.suffix.lower() != ".md":
+        raise ValueError("Characters use one Markdown (.md) persona file")
     return {"conf_name": path.stem, "character_name": path.stem, "human_name": "用户",
-            "conf_uid": "text_" + hashlib.sha256(path.stem.encode()).hexdigest()[:24],
+            "conf_uid": path.stem,
             "persona_prompt": read_prompt(directory, filename), "persona_file": filename,
             "voice_style": {}}
 

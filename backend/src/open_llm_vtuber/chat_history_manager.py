@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional, TypedDict
 from uuid import uuid4
+from .persona_text import LEGACY_CHARACTER_IDS
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 CHAT_HISTORY_DIR = PROJECT_ROOT / "characters" / "memory"
@@ -38,6 +39,7 @@ REVIEW_MAX_TURNS = 24
 EMPTY_MEMORY = "# 记忆\n\n"
 _locks: dict[str, threading.RLock] = {}
 _locks_guard = threading.Lock()
+_directory_lock = threading.RLock()
 
 
 class HistoryStorageError(RuntimeError):
@@ -61,7 +63,9 @@ def _digest(text):
 
 def _safe_conf_uid(value):
     if not isinstance(value, str): raise ValueError("Invalid character ID")
-    value = unicodedata.normalize("NFKC", value.strip())
+    # Preserve the actual filename: normalizing Unicode could merge distinct
+    # characters (for example a full-width letter and its ASCII equivalent).
+    value = value.strip()
     reserved = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
     if not value or len(value) > 128 or value in {".", ".."} or value.endswith((".", " ")) or re.search(r'[<>:"/\\|?*\x00-\x1f]', value) or value.split(".")[0].upper() in reserved:
         raise ValueError("Invalid character ID")
@@ -75,9 +79,35 @@ def _validate_history_uid(value):
 def _directory(uid):
     root = CHAT_HISTORY_DIR.resolve()
     directory = root / _safe_conf_uid(uid)
-    if directory.resolve().parent != root or directory.is_symlink():
-        raise ValueError("Memory directory escapes its root")
-    directory.mkdir(parents=True, exist_ok=True)
+    def checked(path):
+        attributes = getattr(path.lstat(), "st_file_attributes", 0) if path.exists() or path.is_symlink() else 0
+        if path.resolve().parent != root or path.is_symlink() or attributes & 0x400:
+            raise ValueError("Memory directory escapes its root or is a link")
+        return path
+
+    with _directory_lock:
+        checked(directory)
+        old_names = {"text_" + _digest(uid)[:24]}
+        if uid in LEGACY_CHARACTER_IDS:
+            old_names.add(LEGACY_CHARACTER_IDS[uid])
+        old_directories = [checked(root / name) for name in old_names if (root / name).exists() or (root / name).is_symlink()]
+        if old_directories:
+            if len(old_directories) != 1 or (directory.exists() and any(directory.iterdir())):
+                raise HistoryStorageError(
+                    f"新旧记忆目录同时存在，已保留全部内容且未覆盖。请先合并或备份后移开重复目录：{directory}；"
+                    + "；".join(str(path) for path in old_directories))
+            old = old_directories[0]
+            if not old.is_dir():
+                raise HistoryStorageError(f"旧记忆路径不是文件夹，未改动：{old}")
+            if directory.exists():
+                directory.rmdir()  # Empty only; never recursively remove user data.
+            try:
+                # Both absolute paths were resolved and checked under the same
+                # memory root. Rename the whole archive, including SQLite files.
+                old.rename(directory)
+            except OSError as exc:
+                raise HistoryStorageError("旧记忆目录暂时无法迁移，请关闭仍在运行的旧版 MeloMate 后重试；原有数据未覆盖。") from exc
+        directory.mkdir(parents=True, exist_ok=True)
     return directory
 
 

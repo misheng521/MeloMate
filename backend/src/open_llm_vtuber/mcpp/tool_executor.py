@@ -246,16 +246,22 @@ class ToolExecutor:
             if tool_name == "act_workspace_page":
                 page_id = str(tool_input.get("page_id") or "").strip()[:128]
                 action_id = str(tool_input.get("action_id") or "").strip()[:128]
+                operation = str(tool_input.get("operation") or "").strip()
                 try:
                     state_version = max(0, int(tool_input.get("state_version") or 0))
                     wait_ms = max(0, min(int(tool_input.get("wait_ms") or 1200), 5000))
                 except (TypeError, ValueError, OverflowError):
                     return tool_input, "TOOL_POLICY_DENIED: invalid page action revision."
-                if not page_id or not action_id or state_version <= 0:
+                if not page_id or not (action_id or operation) or state_version <= 0:
                     return tool_input, (
                         "TOOL_POLICY_DENIED: page_id, positive state_version, and "
-                        "one advertised action_id are required."
+                        "an action_id or operation are required."
                     )
+                if operation and (action_id or operation not in {"click", "fill", "select", "press", "scroll", "evaluate"}):
+                    return tool_input, "TOOL_POLICY_DENIED: choose one valid operation or one advertised action_id."
+                operation_payload = tool_input.get("payload") or {}
+                if operation and not isinstance(operation_payload, dict):
+                    return tool_input, "TOOL_POLICY_DENIED: page payload must be an object."
                 if tool_policy.get("source") == "workspace_runtime":
                     expected_page_id = str(
                         tool_policy.get("expected_page_id") or ""
@@ -271,7 +277,8 @@ class ToolExecutor:
                         for value in tool_policy.get("allowed_action_ids") or ()
                     }
                     if (
-                        page_id != expected_page_id
+                        bool(operation)
+                        or page_id != expected_page_id
                         or state_version != expected_state_version
                         or action_id not in allowed_action_ids
                     ):
@@ -289,6 +296,8 @@ class ToolExecutor:
                 }
                 if tool_policy.get("project_mode") and scoped_folder:
                     tool_input["folder"] = scoped_folder
+                if operation:
+                    tool_input.update(operation=operation, payload=operation_payload)
         if tool_policy is None or tool_policy.get("enforce") is not True:
             return tool_input, None
         allowed = set(tool_policy.get("allowed_tool_names") or ())

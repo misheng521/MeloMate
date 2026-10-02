@@ -172,7 +172,7 @@ npm run check
 - `docs/WORKSPACE_PROTOCOL.md` - Protocol for interactive workspace apps that both the user and MeloMate can control.
 - `backend/prompts` - Prompt fragments used by the backend.
 - `backend/conf.yaml` - Main backend configuration.
-- `characters/profiles` - Editable Markdown/text personas and compatible YAML runtime profiles.
+- `characters/profiles` - One editable Markdown persona per character; runtime settings are shared through `backend/conf.yaml`.
 - `characters/memory` - Private per-character memory.md and automatic SQLite conversation archives.
 - `models/*.vrm` - VRM avatars automatically discovered by the frontend model picker.
 - `backgrounds` - Background images discovered by the frontend.
